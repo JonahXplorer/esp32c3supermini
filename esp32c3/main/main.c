@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "servo_radio.h"
 
 #define SERVO_PWM_RESOLUTION LEDC_TIMER_14_BIT
 
@@ -22,7 +23,6 @@ enum {
     SERVO_GPIO6_B_US = 2000,
     SERVO_GPIO7_A_US = 2000,
     SERVO_GPIO7_B_US = 1000,
-    SERVO_MOVE_STEP_US = 15,
 };
 
 enum {
@@ -106,10 +106,15 @@ void app_main(void)
         ESP_ERROR_CHECK(ledc_channel_config(&channel));
     }
 
+    const bool radio_ready = servo_radio_start(SERVO_PEER_MAC) == ESP_OK;
     ESP_LOGI(TAG, "Ready at A: GPIO%d=%d us, GPIO%d=%d us; press GPIO%d to switch",
              SERVO_1_GPIO, SERVO_GPIO6_A_US, SERVO_2_GPIO, SERVO_GPIO7_A_US, BUTTON_GPIO);
     bool button_pressed = false;
     unsigned consecutive_samples = 0;
+    int move_step_us = SERVO_SPEED_DEFAULT;
+    uint32_t last_session = 0;
+    uint32_t last_sequence = 0;
+    bool announced_peer = false;
     while (true) {
         const bool pressed = gpio_get_level(BUTTON_GPIO) == 1;
         if (pressed == button_pressed) {
@@ -127,15 +132,44 @@ void app_main(void)
             }
         }
 
+        servo_message_t message;
+        if (radio_ready && servo_radio_receive(&message)) {
+            const bool new_command = message.session != last_session || message.sequence > last_sequence;
+            if (new_command && message.type == SERVO_SET_POSITION && message.position < SERVO_POSITION_COUNT) {
+                target_position = message.position;
+                last_session = message.session;
+                last_sequence = message.sequence;
+                ESP_LOGI(TAG, "Sugarat requested position %c", 'A' + target_position);
+            } else if (new_command && message.type == SERVO_SET_SPEED &&
+                       message.speed >= SERVO_SPEED_MIN && message.speed <= SERVO_SPEED_MAX) {
+                move_step_us = message.speed;
+                last_session = message.session;
+                last_sequence = message.sequence;
+                ESP_LOGI(TAG, "Sugarat set speed to %d us per %d ms", move_step_us, BUTTON_POLL_MS);
+            }
+            if (!announced_peer && message.type == SERVO_QUERY) {
+                announced_peer = true;
+                ESP_LOGI(TAG, "Sugarat status request received");
+            }
+            if (message.type >= SERVO_QUERY && message.type <= SERVO_SET_SPEED) {
+                const bool moving = servos[0].current_us != servos[0].position_us[target_position] ||
+                                    servos[1].current_us != servos[1].position_us[target_position];
+                (void)servo_radio_send((servo_message_t){
+                    .session = message.session, .sequence = message.sequence, .type = SERVO_STATE,
+                    .position = target_position, .speed = move_step_us, .moving = moving,
+                });
+            }
+        }
+
         for (size_t i = 0; i < servo_count; ++i) {
             int step_us = servos[i].position_us[target_position] - servos[i].current_us;
             if (step_us == 0) {
                 continue;
             }
-            if (step_us > SERVO_MOVE_STEP_US) {
-                step_us = SERVO_MOVE_STEP_US;
-            } else if (step_us < -SERVO_MOVE_STEP_US) {
-                step_us = -SERVO_MOVE_STEP_US;
+            if (step_us > move_step_us) {
+                step_us = move_step_us;
+            } else if (step_us < -move_step_us) {
+                step_us = -move_step_us;
             }
             servos[i].current_us += step_us;
             servo_set_pulse(servos[i].channel, servos[i].current_us);
