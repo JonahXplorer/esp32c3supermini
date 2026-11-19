@@ -12,11 +12,11 @@
 #include "freertos/queue.h"
 
 static const char *TAG = "servo_radio";
-static const uint32_t PROTOCOL_ID = 0x31565253;
+static const uint32_t PROTOCOL_ID = 0x32565253;
 static uint8_t peer_address[ESP_NOW_ETH_ALEN];
 static QueueHandle_t inbox;
 
-_Static_assert(sizeof(servo_message_t) == 16, "Unexpected ESP-NOW packet layout");
+_Static_assert(sizeof(servo_message_t) == 20, "Unexpected ESP-NOW packet layout");
 
 static void receive_packet(const esp_now_recv_info_t *info, const uint8_t *data, int length)
 {
