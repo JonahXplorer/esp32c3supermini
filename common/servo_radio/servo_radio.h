@@ -5,7 +5,7 @@
 #include "esp_err.h"
 
 enum {
-    SERVO_RADIO_CHANNEL = 6,
+    SERVO_RADIO_START_CHANNEL = 6,
     SERVO_SPEED_MIN = 10,
     SERVO_SPEED_MAX = 50,
     SERVO_SPEED_DEFAULT = 25,
@@ -23,6 +23,11 @@ typedef enum {
     SERVO_STATE,
 } servo_message_type_t;
 
+typedef enum {
+    SERVO_RADIO_FIXED,
+    SERVO_RADIO_FOLLOW_PEER,
+} servo_radio_mode_t;
+
 typedef struct {
     uint32_t protocol;
     uint32_t session;
@@ -33,9 +38,13 @@ typedef struct {
     uint8_t moving;
     uint8_t angle_deg;
     uint8_t angle_limit_deg;
-    uint8_t reserved[2];
+    uint8_t channel;
+    uint8_t reserved;
 } servo_message_t;
 
-esp_err_t servo_radio_start(const char *peer_mac);
+esp_err_t servo_radio_start(const char *peer_mac, servo_radio_mode_t mode);
+esp_err_t servo_radio_attach(const char *peer_mac);
 bool servo_radio_receive(servo_message_t *message);
 esp_err_t servo_radio_send(servo_message_t message);
+// Call from the receiving task after handling and replying to any incoming packet.
+void servo_radio_scan_step(void);

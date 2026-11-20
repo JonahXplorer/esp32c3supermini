@@ -203,7 +203,7 @@ void app_main(void)
         ESP_ERROR_CHECK(ledc_channel_config(&channel));
     }
 
-    const bool radio_ready = servo_radio_start(SERVO_PEER_MAC) == ESP_OK;
+    const bool radio_ready = servo_radio_start(SERVO_PEER_MAC, SERVO_RADIO_FOLLOW_PEER) == ESP_OK;
     ESP_LOGI(TAG, "Ready at A: GPIO%d=%d us, GPIO%d=%d us; press GPIO%d to switch",
              SERVO_1_GPIO, SERVO_GPIO6_A_US, SERVO_2_GPIO, SERVO_GPIO7_A_US, BUTTON_GPIO);
     bool button_pressed = false;
@@ -244,7 +244,9 @@ void app_main(void)
                 target_position = message.position;
                 last_session = message.session;
                 last_sequence = message.sequence;
-                ESP_LOGI(TAG, "Sugarat requested position %c", 'A' + target_position);
+                ESP_LOGI(TAG, "Sugarat requested position %c: GPIO%d=%d us, GPIO%d=%d us",
+                         'A' + target_position, servos[0].gpio, servo_target_us(&servos[0], target_position, angle_deg),
+                         servos[1].gpio, servo_target_us(&servos[1], target_position, angle_deg));
             } else if (new_command && message.type == SERVO_SET_SPEED &&
                        message.speed >= SERVO_SPEED_MIN && message.speed <= SERVO_SPEED_MAX) {
                 move_step_us = message.speed;
@@ -289,6 +291,9 @@ void app_main(void)
                 .position = target_position, .speed = move_step_us, .moving = moving,
                 .angle_deg = angle_deg, .angle_limit_deg = angle_limit_deg,
             });
+        }
+        if (radio_ready) {
+            servo_radio_scan_step();
         }
 
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));

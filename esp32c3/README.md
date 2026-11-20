@@ -17,7 +17,7 @@ ESP-IDF 6.1 工程，适用于两只 1171MG 这类三线 PWM 角度舵机。上�
 
 在 `main/main.c` 用 `SERVO_GPIO6_A_US`、`SERVO_GPIO6_90_US` 校准 GPIO6，用 `SERVO_GPIO7_A_US`、`SERVO_GPIO7_90_US` 校准 GPIO7。按键日志会分别输出两路的目标脉宽。默认切换速度由 `../common/servo_radio/servo_radio.h` 中的 `SERVO_SPEED_DEFAULT` 设定。
 
-[Sugarat Button 遥控](../sugarat/README.md)通过 ESP-NOW 切换 A/B 和调整两路的速度及 B 点角度。GPIO4 实体按键使用同一组设定。接收端每次重启恢复默认速度和 90°。
+[Sugarat Button 遥控](../sugarat/README.md)通过 ESP-NOW 切换 A/B 和调整两路的速度及 B 点角度。C3 按已配对的 Sugarat 地址识别数据，并在失联后重新寻找 Sugarat 所在的 2.4 GHz 信道。GPIO4 实体按键使用同一组设定。接收端每次重启恢复默认速度和 90°。
 
 ## 校准遥控上限
 

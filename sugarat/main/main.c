@@ -1,6 +1,7 @@
 #include "board.h"
 #include "screen.h"
 #include "servo_radio.h"
+#include "voice.h"
 
 #include "esp_log.h"
 #include "esp_random.h"
@@ -13,64 +14,57 @@ enum {
     QUERY_US = 300000,
     RETRY_US = 150000,
     LINK_TIMEOUT_US = 1500000,
+    STATUS_POLL_US = 200000,
     MAX_SENDS = 4,
+    REMOTE_STACK_BYTES = 8192,
 };
 
 static const char *TAG = "sugarat_remote";
 
 static bool create_command(screen_action_t action, screen_state_t state, servo_message_t *message)
 {
-    switch (action) {
-    case SCREEN_SWITCH:
+    switch (action.kind) {
+    case SCREEN_SET_TARGET:
+        if (action.value > 1 || action.value == state.position) {
+            return false;
+        }
         message->type = SERVO_SET_POSITION;
-        message->position = state.position ^ 1u;
+        message->position = action.value;
         return true;
-    case SCREEN_SLOWER:
-    case SCREEN_FASTER: {
-        const int increment = action == SCREEN_FASTER ? SERVO_SPEED_INCREMENT : -SERVO_SPEED_INCREMENT;
-        const int speed = state.speed + increment;
-        if (speed < SERVO_SPEED_MIN || speed > SERVO_SPEED_MAX) {
+    case SCREEN_SET_SPEED:
+        if (action.value < SERVO_SPEED_MIN || action.value > SERVO_SPEED_MAX || action.value == state.speed) {
             return false;
         }
         message->type = SERVO_SET_SPEED;
-        message->speed = speed;
+        message->speed = action.value;
         return true;
-    }
-    case SCREEN_ANGLE_DOWN:
-    case SCREEN_ANGLE_UP: {
-        const int increment = action == SCREEN_ANGLE_UP ? SERVO_ANGLE_INCREMENT : -SERVO_ANGLE_INCREMENT;
-        const int angle = state.angle_deg + increment;
-        if (angle < 0 || angle > state.angle_limit_deg) {
+    case SCREEN_SET_ANGLE:
+        if (action.value > state.angle_limit_deg || action.value == state.angle_deg) {
             return false;
         }
         message->type = SERVO_SET_ANGLE;
-        message->angle_deg = angle;
+        message->angle_deg = action.value;
         return true;
-    }
     default:
         return false;
     }
 }
 
-static bool screen_changed(screen_state_t before, screen_state_t after)
-{
-    return before.online != after.online || before.pending != after.pending ||
-           before.position != after.position || before.speed != after.speed || before.moving != after.moving ||
-           before.angle_deg != after.angle_deg || before.angle_limit_deg != after.angle_limit_deg;
-}
-
-void app_main(void)
+static void remote_task(void *context)
 {
     ESP_ERROR_CHECK(sugarat_display_init());
-    ESP_ERROR_CHECK(screen_init());
     const bool touch_ready = sugarat_touch_init() == ESP_OK;
+    ESP_ERROR_CHECK(screen_init(touch_ready));
     screen_state_t state = {
         .speed = SERVO_SPEED_DEFAULT, .angle_deg = SERVO_ANGLE_DEFAULT,
         .angle_limit_deg = SERVO_ANGLE_DEFAULT, .touch_ready = touch_ready,
     };
-    ESP_ERROR_CHECK(screen_draw(state));
+    screen_update(&state);
+    (void)screen_poll();
     ESP_ERROR_CHECK(sugarat_display_light());
-    const bool radio_ready = servo_radio_start(SERVO_PEER_MAC) == ESP_OK;
+    const bool wifi_managed = sugarat_voice_start() == ESP_OK;
+    const bool radio_ready = (wifi_managed ? servo_radio_attach(SERVO_PEER_MAC)
+                                          : servo_radio_start(SERVO_PEER_MAC, SERVO_RADIO_FIXED)) == ESP_OK;
     ESP_LOGI(TAG, "Remote ready on Sugarat Button");
 
     const uint32_t session = esp_random();
@@ -79,15 +73,20 @@ void app_main(void)
     int64_t last_reply = -LINK_TIMEOUT_US;
     int64_t next_query = 0;
     int64_t next_retry = 0;
+    int64_t next_status_poll = 0;
     unsigned attempts = 0;
     servo_message_t pending = {0};
-    bool pressed = false;
 
     while (true) {
         const int64_t now = esp_timer_get_time();
         const screen_state_t previous = state;
+        if (now >= next_status_poll) {
+            next_status_poll = now + STATUS_POLL_US;
+            sugarat_voice_view(&state.voice);
+        }
         servo_message_t reply;
-        if (radio_ready && servo_radio_receive(&reply) && reply.type == SERVO_STATE && reply.session == session &&
+        if (radio_ready && servo_radio_receive(&reply) &&
+            reply.type == SERVO_STATE && reply.session == session &&
             reply.sequence >= last_received_sequence && reply.sequence <= sequence &&
             reply.position <= 1 && reply.speed >= SERVO_SPEED_MIN && reply.speed <= SERVO_SPEED_MAX && reply.moving <= 1 &&
             (reply.angle_limit_deg == SERVO_ANGLE_DEFAULT || reply.angle_limit_deg == SERVO_ANGLE_MAX) &&
@@ -104,30 +103,31 @@ void app_main(void)
             state.angle_deg = reply.angle_deg;
             state.angle_limit_deg = reply.angle_limit_deg;
             state.moving = reply.moving != 0;
+            state.receiver_channel = reply.channel;
             if (!previous.online || confirmed_command || state.position != previous.position ||
                 state.speed != previous.speed || state.angle_deg != previous.angle_deg ||
-                state.angle_limit_deg != previous.angle_limit_deg) {
-                ESP_LOGI(TAG, "C3 confirmed target %c, speed %u us per 10 ms, B angle %u/%u degrees%s",
-                         'A' + state.position, (unsigned)state.speed, (unsigned)state.angle_deg,
+                state.angle_limit_deg != previous.angle_limit_deg || state.receiver_channel != previous.receiver_channel) {
+                ESP_LOGI(TAG, "C3 confirmed target %c on channel %u, speed %u us per 10 ms, B angle %u/%u degrees%s",
+                         'A' + state.position, (unsigned)state.receiver_channel, (unsigned)state.speed, (unsigned)state.angle_deg,
                          (unsigned)state.angle_limit_deg, state.moving ? ", moving" : "");
             }
         }
         state.online = now - last_reply < LINK_TIMEOUT_US;
+        if (previous.online && !state.online) {
+            ESP_LOGW(TAG, "C3 status timed out");
+        }
 
-        if (touch_ready) {
-            bool touching;
-            int x, y;
-            if (sugarat_touch_read(&touching, &x, &y) == ESP_OK) {
-                if (touching && !pressed && state.online && !pending.type &&
-                    create_command(screen_hit(x, y), state, &pending)) {
-                    pending.session = session;
-                    pending.sequence = ++sequence;
-                    attempts = 0;
-                    next_retry = now;
-                    ESP_LOGI(TAG, "Touch command %u", (unsigned)pending.type);
-                }
-                pressed = touching;
-            }
+        state.pending = pending.type != 0;
+        screen_update(&state);
+        const screen_action_t action = screen_poll();
+        if (action.kind == SCREEN_END_CALL && state.voice.can_end) {
+            sugarat_voice_end_call();
+        } else if (state.online && !pending.type && create_command(action, state, &pending)) {
+            pending.session = session;
+            pending.sequence = ++sequence;
+            attempts = 0;
+            next_retry = now;
+            ESP_LOGI(TAG, "Touch command %u", (unsigned)pending.type);
         }
 
         if (radio_ready && pending.type && now >= next_retry) {
@@ -148,10 +148,13 @@ void app_main(void)
             next_query = now + QUERY_US;
         }
 
-        state.pending = pending.type != 0;
-        if (screen_changed(previous, state)) {
-            ESP_ERROR_CHECK(screen_draw(state));
-        }
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
+}
+
+void app_main(void)
+{
+    const BaseType_t started = xTaskCreate(remote_task, "sugarat_ui", REMOTE_STACK_BYTES, NULL,
+                                           tskIDLE_PRIORITY + 1, NULL);
+    ESP_ERROR_CHECK(started == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }

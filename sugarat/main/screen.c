@@ -1,175 +1,435 @@
 #include "screen.h"
+#include "screen_port.h"
 
-#include <stdio.h>
+#include "lvgl.h"
+#include "servo_radio.h"
 #include <string.h>
 
-#include "board.h"
-#include "esp_heap_caps.h"
-#include "servo_radio.h"
-
-#define RGB565(r, g, b) (((r) & 0xf8) << 8 | ((g) & 0xfc) << 3 | (b) >> 3)
-
 enum {
-    CENTER = SCREEN_SIZE / 2,
-    SPEED_Y = 165,
-    ANGLE_Y = 226,
-    MINUS_X = 78,
-    PLUS_X = 282,
-    STEP_RADIUS = 24,
-    SWITCH_X = 83,
-    SWITCH_Y = 263,
-    SWITCH_W = 194,
-    SWITCH_H = 52,
-    INK = RGB565(11, 20, 29),
-    PANEL = RGB565(23, 37, 49),
-    BORDER = RGB565(46, 64, 79),
-    WHITE = RGB565(236, 244, 247),
-    MUTED = RGB565(150, 172, 189),
-    ACCENT = RGB565(109, 233, 186),
-    AMBER = RGB565(255, 192, 108),
+    BG = 0x10131F,
+    PANEL = 0x222838,
+    EDGE = 0x343D50,
+    TRACK = 0x414A5C,
+    TEXT = 0xF3F6FC,
+    MUTED = 0xB4BDCF,
+    TEAL = 0x69E4CF,
+    INK = 0x102F2C,
+    LILAC = 0xB5A6FF,
+    AMBER = 0xFFCA89,
+    RED = 0xFF9EAA,
 };
 
-static uint16_t *pixels;
+typedef enum { PAGE_SERVOS, PAGE_JARVIS, PAGE_COUNT } page_t;
 
-static const char glyphs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.+- ";
-static const uint8_t font[][7] = {
-    {14,17,19,21,25,17,14}, {4,12,4,4,4,4,14}, {14,17,1,2,4,8,31},
-    {30,1,1,14,1,1,30}, {2,6,10,18,31,2,2}, {31,16,16,30,1,1,30},
-    {14,16,16,30,17,17,14}, {31,1,2,4,8,8,8}, {14,17,17,14,17,17,14},
-    {14,17,17,15,1,1,14}, {14,17,17,31,17,17,17}, {30,17,17,30,17,17,30},
-    {14,17,16,16,16,17,14}, {30,17,17,17,17,17,30}, {31,16,16,30,16,16,31},
-    {31,16,16,30,16,16,16}, {14,17,16,23,17,17,15}, {17,17,17,31,17,17,17},
-    {14,4,4,4,4,4,14}, {7,2,2,2,2,18,12}, {17,18,20,24,20,18,17},
-    {16,16,16,16,16,16,31}, {17,27,21,21,17,17,17}, {17,25,21,19,17,17,17},
-    {14,17,17,17,17,17,14}, {30,17,17,30,16,16,16}, {14,17,17,17,21,18,13},
-    {30,17,17,30,20,18,17}, {15,16,16,14,1,1,30}, {31,4,4,4,4,4,4},
-    {17,17,17,17,17,17,14}, {17,17,17,17,17,10,4}, {17,17,17,21,21,27,17},
-    {17,17,10,4,10,17,17}, {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31},
-    {0,0,0,0,0,0,4}, {0,4,4,31,4,4,0}, {0,0,0,31,0,0,0}, {0},
+typedef struct {
+    lv_obj_t *slider;
+    lv_obj_t *readout;
+    screen_action_kind_t action;
+    int confirmed;
+    bool dragging;
+    bool awaiting;
+} adjustment_t;
+
+typedef struct {
+    const char *title;
+    const char *detail;
+    uint32_t tint;
+} voice_copy_t;
+
+static const voice_copy_t voice_copy[] = {
+    [SUGARAT_VOICE_BOOT]         = {"Starting Jarvis", "Getting voice ready", LILAC},
+    [SUGARAT_VOICE_SETUP]        = {"Set up Wi-Fi", "Join Sugarat-Jarvis Wi-Fi\non your phone", AMBER},
+    [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "Connecting to your network", AMBER},
+    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "Enter this code in Deotaland Agent", AMBER},
+    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "Bind a voice agent in Deotaland", AMBER},
+    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Speak after the wake word", TEAL},
+    [SUGARAT_VOICE_OPENING]      = {"Opening a call", "You can start speaking", LILAC},
+    [SUGARAT_VOICE_IN_CALL]      = {"In conversation", "Speak to your voice agent", LILAC},
+    [SUGARAT_VOICE_RECONNECTING] = {"Reconnecting", "Restoring your conversation", AMBER},
+    [SUGARAT_VOICE_ENDING]       = {"Ending the call", "Returning to wake-word mode", LILAC},
+    [SUGARAT_VOICE_ERROR]        = {"Voice unavailable", "Restart Sugarat to try again", RED},
+    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Say \"Jarvis\" to try again", AMBER},
 };
 
-static void rect(int x, int y, int w, int h, uint16_t color)
+static lv_obj_t *pages[PAGE_COUNT];
+static lv_obj_t *tabs[PAGE_COUNT];
+static lv_obj_t *tab_text[PAGE_COUNT];
+static lv_obj_t *voice_dot;
+static lv_obj_t *receiver_status;
+static lv_obj_t *targets[2];
+static lv_obj_t *angle_caption;
+static adjustment_t angle = {.action = SCREEN_SET_ANGLE};
+static adjustment_t speed = {.action = SCREEN_SET_SPEED};
+static lv_obj_t *voice_ring;
+static lv_obj_t *voice_core;
+static lv_obj_t *waveform[5];
+static lv_obj_t *voice_title;
+static lv_obj_t *voice_detail;
+static lv_obj_t *voice_end;
+static lv_obj_t *quick_voice;
+
+static page_t active_page;
+static screen_action_t action;
+static screen_state_t displayed;
+static bool has_state;
+
+static lv_obj_t *surface(lv_obj_t *parent, int width, int height, int radius, uint32_t color)
 {
-    const uint16_t wire_color = __builtin_bswap16(color);
-    for (int row = y; row < y + h; ++row) {
-        uint16_t *line = &pixels[row * SCREEN_SIZE + x];
-        for (int col = 0; col < w; ++col) {
-            line[col] = wire_color;
-        }
+    lv_obj_t *object = lv_obj_create(parent);
+    lv_obj_remove_style_all(object);
+    lv_obj_remove_flag(object, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(object, width, height);
+    lv_obj_set_style_radius(object, radius, 0);
+    lv_obj_set_style_bg_color(object, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
+    return object;
+}
+
+static lv_obj_t *text_label(lv_obj_t *parent, const char *text, const lv_font_t *font, uint32_t color)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+    lv_label_set_text(label, text);
+    return label;
+}
+
+static lv_obj_t *button(lv_obj_t *parent, int width, int height, const char *text, lv_obj_t **label)
+{
+    lv_obj_t *object = lv_button_create(parent);
+    lv_obj_remove_style_all(object);
+    lv_obj_set_size(object, width, height);
+    lv_obj_set_style_radius(object, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(object, LV_OPA_70, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(object, LV_OPA_50, LV_STATE_DISABLED);
+    lv_obj_t *title = text_label(object, text, &lv_font_montserrat_16, TEXT);
+    lv_obj_center(title);
+    if (label) {
+        *label = title;
+    }
+    return object;
+}
+
+static void set_hidden(lv_obj_t *object, bool hidden)
+{
+    if (hidden) {
+        lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-static void rounded(int x, int y, int w, int h, int radius, uint16_t color)
+static void show_page(page_t page)
 {
-    int inset = radius;
-    for (int row = 0; row < radius; ++row) {
-        const int dy = radius - row - 1;
-        while (inset > 0 && (radius - inset + 1) * (radius - inset + 1) + dy * dy <= radius * radius) {
-            --inset;
-        }
-        rect(x + inset, y + row, w - 2 * inset, 1, color);
-        rect(x + inset, y + h - row - 1, w - 2 * inset, 1, color);
+    active_page = page;
+    for (int i = 0; i < PAGE_COUNT; ++i) {
+        const bool selected = i == page;
+        set_hidden(pages[i], !selected);
+        lv_obj_set_style_bg_color(tabs[i], lv_color_hex(selected ? TRACK : PANEL), 0);
+        lv_obj_set_style_text_color(tab_text[i], lv_color_hex(selected ? TEXT : MUTED), 0);
     }
-    rect(x, y + radius, w, h - radius * 2, color);
 }
 
-static void label(const char *text, int center, int y, int scale, uint16_t color)
+static void tab_clicked(lv_event_t *event)
 {
-    int x = center - ((int)strlen(text) * 6 - 1) * scale / 2;
-    for (const char *c = text; *c; ++c, x += 6 * scale) {
-        const char *index = strchr(glyphs, *c);
-        if (!index) {
-            continue;
+    show_page((page_t)(uintptr_t)lv_event_get_user_data(event));
+}
+
+static void swipe(lv_event_t *event)
+{
+    lv_indev_t *input = lv_indev_active();
+    const lv_dir_t direction = lv_indev_get_gesture_dir(input);
+    if (direction == LV_DIR_LEFT && active_page == PAGE_SERVOS) {
+        lv_indev_wait_release(input);
+        show_page(PAGE_JARVIS);
+    } else if (direction == LV_DIR_RIGHT && active_page == PAGE_JARVIS) {
+        lv_indev_wait_release(input);
+        show_page(PAGE_SERVOS);
+    }
+}
+
+static void command_clicked(lv_event_t *event)
+{
+    const screen_action_t *command = lv_event_get_user_data(event);
+    action = *command;
+}
+
+static void mark_enabled(lv_obj_t *object, bool enabled)
+{
+    if (enabled) {
+        lv_obj_remove_state(object, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(object, LV_STATE_DISABLED);
+    }
+}
+
+static void readout(adjustment_t *control, int value)
+{
+    if (control->action == SCREEN_SET_ANGLE) {
+        lv_label_set_text_fmt(control->readout, "%d°", value * SERVO_ANGLE_INCREMENT);
+    } else {
+        const unsigned us_per_step = SERVO_SPEED_MIN + value * SERVO_SPEED_INCREMENT;
+        const unsigned centiseconds = (1000u + us_per_step - 1) / us_per_step;
+        lv_label_set_text_fmt(control->readout, "%u.%02u s", centiseconds / 100, centiseconds % 100);
+    }
+}
+
+static void slider_input(lv_event_t *event)
+{
+    adjustment_t *control = lv_event_get_user_data(event);
+    const lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        control->dragging = true;
+    } else if (code == LV_EVENT_VALUE_CHANGED) {
+        readout(control, lv_slider_get_value(control->slider));
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        const int value = lv_slider_get_value(control->slider);
+        if (code == LV_EVENT_RELEASED && control->dragging && value != control->confirmed) {
+            const int setting = control->action == SCREEN_SET_ANGLE ? value * SERVO_ANGLE_INCREMENT
+                               : SERVO_SPEED_MIN + value * SERVO_SPEED_INCREMENT;
+            action = (screen_action_t){.kind = control->action, .value = setting};
+            control->awaiting = true;
+        } else {
+            lv_slider_set_value(control->slider, control->confirmed, LV_ANIM_OFF);
+            readout(control, control->confirmed);
         }
-        const uint8_t *bitmap = font[index - glyphs];
-        for (int row = 0; row < 7; ++row) {
-            for (int col = 0; col < 5; ++col) {
-                if ((bitmap[row] & (16 >> col)) != 0) {
-                    rect(x + col * scale, y + row * scale, scale, scale, color);
-                }
+        control->dragging = false;
+    }
+}
+
+static lv_obj_t *build_adjustment(lv_obj_t *page, adjustment_t *control, int y,
+                                 int width, const char *caption, uint32_t tint)
+{
+    lv_obj_t *card = surface(page, width, 60, 20, PANEL);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(EDGE), 0);
+
+    lv_obj_t *label = text_label(card, caption, &lv_font_montserrat_14, MUTED);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 13, 11);
+    control->readout = text_label(card, "", &lv_font_montserrat_24, TEXT);
+    lv_obj_align(control->readout, LV_ALIGN_TOP_RIGHT, -13, 2);
+
+    lv_obj_t *slider = lv_slider_create(card);
+    control->slider = slider;
+    lv_obj_set_size(slider, width - 34, 10);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 39);
+    lv_obj_set_ext_click_area(slider, 9);
+    lv_obj_remove_flag(slider, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(TRACK), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(tint), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(TEXT), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(tint), LV_PART_KNOB | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(MUTED), LV_PART_KNOB | LV_STATE_DISABLED);
+    lv_obj_set_style_pad_all(slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, slider_input, LV_EVENT_ALL, control);
+    return label;
+}
+
+static void build_servos(lv_obj_t *page)
+{
+    static const screen_action_t target_commands[] = {
+        {.kind = SCREEN_SET_TARGET, .value = 0},
+        {.kind = SCREEN_SET_TARGET, .value = 1},
+    };
+    receiver_status = text_label(page, "", &lv_font_montserrat_14, MUTED);
+    lv_obj_align(receiver_status, LV_ALIGN_TOP_MID, 0, 89);
+
+    lv_obj_t *selector = surface(page, 254, 54, 27, PANEL);
+    lv_obj_align(selector, LV_ALIGN_TOP_MID, 0, 117);
+    for (int i = 0; i < 2; ++i) {
+        lv_obj_t *label;
+        targets[i] = button(selector, 119, 46, i == 0 ? "Position A" : "Position B", &label);
+        lv_obj_set_pos(targets[i], 4 + i * 127, 4);
+        lv_obj_set_style_bg_color(targets[i], lv_color_hex(PANEL), 0);
+        lv_obj_set_style_bg_color(targets[i], lv_color_hex(TEAL), LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(targets[i], lv_color_hex(INK), LV_STATE_CHECKED);
+        // Inherit the checked foreground from the button.
+        lv_obj_remove_local_style_prop(label, LV_STYLE_TEXT_COLOR, 0);
+        lv_obj_set_style_text_color(targets[i], lv_color_hex(TEXT), 0);
+        lv_obj_add_event_cb(targets[i], command_clicked, LV_EVENT_CLICKED, (void *)&target_commands[i]);
+    }
+
+    angle_caption = build_adjustment(page, &angle, 178, 274, "", TEAL);
+    build_adjustment(page, &speed, 244, 246, "Travel time / 90°", LILAC);
+    lv_slider_set_range(speed.slider, 0, (SERVO_SPEED_MAX - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT);
+
+    quick_voice = button(page, 150, 30, "", NULL);
+    lv_obj_align(quick_voice, LV_ALIGN_TOP_MID, 0, 308);
+    lv_obj_set_style_bg_color(quick_voice, lv_color_hex(PANEL), 0);
+    lv_obj_add_event_cb(quick_voice, tab_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_JARVIS);
+}
+
+static void build_voice(lv_obj_t *page)
+{
+    static const screen_action_t end_command = {.kind = SCREEN_END_CALL};
+    voice_ring = surface(page, 110, 110, LV_RADIUS_CIRCLE, BG);
+    lv_obj_align(voice_ring, LV_ALIGN_TOP_MID, 0, 87);
+    lv_obj_set_style_border_width(voice_ring, 1, 0);
+
+    voice_core = surface(voice_ring, 88, 88, LV_RADIUS_CIRCLE, PANEL);
+    lv_obj_center(voice_core);
+    const int heights[] = {14, 26, 38, 26, 14};
+    for (int i = 0; i < 5; ++i) {
+        waveform[i] = surface(voice_core, 5, heights[i], LV_RADIUS_CIRCLE, LILAC);
+        lv_obj_align(waveform[i], LV_ALIGN_CENTER, (i - 2) * 11, 0);
+    }
+
+    voice_title = text_label(page, "", &lv_font_montserrat_24, TEXT);
+    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, 206);
+    voice_detail = text_label(page, "", &lv_font_montserrat_14, MUTED);
+    lv_obj_set_style_text_align(voice_detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(voice_detail, 242);
+    lv_label_set_long_mode(voice_detail, LV_LABEL_LONG_WRAP);
+    lv_obj_align(voice_detail, LV_ALIGN_TOP_MID, 0, 255);
+    voice_end = button(page, 152, 42, "End call", NULL);
+    lv_obj_align(voice_end, LV_ALIGN_TOP_MID, 0, 291);
+    lv_obj_set_style_bg_color(voice_end, lv_color_hex(0x672839), 0);
+    lv_obj_add_event_cb(voice_end, command_clicked, LV_EVENT_CLICKED, (void *)&end_command);
+}
+
+static void build_navigation(lv_obj_t *root)
+{
+    lv_obj_t *tray = surface(root, 208, 40, LV_RADIUS_CIRCLE, PANEL);
+    lv_obj_align(tray, LV_ALIGN_TOP_MID, 0, 33);
+    const char *names[] = {"Servos", "Jarvis"};
+    for (int i = 0; i < PAGE_COUNT; ++i) {
+        tabs[i] = button(tray, 98, 34, names[i], &tab_text[i]);
+        lv_obj_set_pos(tabs[i], 3 + i * 104, 3);
+        lv_obj_add_event_cb(tabs[i], tab_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+    }
+    lv_obj_align(tab_text[PAGE_JARVIS], LV_ALIGN_CENTER, -4, 0);
+    voice_dot = surface(tabs[PAGE_JARVIS], 6, 6, LV_RADIUS_CIRCLE, LILAC);
+    lv_obj_align(voice_dot, LV_ALIGN_RIGHT_MID, -10, 0);
+}
+
+esp_err_t screen_init(bool touch_ready)
+{
+    esp_err_t err = screen_port_init(touch_ready);
+    if (err != ESP_OK) {
+        return err;
+    }
+    lv_obj_t *root = lv_screen_active();
+    lv_obj_remove_style_all(root);
+    lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(root, lv_color_hex(BG), 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+    lv_obj_add_event_cb(root, swipe, LV_EVENT_GESTURE, NULL);
+
+    for (int i = 0; i < PAGE_COUNT; ++i) {
+        pages[i] = surface(root, LV_PCT(100), LV_PCT(100), 0, BG);
+        lv_obj_set_style_bg_opa(pages[i], LV_OPA_TRANSP, 0);
+    }
+    build_servos(pages[PAGE_SERVOS]);
+    build_voice(pages[PAGE_JARVIS]);
+    build_navigation(root);
+    show_page(PAGE_SERVOS);
+    return ESP_OK;
+}
+
+static void show_receiver(const screen_state_t *state)
+{
+    uint32_t tint = state->online ? TEAL : AMBER;
+    if (!state->touch_ready) {
+        lv_label_set_text(receiver_status, "Touchscreen unavailable");
+        tint = RED;
+    } else if (!state->online) {
+        lv_label_set_text(receiver_status, "Finding receiver...");
+    } else if (state->pending) {
+        lv_label_set_text(receiver_status, "Sending to receiver...");
+        tint = MUTED;
+    } else if (state->moving) {
+        lv_label_set_text_fmt(receiver_status, "Moving to %c", 'A' + state->position);
+    } else if (state->receiver_channel != 0) {
+        lv_label_set_text_fmt(receiver_status, "Receiver connected  /  ch %u", (unsigned)state->receiver_channel);
+    } else {
+        lv_label_set_text(receiver_status, "Receiver connected");
+    }
+    lv_obj_set_style_text_color(receiver_status, lv_color_hex(tint), 0);
+}
+
+static void sync_adjustment(adjustment_t *control, int confirmed, bool enabled, bool waiting)
+{
+    control->confirmed = confirmed;
+    mark_enabled(control->slider, enabled);
+    if (!enabled) {
+        control->dragging = false;
+    }
+    control->awaiting &= waiting;
+    if (!control->dragging && !control->awaiting &&
+        (!has_state || lv_slider_get_value(control->slider) != confirmed)) {
+        lv_slider_set_value(control->slider, confirmed, LV_ANIM_OFF);
+        readout(control, confirmed);
+    }
+}
+
+static void show_voice(const sugarat_voice_view_t *voice)
+{
+    const voice_copy_t *copy = &voice_copy[voice->phase];
+    const bool activation = voice->phase == SUGARAT_VOICE_ACTIVATE;
+    const lv_color_t tint = lv_color_hex(copy->tint);
+    lv_obj_set_style_bg_color(voice_dot, tint, 0);
+    lv_obj_set_style_border_color(voice_ring, lv_color_mix(tint, lv_color_hex(BG), LV_OPA_60), 0);
+    lv_obj_set_style_bg_color(voice_core, lv_color_mix(tint, lv_color_hex(PANEL), LV_OPA_30), 0);
+    for (int i = 0; i < 5; ++i) {
+        lv_obj_set_style_bg_color(waveform[i], tint, 0);
+    }
+    lv_obj_set_style_text_font(voice_title, activation ? &lv_font_montserrat_40 : &lv_font_montserrat_24, 0);
+    lv_label_set_text(voice_title, activation ? voice->activation_code : copy->title);
+    lv_label_set_text(voice_detail, copy->detail);
+    set_hidden(voice_end, !voice->can_end);
+
+    const char *shortcut = voice->can_end ? "Voice call" : activation ? "Activate Jarvis" :
+                           voice->phase == SUGARAT_VOICE_SETUP ? "Set up Wi-Fi" : NULL;
+    if (shortcut) {
+        lv_label_set_text(lv_obj_get_child(quick_voice, 0), shortcut);
+    }
+    set_hidden(quick_voice, shortcut == NULL);
+}
+
+void screen_update(const screen_state_t *state)
+{
+    const bool enabled = state->online && !state->pending && state->touch_ready;
+    if (!has_state || state->online != displayed.online || state->pending != displayed.pending ||
+        state->touch_ready != displayed.touch_ready || state->receiver_channel != displayed.receiver_channel ||
+        state->position != displayed.position ||
+        state->moving != displayed.moving) {
+        show_receiver(state);
+        for (int i = 0; i < 2; ++i) {
+            if (state->online && state->position == i) {
+                lv_obj_add_state(targets[i], LV_STATE_CHECKED);
+            } else {
+                lv_obj_remove_state(targets[i], LV_STATE_CHECKED);
             }
+            mark_enabled(targets[i], enabled);
         }
     }
+    if (!has_state || state->angle_limit_deg != displayed.angle_limit_deg) {
+        lv_label_set_text_fmt(angle_caption, "B angle (0-%u°)", (unsigned)state->angle_limit_deg);
+        lv_slider_set_range(angle.slider, 0, state->angle_limit_deg / SERVO_ANGLE_INCREMENT);
+    }
+    sync_adjustment(&angle, state->angle_deg / SERVO_ANGLE_INCREMENT, enabled, state->pending);
+    sync_adjustment(&speed, (state->speed - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT, enabled, state->pending);
+
+    if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
+        strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {
+        show_voice(&state->voice);
+    }
+    displayed = *state;
+    has_state = true;
 }
 
-esp_err_t screen_init(void)
+screen_action_t screen_poll(void)
 {
-    pixels = heap_caps_malloc(SCREEN_SIZE * SCREEN_SIZE * sizeof(*pixels), MALLOC_CAP_SPIRAM);
-    return pixels ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-static void adjustment(int y, const char *name, const char *value, bool can_decrease, bool can_increase)
-{
-    const int diameter = STEP_RADIUS * 2;
-    label(name, CENTER, y - 24, 2, MUTED);
-    label(value, CENTER, y - 4, 3, WHITE);
-    rounded(MINUS_X - STEP_RADIUS, y - STEP_RADIUS, diameter, diameter,
-            STEP_RADIUS, can_decrease ? BORDER : PANEL);
-    rounded(PLUS_X - STEP_RADIUS, y - STEP_RADIUS, diameter, diameter,
-            STEP_RADIUS, can_increase ? BORDER : PANEL);
-    label("-", MINUS_X, y - 14, 4, can_decrease ? ACCENT : MUTED);
-    label("+", PLUS_X, y - 14, 4, can_increase ? ACCENT : MUTED);
-}
-
-esp_err_t screen_draw(screen_state_t state)
-{
-    const bool active = state.online && state.touch_ready && !state.pending;
-    rect(0, 0, SCREEN_SIZE, SCREEN_SIZE, INK);
-    label("SERVO", CENTER, 35, 4, WHITE);
-
-    const char *link = !state.touch_ready ? "TOUCH ERROR" : state.online ? "CONNECTED" : "WAITING FOR C3";
-    rounded(82, 69, 196, 27, 13, PANEL);
-    label(link, CENTER, 75, 2, state.online && state.touch_ready ? ACCENT : AMBER);
-
-    rounded(79, 101, 202, 35, 16, PANEL);
-    const char *position = !state.online ? "POSITION -" : state.position ? "POSITION B" : "POSITION A";
-    if (state.online && state.moving) {
-        position = state.position ? "MOVING TO B" : "MOVING TO A";
-    }
-    label(position, CENTER, 111, 2, WHITE);
-
-    const unsigned centiseconds = (1000u + state.speed - 1) / state.speed;
-    char seconds[16];
-    snprintf(seconds, sizeof(seconds), "%u.%02uS", centiseconds / 100, centiseconds % 100);
-    adjustment(SPEED_Y, "SPEED AT 90", seconds,
-               state.speed > SERVO_SPEED_MIN && active, state.speed < SERVO_SPEED_MAX && active);
-
-    char angle[12];
-    char angle_label[16];
-    snprintf(angle, sizeof(angle), "%u DEG", (unsigned)state.angle_deg);
-    snprintf(angle_label, sizeof(angle_label), "ANGLE MAX %u", (unsigned)state.angle_limit_deg);
-    adjustment(ANGLE_Y, angle_label, angle,
-               state.angle_deg > 0 && active, state.angle_deg < state.angle_limit_deg && active);
-
-    rounded(SWITCH_X, SWITCH_Y, SWITCH_W, SWITCH_H, 24, active ? ACCENT : PANEL);
-    label(state.pending ? "SENDING" : state.position ? "GO TO A" : "GO TO B", CENTER, SWITCH_Y + 16,
-          3, active ? INK : MUTED);
-    return sugarat_display_present(pixels);
-}
-
-static bool hit_step(int x, int y, int center_x, int center_y)
-{
-    const int dx = x - center_x;
-    const int dy = y - center_y;
-    return dx * dx + dy * dy <= STEP_RADIUS * STEP_RADIUS;
-}
-
-screen_action_t screen_hit(int x, int y)
-{
-    if (hit_step(x, y, MINUS_X, SPEED_Y)) {
-        return SCREEN_SLOWER;
-    }
-    if (hit_step(x, y, PLUS_X, SPEED_Y)) {
-        return SCREEN_FASTER;
-    }
-    if (hit_step(x, y, MINUS_X, ANGLE_Y)) {
-        return SCREEN_ANGLE_DOWN;
-    }
-    if (hit_step(x, y, PLUS_X, ANGLE_Y)) {
-        return SCREEN_ANGLE_UP;
-    }
-    if (x >= SWITCH_X && x < SWITCH_X + SWITCH_W && y >= SWITCH_Y && y < SWITCH_Y + SWITCH_H) {
-        return SCREEN_SWITCH;
-    }
-    return SCREEN_NONE;
+    lv_timer_handler();
+    const screen_action_t selected = action;
+    action = (screen_action_t){0};
+    return selected;
 }

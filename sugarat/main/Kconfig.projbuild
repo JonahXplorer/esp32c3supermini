@@ -1,0 +1,3 @@
+config AGENT_LINK_TRANSPORT_WIFI
+    bool
+    default y

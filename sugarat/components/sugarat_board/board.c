@@ -59,18 +59,26 @@ esp_err_t sugarat_display_init(void)
     return ESP_OK;
 }
 
-esp_err_t sugarat_display_present(const uint16_t *pixels)
+esp_err_t sugarat_display_write(int x, int y, int width, int height, const uint8_t *pixels)
 {
-    const uint8_t columns[] = {0, 0, (SCREEN_SIZE - 1) >> 8, (SCREEN_SIZE - 1) & 0xff};
-    for (int y = 0; y < SCREEN_SIZE; y += LCD_STRIPE_ROWS) {
-        const int bottom = y + LCD_STRIPE_ROWS - 1;
-        const uint8_t rows[] = {y >> 8, y & 0xff, bottom >> 8, bottom & 0xff};
+    ESP_RETURN_ON_FALSE(pixels && x >= 0 && y >= 0 && width > 0 && height > 0 &&
+                        width <= SCREEN_SIZE - x && height <= SCREEN_SIZE - y,
+                        ESP_ERR_INVALID_ARG, TAG, "Invalid LCD window");
+    const int right = x + width - 1;
+    const uint8_t columns[] = {x >> 8, x & 0xff, right >> 8, right & 0xff};
+    const unsigned row_bytes = width * sizeof(uint16_t);
+    const int rows_per_transfer = LCD_STRIPE_BYTES / row_bytes;
+    for (int top = y; top < y + height; top += rows_per_transfer) {
+        const int remaining = y + height - top;
+        const int lines = remaining < rows_per_transfer ? remaining : rows_per_transfer;
+        const int bottom = top + lines - 1;
+        const uint8_t rows[] = {top >> 8, top & 0xff, bottom >> 8, bottom & 0xff};
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(lcd, 0x02002A00, columns, sizeof(columns)),
                             TAG, "LCD columns");
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(lcd, 0x02002B00, rows, sizeof(rows)),
                             TAG, "LCD rows");
-        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_color(lcd, 0x32002C00, pixels + y * SCREEN_SIZE,
-                                                    LCD_STRIPE_BYTES), TAG, "LCD pixels");
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_color(lcd, 0x32002C00, pixels + (top - y) * row_bytes,
+                                                    lines * row_bytes), TAG, "LCD pixels");
     }
     return ESP_OK;
 }
