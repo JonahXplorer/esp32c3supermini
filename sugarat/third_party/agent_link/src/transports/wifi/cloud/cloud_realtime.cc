@@ -63,6 +63,7 @@ using namespace agentlink::cloud_limits;
 constexpr const char* TAG = "agent_link.realtime";
 constexpr int kConnectTimeoutMs = 10000;
 constexpr int kSendTimeoutMs = 3000;
+constexpr int64_t kReportAudioGapUs = 150000;
 constexpr size_t kMicBytes = 640;
 #if CONFIG_IDF_TARGET_ESP32C3
 // Negotiation accepts exactly 20 ms, decoded at 16 kHz mono PCM16.
@@ -795,6 +796,42 @@ public:
     }
     bool WriteBlocked() const { return write_stall_.Blocked(); }
 
+#if !CONFIG_IDF_TARGET_ESP32C3
+    void NoteHelloSent() {
+        hello_sent_ms_.store(static_cast<uint32_t>(esp_timer_get_time() / 1000));
+    }
+
+    void RecordWsPoll() { ++ws_polls_; }
+    void RecordWsDeliveryWait() { ++ws_delivery_waits_; }
+
+    void RecordWsRead(int bytes, int64_t started_us, int64_t finished_us) {
+        if (bytes > 0) last_ws_payload_us_ = finished_us;
+        if (finished_us - started_us >= kReportAudioGapUs) {
+            ESP_LOGI(TAG, "WSS slow read: start_ms=%u end_ms=%u bytes=%d",
+                     static_cast<unsigned>(started_us / 1000), static_cast<unsigned>(finished_us / 1000), bytes);
+        }
+    }
+
+    void RecordWsMessage() { ++ws_messages_; }
+
+    void ReportWriteStall(const char* outcome, int64_t now_us) {
+        if (!ws_stall_started_us_) return;
+        const int64_t duration_us = now_us - ws_stall_started_us_;
+        if (duration_us >= kReportAudioGapUs) {
+            const int64_t rx_idle_us = last_ws_payload_us_ ? now_us - last_ws_payload_us_ : now_us - created_at_;
+            ESP_LOGI(TAG, "WSS TX stall %s: start_ms=%u end_ms=%u duration_ms=%u rx_bytes=%u rx_messages=%u "
+                          "decoded_ms=%u rx_age_ms=%u rx_polls=%u delivery_waits=%u downlink_pending_bytes=%u",
+                     outcome, static_cast<unsigned>(ws_stall_started_us_ / 1000), static_cast<unsigned>(now_us / 1000),
+                     static_cast<unsigned>(duration_us / 1000), static_cast<unsigned>(s_rx_bytes.load() - ws_stall_rx_bytes_),
+                     ws_messages_ - ws_stall_messages_,
+                     static_cast<unsigned>((s_decoded_samples.load() - ws_stall_decoded_) / 16),
+                     static_cast<unsigned>(rx_idle_us / 1000), ws_polls_ - ws_stall_polls_,
+                     ws_delivery_waits_ - ws_stall_delivery_waits_, static_cast<unsigned>(s_downlink_bytes.load()));
+        }
+        ws_stall_started_us_ = 0;
+    }
+#endif
+
     // A busy queue pauses reads, while the network loop continues to send microphone audio.
     bool Deliver(unsigned opcode, const uint8_t* data, size_t bytes, int64_t received_at, uint32_t reset) {
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -926,7 +963,18 @@ public:
     bool Audio(uint8_t* data, size_t bytes) {
         if (!s_ready || s_mute || !bytes) return true;
         const int64_t now = received_at_;
-        if (last_audio_ && now - last_audio_ > max_gap_) max_gap_ = now - last_audio_;
+        if (last_audio_) {
+            const int64_t gap_us = now - last_audio_;
+            if (gap_us > max_gap_) max_gap_ = gap_us;
+#if !CONFIG_IDF_TARGET_ESP32C3
+            if (gap_us >= kReportAudioGapUs) {
+                ESP_LOGI(TAG, "WSS audio gap: reply=%u start_ms=%u end_ms=%u gap_ms=%u dispatch_ms=%u",
+                         replies_, static_cast<unsigned>(last_audio_ / 1000), static_cast<unsigned>(now / 1000),
+                         static_cast<unsigned>(gap_us / 1000),
+                         static_cast<unsigned>((esp_timer_get_time() - now) / 1000));
+            }
+#endif
+        }
         last_audio_ = now;
         encoded_bytes_ += bytes;
         ++packets_;
@@ -1017,6 +1065,13 @@ public:
             if (!s_ready.exchange(true) && s_cb.state)
                 s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
             SetRecovering(epoch_, false);
+#if !CONFIG_IDF_TARGET_ESP32C3
+            const uint32_t sent_at = hello_sent_ms_.exchange(0);
+            if (sent_at) {
+                const uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+                ESP_LOGI(TAG, "Voice stage session ready: ms=%u", static_cast<unsigned>(now - sent_at));
+            }
+#endif
             ESP_LOGI(TAG, "voice session ready (%s 16 kHz up, %s 24 kHz down, %s)",
                      audio_.input_opus ? "Opus" : "PCM16", audio_.output_opus ? "Opus" : "PCM16",
                      continuous_ ? "server endpointing" : "client PTT");
@@ -1041,6 +1096,11 @@ public:
             }
         } else if (strcmp(event, "response.audio.done") == 0) {
             ++reply_ends_;
+#if !CONFIG_IDF_TARGET_ESP32C3
+            ESP_LOGI(TAG, "WSS audio done: reply=%u packets=%u pcm_ms=%u max_gap_ms=%u max_decode_us=%u max_pacing_ms=%u",
+                     replies_, packets_, static_cast<unsigned>(samples_ / 16), static_cast<unsigned>(max_gap_ / 1000),
+                     static_cast<unsigned>(max_decode_), static_cast<unsigned>(max_pacing_ / 1000));
+#endif
             ESP_LOGD(TAG, "reply audio end #%u (started=%u, interrupted=%u)",
                      reply_ends_, replies_, interruptions_);
             ESP_LOGD(TAG, "reply audio: %s, %u packets, %u bytes, %u ms PCM, max gap %u ms",
@@ -1098,14 +1158,25 @@ public:
         errno = 0;
         const int writable = PollWritable(ws.tls);
         const int saved_errno = errno;
-        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t now_ms = now_us / 1000;
         write_stall_.Observe(writable > 0, now_ms);
+        if (!writable && !ws_stall_started_us_) {
+            ws_stall_started_us_ = now_us;
+            ws_stall_rx_bytes_ = s_rx_bytes.load();
+            ws_stall_messages_ = ws_messages_;
+            ws_stall_decoded_ = s_decoded_samples.load();
+            ws_stall_polls_ = ws_polls_;
+            ws_stall_delivery_waits_ = ws_delivery_waits_;
+        }
         if (writable < 0 || write_stall_.Expired(now_ms)) {
+            ReportWriteStall(writable < 0 ? "error" : "timeout", now_us);
             LogTransportFailure(ws.tls, "uplink wait writable", writable, saved_errno);
             transport_failed_ = true;
             return false;
         }
         if (!writable) return true;
+        ReportWriteStall("writable", now_us);
 #endif
         if (input_opus_.load()) {
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
@@ -1190,6 +1261,19 @@ private:
 #if CONFIG_IDF_TARGET_ESP32C3
     WsSender* sender_ = nullptr;
     TxScratch* scratch_ = nullptr;
+#else
+    std::atomic<uint32_t> hello_sent_ms_{0};
+    // Owned by the WSS network task. Decoded PCM is counted separately by the media task.
+    int64_t last_ws_payload_us_ = 0;
+    unsigned ws_messages_ = 0;
+    unsigned ws_polls_ = 0;
+    unsigned ws_delivery_waits_ = 0;
+    int64_t ws_stall_started_us_ = 0;
+    uint32_t ws_stall_rx_bytes_ = 0;
+    unsigned ws_stall_messages_ = 0;
+    uint32_t ws_stall_decoded_ = 0;
+    unsigned ws_stall_polls_ = 0;
+    unsigned ws_stall_delivery_waits_ = 0;
 #endif
     agentlink::realtime::OpusBatchGate batch_gate_{kOpusBatchFrames};
     agentlink::realtime::WriteStall write_stall_;
@@ -1764,10 +1848,14 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
         return false;
     }
     WsSender sender{tls, scratch->wire, sizeof scratch->wire};
+    const int64_t handshake_started = esp_timer_get_time();
     errno = 0;
     const int connected = esp_transport_connect(ws, addr.host, addr.port, kConnectTimeoutMs);
+    const int saved_errno = errno;
+    const int64_t handshake_finished = esp_timer_get_time();
+    ESP_LOGI(TAG, "Voice stage WSS handshake: ms=%u result=%d",
+             static_cast<unsigned>((handshake_finished - handshake_started) / 1000), connected);
     if (connected != 0) {
-        const int saved_errno = errno;
         const int status = esp_transport_ws_get_upgrade_request_status(ws);
         LogTransportFailure(tls, "connect", connected, saved_errno);
         ESP_LOGW(TAG, "WSS connection failed (upgrade HTTP %d)", status);
@@ -1797,7 +1885,10 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             ESP_LOGW(TAG, "session.connect could not be sent");
             retryable = true;
         } else {
+            call.NoteHelloSent();
             ESP_LOGI(TAG, "session.connect sent over WSS");
+            ESP_LOGI(TAG, "Voice stage session.connect: ms=%u",
+                     static_cast<unsigned>((esp_timer_get_time() - handshake_finished) / 1000));
             agentlink::realtime::Message assembler(message.Data(), message.Capacity());
             uint8_t* chunk = scratch->read;
             int frame_read = 0;
@@ -1815,6 +1906,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                 }
                 if (pending) {
                     if (!call.Deliver(assembler.Opcode(), message.Data(), assembler.Size(), pending_at, pending_reset)) {
+                        call.RecordWsDeliveryWait();
                         vTaskDelay(1);
                         continue;
                     }
@@ -1841,6 +1933,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                 }
                 SetWorkerPhase(2);
                 errno = 0;
+                call.RecordWsPoll();
                 const int polled = esp_transport_poll_read(ws, call.TxPending() && !call.WriteBlocked() ? 0 : 10);
                 SetWorkerPhase(0);
                 if (polled < 0) {
@@ -1856,10 +1949,14 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                 if (!polled) continue;
                 SetWorkerPhase(3);
                 errno = 0;
+                const int64_t read_started_us = esp_timer_get_time();
                 const int got = esp_transport_read(ws, reinterpret_cast<char*>(chunk), sizeof scratch->read, 1000);
+                const int read_errno = errno;
+                const int64_t read_finished_us = esp_timer_get_time();
                 SetWorkerPhase(0);
+                call.RecordWsRead(got, read_started_us, read_finished_us);
                 if (got < 0) {
-                    LogTransportFailure(tls, "read", got, errno);
+                    LogTransportFailure(tls, "read", got, read_errno);
                     retryable = true;
                     break;
                 }
@@ -1910,6 +2007,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                         break;
                     }
                     if (result == agentlink::realtime::Message::kComplete) {
+                        call.RecordWsMessage();
                         // Cancel queued speech before an interruption waits behind paced audio.
                         if (assembler.Opcode() == WS_TRANSPORT_OPCODES_TEXT && IsInterruption(message.Data(), assembler.Size()))
                             s_reset.fetch_add(1);
@@ -1920,6 +2018,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                 }
                 if (end) frame_read = 0;
             }
+            call.ReportWriteStall("connection_end", esp_timer_get_time());
             // An explicit server rejection or invalid media must not be retried
             // merely because the network worker observed a simultaneous failure.
             if (!call.Healthy()) retryable = false;
@@ -1964,13 +2063,21 @@ void Worker(void*) {
 #endif
             if (grant.platform && Current(grant.epoch)) {
                 int status = 0;
-                granted = cloud_platform_grant(grant.agent_id, grant.session_id, false,
-                                               grant.url, sizeof grant.url, grant.token, sizeof grant.token,
-                                               &grant.audio, &status) == ESP_OK;
+                int64_t started = esp_timer_get_time();
+                esp_err_t result = cloud_platform_grant(grant.agent_id, grant.session_id, false,
+                                                        grant.url, sizeof grant.url, grant.token, sizeof grant.token,
+                                                        &grant.audio, &status);
+                ESP_LOGI(TAG, "Voice stage grant: ms=%u http=%d result=%s",
+                         static_cast<unsigned>((esp_timer_get_time() - started) / 1000), status, esp_err_to_name(result));
+                granted = result == ESP_OK;
                 if (!granted && status == 409 && Current(grant.epoch)) {
-                    granted = cloud_platform_grant(grant.agent_id, grant.session_id, true,
-                                                   grant.url, sizeof grant.url, grant.token, sizeof grant.token,
-                                                   &grant.audio, &status) == ESP_OK;
+                    started = esp_timer_get_time();
+                    result = cloud_platform_grant(grant.agent_id, grant.session_id, true,
+                                                  grant.url, sizeof grant.url, grant.token, sizeof grant.token,
+                                                  &grant.audio, &status);
+                    ESP_LOGI(TAG, "Voice stage grant refresh: ms=%u http=%d result=%s",
+                             static_cast<unsigned>((esp_timer_get_time() - started) / 1000), status, esp_err_to_name(result));
+                    granted = result == ESP_OK;
                 }
                 if (!granted) hint = status == 409 ? "Voice session busy. End the previous call"
                                      : "Voice access failed. Tap Connect to retry";

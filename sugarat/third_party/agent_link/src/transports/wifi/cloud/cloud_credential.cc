@@ -13,8 +13,8 @@
 namespace {
 constexpr const char* TAG = "agent_link.cred";
 
-// Existing namespace; renaming it would drop the key on devices that are already bound.
-constexpr const char* kNs      = "al_dev";
+// Keep bot.sugarat.ai credentials separate from the previous platform's al_dev key.
+constexpr const char* kNs      = "al_sugarat_ai";
 constexpr const char* kKeyAuth = "auth_key";
 
 char s_auth[CLOUD_AUTH_KEY_MAX] = {0};

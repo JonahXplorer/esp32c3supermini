@@ -23,6 +23,7 @@ typedef enum {
     SCREEN_SET_SPEED,
     SCREEN_SET_ANGLE,
     SCREEN_SET_TARGET,
+    SCREEN_START_CALL,
     SCREEN_END_CALL,
 } screen_action_kind_t;
 

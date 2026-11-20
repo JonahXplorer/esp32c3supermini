@@ -6,6 +6,11 @@
 #include "esp_err.h"
 
 enum { SUGARAT_SAMPLE_RATE = 16000, SUGARAT_AUDIO_FRAME = 320 };
+enum {
+    SUGARAT_SPEAKER_DMA_DESCRIPTORS = 6,
+    SUGARAT_SPEAKER_DMA_SAMPLES = 240,
+    SUGARAT_SPEAKER_DMA_MS = SUGARAT_SPEAKER_DMA_DESCRIPTORS * SUGARAT_SPEAKER_DMA_SAMPLES * 1000 / SUGARAT_SAMPLE_RATE,
+};
 
 esp_err_t sugarat_audio_init(void);
 void sugarat_audio_deinit(void);

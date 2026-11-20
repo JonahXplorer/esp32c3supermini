@@ -33,8 +33,8 @@ static esp_err_t init_speaker(void)
 {
     i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     channel.auto_clear_after_cb = true;
-    channel.dma_desc_num = 6;
-    channel.dma_frame_num = 240;
+    channel.dma_desc_num = SUGARAT_SPEAKER_DMA_DESCRIPTORS;
+    channel.dma_frame_num = SUGARAT_SPEAKER_DMA_SAMPLES;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&channel, &speaker, NULL), TAG, "Create speaker TX");
     i2s_std_config_t config = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SUGARAT_SAMPLE_RATE),

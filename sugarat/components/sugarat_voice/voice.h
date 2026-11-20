@@ -25,5 +25,6 @@ typedef struct {
 } sugarat_voice_view_t;
 
 esp_err_t sugarat_voice_start(void);
+void sugarat_voice_start_call(void);
 void sugarat_voice_view(sugarat_voice_view_t *view);
 void sugarat_voice_end_call(void);

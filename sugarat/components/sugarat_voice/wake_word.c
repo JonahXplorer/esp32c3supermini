@@ -9,6 +9,7 @@
 #include "model_path.h"
 
 static const char *TAG = "sugarat_wake";
+static const float JARVIS_THRESHOLD = 0.60f;
 static srmodel_list_t *models;
 static const esp_afe_sr_iface_t *afe;
 static esp_afe_sr_data_t *detector;
@@ -45,6 +46,11 @@ esp_err_t wake_word_init(void)
     if (!detector) {
         wake_word_deinit();
         return ESP_ERR_NO_MEM;
+    }
+    if (afe->set_wakenet_threshold && afe->set_wakenet_threshold(detector, 1, JARVIS_THRESHOLD) == 1) {
+        ESP_LOGI(TAG, "Jarvis WakeNet threshold %.2f", (double)JARVIS_THRESHOLD);
+    } else {
+        ESP_LOGW(TAG, "Could not set Jarvis WakeNet threshold; using the model default");
     }
     const int feed = afe->get_feed_chunksize(detector);
     const int fetch = afe->get_fetch_chunksize(detector);

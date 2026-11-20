@@ -40,15 +40,15 @@ static const voice_copy_t voice_copy[] = {
     [SUGARAT_VOICE_BOOT]         = {"Starting Jarvis", "Getting voice ready", LILAC},
     [SUGARAT_VOICE_SETUP]        = {"Set up Wi-Fi", "Join Sugarat-Jarvis Wi-Fi\non your phone", AMBER},
     [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "Connecting to your network", AMBER},
-    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "Enter this code in Deotaland Agent", AMBER},
-    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "Bind a voice agent in Deotaland", AMBER},
-    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Speak after the wake word", TEAL},
+    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "Enter this code at bot.sugarat.ai", AMBER},
+    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "Bind a voice agent in Sugarat", AMBER},
+    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Or tap to start a call", TEAL},
     [SUGARAT_VOICE_OPENING]      = {"Opening a call", "You can start speaking", LILAC},
     [SUGARAT_VOICE_IN_CALL]      = {"In conversation", "Speak to your voice agent", LILAC},
     [SUGARAT_VOICE_RECONNECTING] = {"Reconnecting", "Restoring your conversation", AMBER},
     [SUGARAT_VOICE_ENDING]       = {"Ending the call", "Returning to wake-word mode", LILAC},
     [SUGARAT_VOICE_ERROR]        = {"Voice unavailable", "Restart Sugarat to try again", RED},
-    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Say \"Jarvis\" to try again", AMBER},
+    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Tap or say \"Jarvis\" to retry", AMBER},
 };
 
 static lv_obj_t *pages[PAGE_COUNT];
@@ -269,10 +269,12 @@ static void build_servos(lv_obj_t *page)
 
 static void build_voice(lv_obj_t *page)
 {
+    static const screen_action_t start_command = {.kind = SCREEN_START_CALL};
     static const screen_action_t end_command = {.kind = SCREEN_END_CALL};
     voice_ring = surface(page, 110, 110, LV_RADIUS_CIRCLE, BG);
     lv_obj_align(voice_ring, LV_ALIGN_TOP_MID, 0, 87);
     lv_obj_set_style_border_width(voice_ring, 1, 0);
+    lv_obj_add_event_cb(voice_ring, command_clicked, LV_EVENT_CLICKED, (void *)&start_command);
 
     voice_core = surface(voice_ring, 88, 88, LV_RADIUS_CIRCLE, PANEL);
     lv_obj_center(voice_core);
@@ -374,6 +376,11 @@ static void show_voice(const sugarat_voice_view_t *voice)
 {
     const voice_copy_t *copy = &voice_copy[voice->phase];
     const bool activation = voice->phase == SUGARAT_VOICE_ACTIVATE;
+    if (voice->phase == SUGARAT_VOICE_READY || voice->phase == SUGARAT_VOICE_RETRY) {
+        lv_obj_add_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_remove_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
+    }
     const lv_color_t tint = lv_color_hex(copy->tint);
     lv_obj_set_style_bg_color(voice_dot, tint, 0);
     lv_obj_set_style_border_color(voice_ring, lv_color_mix(tint, lv_color_hex(BG), LV_OPA_60), 0);

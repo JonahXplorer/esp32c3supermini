@@ -120,7 +120,9 @@ static void remote_task(void *context)
         state.pending = pending.type != 0;
         screen_update(&state);
         const screen_action_t action = screen_poll();
-        if (action.kind == SCREEN_END_CALL && state.voice.can_end) {
+        if (action.kind == SCREEN_START_CALL) {
+            sugarat_voice_start_call();
+        } else if (action.kind == SCREEN_END_CALL && state.voice.can_end) {
             sugarat_voice_end_call();
         } else if (state.online && !pending.type && create_command(action, state, &pending)) {
             pending.session = session;
