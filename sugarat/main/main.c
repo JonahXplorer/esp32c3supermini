@@ -130,6 +130,9 @@ static void remote_task(void *context)
         state.pending = pending.type != 0;
         screen_update(&state);
         const screen_action_t action = screen_poll();
+        if (state.voice.phase == SUGARAT_VOICE_IN_CALL && previous.voice.phase != SUGARAT_VOICE_IN_CALL) {
+            ESP_LOGI(TAG, "Voice UI in conversation: shown_ms=%lu", (unsigned long)(esp_timer_get_time() / 1000));
+        }
         bool command_started = false;
         if (action.kind == SCREEN_START_CALL) {
             sugarat_voice_start_call();
@@ -187,6 +190,7 @@ static void remote_task(void *context)
 
 void app_main(void)
 {
+    // Board startup can initialize or write NVS, which requires an internal stack.
     const BaseType_t started = xTaskCreate(remote_task, "sugarat_ui", REMOTE_STACK_BYTES, NULL,
                                            tskIDLE_PRIORITY + 1, NULL);
     ESP_ERROR_CHECK(started == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);

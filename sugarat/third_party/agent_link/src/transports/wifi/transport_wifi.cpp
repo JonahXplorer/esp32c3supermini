@@ -262,6 +262,7 @@ void OnGotIp(const esp_netif_ip_info_t& ip) {
 }
 
 void OnStaDisconnected(uint8_t reason) {
+    cloud_realtime_invalidate_dns();
     if (!s_want_connect) return;
     if (reason == WIFI_REASON_ASSOC_LEAVE && s_ignore_leave) { s_ignore_leave = false; return; }
     s_portal_close_at = 0;
@@ -968,15 +969,16 @@ extern "C" esp_err_t agent_transport_wifi_request_realtime(void) {
     return r;
 }
 
-extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int agent_id, const char* session_id) {
+extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int agent_id, const char* session_id, bool standby) {
     // This path obtains a grant over authenticated HTTP; only the legacy
     // cloud_json_request_realtime() path above needs an MQTT connection.
     if (!cloud_platform_enabled() ||
         s_link.load(std::memory_order_acquire) != AGENT_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
+    if (standby) return cloud_realtime_request_platform(agent_id, session_id, true);
     if (s_realtime_wanted.exchange(true)) return ESP_ERR_INVALID_STATE;
     s_platform_voice.store(true);
     OnRealtimeState(false, "Requesting voice access");
-    const esp_err_t r = cloud_realtime_request_platform(agent_id, session_id);
+    const esp_err_t r = cloud_realtime_request_platform(agent_id, session_id, false);
     if (r != ESP_OK) {
         s_realtime_wanted.store(false);
         s_platform_voice.store(false);
@@ -1031,7 +1033,7 @@ agent_transport_t s_wifi = {
 }  // namespace
 
 extern "C" agent_transport_t* agent_transport_wifi(void) { return &s_wifi; }
-extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int, const char*) {
+extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int, const char*, bool) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 

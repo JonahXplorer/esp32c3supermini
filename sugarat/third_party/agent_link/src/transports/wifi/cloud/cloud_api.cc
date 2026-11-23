@@ -62,6 +62,9 @@ esp_http_client_handle_t Client(const char* url) {
     hc.method            = HTTP_METHOD_POST;
     hc.timeout_ms        = kTimeoutMs;
     hc.crt_bundle_attach = esp_crt_bundle_attach;   // public CA bundle; no pinned cert to rotate
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_MBEDTLS_SSL_PROTO_TLS1_3
+    hc.tls_version       = ESP_HTTP_CLIENT_TLS_VER_TLS_1_2;
+#endif
     hc.buffer_size       = 1024;
     hc.buffer_size_tx    = 1024;
     // TCP keep-alive, so a connection that dies while idle is detected within ~25s rather than by

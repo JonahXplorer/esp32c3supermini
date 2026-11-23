@@ -9,7 +9,7 @@
 #include "model_path.h"
 
 static const char *TAG = "sugarat_wake";
-static const float JARVIS_THRESHOLD = 0.60f;
+static const float JARVIS_THRESHOLD = 0.55f;
 static srmodel_list_t *models;
 static const esp_afe_sr_iface_t *afe;
 static esp_afe_sr_data_t *detector;
@@ -61,7 +61,7 @@ esp_err_t wake_word_init(void)
     }
     feed_samples = feed;
     fetch_samples = fetch;
-    input = heap_caps_malloc(feed_samples * sizeof(*input), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    input = heap_caps_malloc(feed_samples * sizeof(*input), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!input) {
         wake_word_deinit();
         return ESP_ERR_NO_MEM;

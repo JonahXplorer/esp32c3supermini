@@ -19,14 +19,15 @@ inline constexpr char kPcmAudioConfig[] =
     R"({"input":{"encoding":"pcm16","sampleRate":16000,"channels":1},)"
     R"("output":{"encoding":"pcm16","sampleRate":24000,"channels":1}})";
 
-inline const cJSON* AudioSettings(const cJSON* body, unsigned depth = 0) {
+inline const cJSON* AudioSettings(const cJSON* body, unsigned depth = 0, bool* declared = nullptr) {
     if (!cJSON_IsObject(body) || depth > 3) return nullptr;
     for (const char* key : {"audio_config", "audio"}) {
         const cJSON* audio = cJSON_GetObjectItemCaseSensitive(body, key);
+        if (audio && declared) *declared = true;
         if (cJSON_IsObject(audio)) return audio;
     }
     for (const char* key : {"realtimeConnection", "grant", "data"}) {
-        const cJSON* audio = AudioSettings(cJSON_GetObjectItemCaseSensitive(body, key), depth + 1);
+        const cJSON* audio = AudioSettings(cJSON_GetObjectItemCaseSensitive(body, key), depth + 1, declared);
         if (audio) return audio;
     }
     return nullptr;

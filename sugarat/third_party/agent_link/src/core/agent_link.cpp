@@ -995,11 +995,17 @@ esp_err_t agent_link_request_realtime(void) {
     return agent_transport_wifi_request_realtime();
 }
 
-extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int agent_id, const char* session_id);
+extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int agent_id, const char* session_id, bool standby);
 esp_err_t agent_link_request_realtime_session(int agent_id, const char* session_id) {
     if (!s_tx) return ESP_ERR_INVALID_STATE;
     if (s_cfg.transport != AGENT_TRANSPORT_WIFI) return ESP_ERR_NOT_SUPPORTED;
-    return agent_transport_wifi_request_realtime_session(agent_id, session_id);
+    return agent_transport_wifi_request_realtime_session(agent_id, session_id, false);
+}
+
+esp_err_t agent_link_prepare_realtime_session(int agent_id, const char* session_id) {
+    if (!s_tx) return ESP_ERR_INVALID_STATE;
+    if (s_cfg.transport != AGENT_TRANSPORT_WIFI) return ESP_ERR_NOT_SUPPORTED;
+    return agent_transport_wifi_request_realtime_session(agent_id, session_id, true);
 }
 
 bool agent_link_realtime_running(void) {

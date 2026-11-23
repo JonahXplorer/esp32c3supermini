@@ -24,6 +24,7 @@ typedef struct {
 
 void cloud_realtime_set_callbacks(const cloud_realtime_callbacks_t* callbacks);
 void cloud_realtime_cancel(void);
+void cloud_realtime_invalidate_dns(void);
 // After cancel, wait for the worker's TLS and platform cleanup before taking WiFi.
 esp_err_t cloud_realtime_wait_idle(uint32_t timeout_ms);
 bool cloud_realtime_ready(void);
@@ -31,7 +32,7 @@ bool cloud_realtime_ready(void);
 bool cloud_realtime_recovering(void);
 bool cloud_realtime_direct_enabled(void);
 esp_err_t cloud_realtime_request_direct(void);
-esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id);
+esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id, bool standby);
 esp_err_t cloud_realtime_stream_start(agent_stream_t type);
 esp_err_t cloud_realtime_stream_write(agent_stream_t type, const uint8_t* data, size_t bytes);
 esp_err_t cloud_realtime_stream_end(agent_stream_t type, bool complete);

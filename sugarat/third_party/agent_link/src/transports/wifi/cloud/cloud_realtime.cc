@@ -45,9 +45,13 @@
 #include "esp_opus_enc.h"
 #endif
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_USING_MBEDTLS
+#include "mbedtls/ssl.h"
+#endif
 #include "mbedtls/version.h"
 #if MBEDTLS_VERSION_MAJOR >= 4
 #include "psa/crypto.h"
@@ -56,14 +60,31 @@
 #endif
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
+#endif
 
 namespace {
 using agentlink::realtime::AudioFormat;
 using agentlink::realtime::ReadAudioFormat;
 using namespace agentlink::cloud_limits;
 constexpr const char* TAG = "agent_link.realtime";
+#if CONFIG_IDF_TARGET_ESP32S3
+constexpr uint32_t kDmaCaps = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+
+void ReportDmaHeap(const char* phase) {
+    multi_heap_info_t info{};
+    heap_caps_get_info(&info, kDmaCaps);
+    ESP_LOGI(TAG, "Voice DMA heap: phase=%s free=%u largest=%u min=%u",
+             phase, static_cast<unsigned>(info.total_free_bytes),
+             static_cast<unsigned>(info.largest_free_block),
+             static_cast<unsigned>(info.minimum_free_bytes));
+}
+#endif
 constexpr int kConnectTimeoutMs = 10000;
 constexpr int kSendTimeoutMs = 3000;
+constexpr int64_t kWorkerYieldUs = 20000;
 constexpr int64_t kReportAudioGapUs = 150000;
 constexpr size_t kMicBytes = 640;
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -77,9 +98,14 @@ constexpr size_t kUplinkBatchBytes = kMicBytes * kUplinkBatchPackets;
 constexpr char kAudioPrefix[] = "{\"type\":\"input_audio.append\",\"audio\":\"";
 constexpr size_t kAudioJsonBytes = sizeof(kAudioPrefix) - 1 + (kUplinkBatchBytes + 2) / 3 * 4 + 3;
 constexpr int64_t kReadyTimeoutUs = 10000000;
-#if CONFIG_IDF_TARGET_ESP32C3
+constexpr int64_t kPreparedUseMarginUs = 10000000;
+constexpr int64_t kPrepareRetryUs = 15000000;
+constexpr int64_t kPrepareLeaseUs = 4000000;
+#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
+#define AGENT_LINK_NATIVE_WSS 1
 using VoiceTls = esp_tls_t*;
 #else
+#define AGENT_LINK_NATIVE_WSS 0
 using VoiceTls = esp_transport_handle_t;
 #endif
 
@@ -93,11 +119,20 @@ struct Grant {
     char url[512];
     char token[256];
     uint32_t epoch;
+    int64_t expires_us;
     bool direct;
     agentlink::realtime::AudioFormat audio;
     bool platform;
     int agent_id;
     char session_id[80];
+};
+
+struct PrepareRoute {
+    int agent_id;
+    char session_id[sizeof Grant::session_id];
+    int64_t maintain_until_us;
+    int64_t next_attempt_us;
+    uint32_t generation;
 };
 
 enum class TxKind { kStart, kPcm, kEnd };
@@ -136,6 +171,35 @@ struct WssAddress {
     int  port = 443;
 };
 
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+// Only the realtime worker accesses this ticket. It retains no socket and
+// can only resume a previously authenticated connection to the same origin.
+struct WssTicket {
+    std::unique_ptr<esp_tls_client_session_t, decltype(&esp_tls_free_client_session)>
+        session{nullptr, esp_tls_free_client_session};
+    char host[sizeof WssAddress::host]{};
+    int port = 0;
+    int64_t expires_us = 0;
+
+    esp_tls_client_session_t* For(const WssAddress& addr) {
+        if (esp_timer_get_time() >= expires_us || port != addr.port || strcmp(host, addr.host) != 0) {
+            session.reset();
+        }
+        return session.get();
+    }
+
+    void Save(const WssAddress& addr, esp_tls_t* tls) {
+        session.reset(esp_tls_get_client_session(tls));
+        if (!session) return;
+        memcpy(host, addr.host, sizeof host);
+        port = addr.port;
+        expires_us = esp_timer_get_time() + 10 * 60 * 1000000LL;
+        ESP_LOGI(TAG, "Voice TLS ticket stored for next call");
+    }
+};
+WssTicket s_wss_ticket;
+#endif
+
 QueueHandle_t              s_grants = nullptr;
 bool                       s_grants_caps = false;
 std::atomic<TaskHandle_t>  s_task{nullptr};
@@ -148,6 +212,8 @@ std::atomic<bool>          s_continuous{false};
 std::atomic<uint32_t>      s_epoch{0};
 std::atomic<uint32_t>      s_reset{0};
 std::mutex                s_mutex;
+PrepareRoute              s_prepare = {};
+Grant                     s_prepared = {};
 QueueHandle_t             s_tx = nullptr;
 bool                      s_tx_caps = false;
 agent_stream_t            s_input = AGENT_STREAM_KIND_COUNT;
@@ -271,6 +337,66 @@ bool ParseWss(const char* url, WssAddress* out) {
     }
     return true;
 }
+
+#if CONFIG_IDF_TARGET_ESP32S3
+constexpr int64_t kVoiceDnsCacheUs = 60 * 1000000LL;
+std::mutex s_voice_dns_mutex;
+struct {
+    char host[sizeof WssAddress::host];
+    char ip[IPADDR_STRLEN_MAX];
+    int64_t expires_us;
+    uint32_t generation;
+} s_voice_dns = {};
+
+struct VoiceDnsQuery {
+    char host[sizeof WssAddress::host];
+    int64_t start_us;
+    uint32_t generation;
+};
+
+bool CopyVoiceDns(const char* host, char (&ip)[IPADDR_STRLEN_MAX]) {
+    std::lock_guard<std::mutex> lock(s_voice_dns_mutex);
+    if (s_voice_dns.expires_us <= esp_timer_get_time() || strcmp(s_voice_dns.host, host) != 0) return false;
+    memcpy(ip, s_voice_dns.ip, sizeof ip);
+    return true;
+}
+
+void VoiceDnsDone(const char*, const ip_addr_t* addr, void* context) {
+    std::unique_ptr<VoiceDnsQuery> query(static_cast<VoiceDnsQuery*>(context));
+    char ip[IPADDR_STRLEN_MAX]{};
+    if (addr && ipaddr_ntoa_r(addr, ip, sizeof ip)) {
+        std::lock_guard<std::mutex> lock(s_voice_dns_mutex);
+        if (query->generation == s_voice_dns.generation) {
+            memcpy(s_voice_dns.host, query->host, sizeof s_voice_dns.host);
+            memcpy(s_voice_dns.ip, ip, sizeof s_voice_dns.ip);
+            s_voice_dns.expires_us = esp_timer_get_time() + kVoiceDnsCacheUs;
+        }
+    }
+    ESP_LOGI(TAG, "Voice DNS prefetch: result=%s ms=%u", addr ? "resolved" : "failed",
+             static_cast<unsigned>((esp_timer_get_time() - query->start_us) / 1000));
+}
+
+void ResolveVoiceDns(void* context) {
+    auto* query = static_cast<VoiceDnsQuery*>(context);
+    ip_addr_t addr;
+    const err_t result = dns_gethostbyname(query->host, &addr, &VoiceDnsDone, query);
+    if (result != ERR_INPROGRESS) VoiceDnsDone(query->host, result == ERR_OK ? &addr : nullptr, query);
+}
+
+void PrefetchVoiceDns(const char* url) {
+    WssAddress addr{};
+    if (!ParseWss(url, &addr)) return;
+    auto* query = new (std::nothrow) VoiceDnsQuery{{}, esp_timer_get_time(), 0};
+    if (!query) return;
+    memcpy(query->host, addr.host, sizeof query->host);
+    {
+        std::lock_guard<std::mutex> lock(s_voice_dns_mutex);
+        query->generation = s_voice_dns.generation;
+    }
+    // Enqueue a DNS query on lwIP without delaying the next call or opening a socket.
+    if (tcpip_try_callback(&ResolveVoiceDns, query) != ERR_OK) delete query;
+}
+#endif
 
 bool SafeToken(const char* token) {
     if (!token || !*token || strlen(token) >= sizeof Grant::token) return false;
@@ -432,8 +558,9 @@ void EndDirectSession() {
 void LogTransportFailure(VoiceTls transport, const char* operation,
                          int result, int saved_errno) {
     int tls_code = 0, tls_flags = 0;
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
     esp_tls_error_handle_t error = nullptr;
+    if (!transport) return;
     (void)esp_tls_get_error_handle(transport, &error);
     int socket_error = 0, socket = -1;
     socklen_t size = sizeof socket_error;
@@ -460,16 +587,22 @@ struct WsSender {
     uint8_t* wire;
     size_t capacity;
     int64_t last_slow_log = 0;
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
     agentlink::realtime::PendingWrite pending;
     unsigned audio_frames = 0, audio_messages = 0;
     size_t audio_bytes = 0;
     int64_t queued_at = 0;
+    uint32_t receive_at_first_wait = 0;
+    int64_t first_wait_at = 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+    int64_t last_data_received_ms = 0;
+    bool wait_extension_logged = false;
+#endif
 #endif
 };
 
 int PollWritable(VoiceTls tls) {
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
     int socket = -1;
     if (esp_tls_get_conn_sockfd(tls, &socket) != ESP_OK || socket < 0) return -1;
     fd_set writes; FD_ZERO(&writes); FD_SET(socket, &writes);
@@ -480,7 +613,7 @@ int PollWritable(VoiceTls tls) {
 #endif
 }
 
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
 bool TlsWouldBlock(int result) {
     return result == ESP_TLS_ERR_SSL_WANT_READ || result == ESP_TLS_ERR_SSL_WANT_WRITE;
 }
@@ -488,15 +621,32 @@ bool TlsWouldBlock(int result) {
 bool PumpWire(WsSender& sender) {
     if (!sender.pending.Busy()) return true;
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (sender.pending.Expired(now_ms)) {
-        ESP_LOGW(TAG, "voice TLS write expired: no_progress_ms=%lld age_ms=%lld pending=%u offset=%u",
-                 static_cast<long long>(sender.pending.StalledMs(now_ms)),
-                 static_cast<long long>(sender.pending.AgeMs(now_ms)),
+    using agentlink::realtime::PendingWrite;
+    int64_t stall_limit_ms = PendingWrite::kStallMs;
+#if CONFIG_IDF_TARGET_ESP32S3
+    const bool receiving = sender.audio_messages && sender.first_wait_at &&
+                           sender.last_data_received_ms >= sender.first_wait_at / 1000 &&
+                           now_ms - sender.last_data_received_ms <= 1000;
+    if (receiving) {
+        stall_limit_ms = 6000;
+        if (!sender.wait_extension_logged && sender.pending.StalledMs(now_ms) >= PendingWrite::kStallMs) {
+            sender.wait_extension_logged = true;
+            ESP_LOGI(TAG, "Voice TLS write waiting: downlink active, limit_ms=%lld",
+                     static_cast<long long>(stall_limit_ms));
+        }
+    }
+#endif
+    const auto timed_out = [&](int64_t at_ms) {
+        ESP_LOGW(TAG, "voice TLS write expired: no_progress_ms=%lld age_ms=%lld limit_ms=%lld pending=%u offset=%u rx_while_waiting=%u",
+                 static_cast<long long>(sender.pending.StalledMs(at_ms)),
+                 static_cast<long long>(sender.pending.AgeMs(at_ms)), static_cast<long long>(stall_limit_ms),
                  static_cast<unsigned>(sender.pending.Remaining()),
-                 static_cast<unsigned>(sender.pending.Offset()));
+                 static_cast<unsigned>(sender.pending.Offset()),
+                 sender.first_wait_at ? static_cast<unsigned>(s_rx_bytes.load() - sender.receive_at_first_wait) : 0);
         LogTransportFailure(sender.tls, "write progress timeout", 0, 0);
         return false;
-    }
+    };
+    if (sender.pending.Expired(now_ms, stall_limit_ms)) return timed_out(now_ms);
     // Retry exactly the retained suffix, including after WANT_READ/WANT_WRITE.
     // This socket stays nonblocking after the verified async TLS handshake.
     // select() has a TCP low-water threshold, not a promise that this small
@@ -506,19 +656,43 @@ bool PumpWire(WsSender& sender) {
     const size_t remaining = sender.pending.Remaining();
     errno = 0;
     const int sent = esp_tls_conn_write(sender.tls, sender.wire + sender.pending.Offset(), remaining);
+#if CONFIG_IDF_TARGET_ESP32S3 && MBEDTLS_VERSION_MAJOR >= 4
+    if (sent == PSA_ERROR_GENERIC_ERROR) ReportDmaHeap("tls_write_failed");
+#endif
     const bool waiting = TlsWouldBlock(sent);
-    if (waiting) s_tx_would_block.fetch_add(1);
+    if (waiting) {
+        s_tx_would_block.fetch_add(1);
+        if (!sender.first_wait_at) {
+            sender.first_wait_at = esp_timer_get_time();
+            sender.receive_at_first_wait = s_rx_bytes.load();
+        }
+    }
     if (sent > 0 && static_cast<size_t>(sent) < remaining) s_tx_partial.fetch_add(1);
     if (sent > 0 && writable == 0) s_tx_select0_accepted.fetch_add(1);
-    if (!sender.pending.Advance(sent, waiting, esp_timer_get_time() / 1000)) {
+    const int64_t finished_ms = esp_timer_get_time() / 1000;
+    if (!sender.pending.Advance(sent, waiting, finished_ms, stall_limit_ms)) {
+        if (waiting && sender.pending.Expired(finished_ms, stall_limit_ms)) return timed_out(finished_ms);
         LogTransportFailure(sender.tls, "write", sent, errno);
         return false;
     }
     if (!sender.pending.Busy()) {
+        const uint32_t waited_rx = s_rx_bytes.load() - sender.receive_at_first_wait;
+        if (sender.first_wait_at && waited_rx && esp_timer_get_time() - sender.first_wait_at >= kReportAudioGapUs) {
+            ESP_LOGI(TAG, "Voice TLS write resumed: wait_ms=%u rx_while_waiting=%u",
+                     static_cast<unsigned>((esp_timer_get_time() - sender.first_wait_at) / 1000),
+                     static_cast<unsigned>(waited_rx));
+        }
+        sender.first_wait_at = 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+        sender.wait_extension_logged = false;
+#endif
         memset(sender.wire, 0, sender.pending.Size());
         if (sender.audio_messages) {
             const uint32_t elapsed = static_cast<uint32_t>((esp_timer_get_time() - sender.queued_at) / 1000);
-            s_tx_sent_frames.fetch_add(sender.audio_frames);
+            const uint32_t previously_sent = s_tx_sent_frames.fetch_add(sender.audio_frames);
+            if (s_continuous.load() && previously_sent == 0)
+                ESP_LOGI(TAG, "Voice first uplink: sent_ms=%u frames=%u",
+                         static_cast<unsigned>(esp_timer_get_time() / 1000), sender.audio_frames);
             s_tx_sent_messages.fetch_add(sender.audio_messages);
             s_tx_bytes.fetch_add(static_cast<uint32_t>(sender.audio_bytes));
             s_tx_write_calls.fetch_add(1);
@@ -534,7 +708,7 @@ bool PumpWire(WsSender& sender) {
 
 bool WriteWire(WsSender& sender, size_t expected) {
     if (!expected || expected > sender.capacity) return false;
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
     if (sender.pending.Busy()) return false;
     sender.queued_at = esp_timer_get_time();
     return sender.pending.Begin(expected, sender.queued_at / 1000);
@@ -566,7 +740,7 @@ bool WriteWire(WsSender& sender, size_t expected) {
 #endif
 }
 
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
 bool PumpControl(WsSender& sender, const uint8_t* pong, size_t pong_size,
                  bool* pong_pending, int64_t* last_ping, int64_t now) {
     if (sender.pending.Busy()) return true;
@@ -584,7 +758,7 @@ bool PumpControl(WsSender& sender, const uint8_t* pong, size_t pong_size,
 #endif
 
 size_t AppendFrame(WsSender& sender, size_t offset, const char* json, size_t bytes) {
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
     if (sender.pending.Busy()) return 0;
 #endif
     if (offset > sender.capacity) return 0;
@@ -685,12 +859,21 @@ public:
 #else
         constexpr unsigned stack_bytes = 8192;
 #endif
-        media_started_ = xTaskCreate(&MediaEntry, "agentlink_audio", stack_bytes, this, 5, nullptr) == pdPASS;
+        media_caps_ = true;
+        media_started_ = xTaskCreateWithCaps(&MediaEntry, "agentlink_audio", stack_bytes, this, 5,
+                                           nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+        if (!media_started_) {
+            media_caps_ = false;
+            media_started_ = xTaskCreate(&MediaEntry, "agentlink_audio", stack_bytes, this, 5, nullptr) == pdPASS;
+        }
         if (!media_started_)
             ESP_LOGE(TAG, "could not start downlink audio worker (%uB stack, internal free=%u largest=%u)",
                      stack_bytes,
                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        else
+            ESP_LOGI(TAG, "Downlink audio stack=%s; DMA heap free=%uB", media_caps_ ? "PSRAM" : "internal",
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)));
         return media_started_;
 #endif
     }
@@ -1074,6 +1257,9 @@ public:
             // Codec allocation must succeed before enabling capture/UI readiness.
             if (audio_.input_opus && !StartEncoder()) { cJSON_Delete(json); return false; }
 #endif
+#if CONFIG_IDF_TARGET_ESP32S3
+            ReportDmaHeap("session_ready");
+#endif
             s_mute.store(false);
             if (!s_ready.exchange(true) && s_cb.state)
                 s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
@@ -1173,15 +1359,15 @@ public:
 
     bool FlushTx(WsSender& ws, TxScratch* scratch) {
         if (!s_ready) return true;
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
         if (ws.pending.Busy()) return true;
 #endif
 #if CONFIG_AGENT_LINK_REALTIME_OPUS && !CONFIG_IDF_TARGET_ESP32C3
         if (input_opus_.load() && !StartEncoder()) return false;
 #endif
         if (!TxPending()) return true;
-#if !CONFIG_IDF_TARGET_ESP32C3
-        // Other targets use the blocking transport adapter. C3 instead queues
+#if !AGENT_LINK_NATIVE_WSS
+        // The blocking transport adapter polls before writing. Native WSS queues
         // one immutable frame and drives actual nonblocking TLS write progress.
         errno = 0;
         const int writable = PollWritable(ws.tls);
@@ -1250,7 +1436,7 @@ public:
 #endif
         }
         Tx packet;
-        const unsigned sends_per_pass = continuous_ ? 1 : 8;
+        const unsigned sends_per_pass = (AGENT_LINK_NATIVE_WSS || continuous_) ? 1 : 8;
         for (unsigned i = 0; i < sends_per_pass && Current(epoch_) &&
                              xQueueReceive(s_tx, &packet, 0) == pdTRUE; ++i) {
             if (packet.kind == TxKind::kPcm) {
@@ -1331,8 +1517,10 @@ private:
             s_media_stack.store(uxTaskGetStackHighWaterMark(nullptr));
             if (!handled) running_.store(false);
         }
+        const bool caps = media_caps_;
         media_done_.store(true);
-        vTaskDelete(nullptr);
+        if (caps) vTaskDeleteWithCaps(nullptr);
+        else vTaskDelete(nullptr);
     }
 
     size_t AudioJson(TxScratch* scratch, const uint8_t* data, size_t bytes) {
@@ -1356,7 +1544,7 @@ private:
 
     bool WriteAudio(WsSender& ws, size_t wire_bytes, size_t json_bytes,
                     unsigned pcm_packets, unsigned messages) {
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
         if (!WriteWire(ws, wire_bytes)) { transport_failed_ = true; return false; }
         ws.audio_frames = pcm_packets; ws.audio_messages = messages; ws.audio_bytes = json_bytes;
         return true;
@@ -1376,7 +1564,10 @@ private:
                      static_cast<unsigned>((uxQueueMessagesWaiting(s_tx) + s_encoded_pending.load()) * 20));
             return false;
         }
-        s_tx_sent_frames.fetch_add(pcm_packets);
+        const uint32_t previously_sent = s_tx_sent_frames.fetch_add(pcm_packets);
+        if (continuous_ && previously_sent == 0)
+            ESP_LOGI(TAG, "Voice first uplink: sent_ms=%u frames=%u",
+                     static_cast<unsigned>(esp_timer_get_time() / 1000), pcm_packets);
         s_tx_sent_messages.fetch_add(messages);
         s_tx_bytes.fetch_add(json_bytes);
         return true;
@@ -1542,10 +1733,15 @@ private:
         agentlink::realtime::PcmFrames<kMicBytes> frames;
         Tx input;
         EncodedTx output{};
+        int64_t last_yield = esp_timer_get_time();
         while (valid && Healthy() && Current(epoch_)) {
             if (xQueueReceive(s_tx, &input, pdMS_TO_TICKS(10)) != pdTRUE) continue;
             valid = EncodeInput(input, frames, output);
             s_encoder_stack.store(uxTaskGetStackHighWaterMark(nullptr));
+            if (esp_timer_get_time() - last_yield >= kWorkerYieldUs) {
+                vTaskDelay(1);
+                last_yield = esp_timer_get_time();
+            }
         }
         if (!valid && Healthy() && Current(epoch_)) {
             ESP_LOGW(TAG, "microphone Opus worker stopped after a codec error");
@@ -1574,7 +1770,7 @@ private:
     bool encoder_started_ = false, encoder_caps_ = false;
     std::atomic<bool> encoder_done_{false};
     QueueHandle_t rx_queue_ = nullptr;
-    bool rx_caps_ = false, media_started_ = false;
+    bool rx_caps_ = false, media_started_ = false, media_caps_ = false;
     std::atomic<bool> running_{true}, media_done_{false};
     int16_t* decode_pcm_ = nullptr;
     const char* connect_token_ = nullptr;
@@ -1596,7 +1792,7 @@ private:
 #endif
 };
 
-#if CONFIG_IDF_TARGET_ESP32C3
+#if AGENT_LINK_NATIVE_WSS
 class NativeWss {
 public:
     NativeWss() : tls(esp_tls_init()) {}
@@ -1609,19 +1805,78 @@ public:
         config.non_block = true;
         config.timeout_ms = kConnectTimeoutMs;
         config.crt_bundle_attach = esp_crt_bundle_attach;
+        const char* connect_host = addr.host;
+#if CONFIG_IDF_TARGET_ESP32S3
+        // Offer TLS 1.3 and TLS 1.2 in the same ClientHello. The peer can
+        // select 1.2 without a second TCP connection or a failed handshake.
+        config.tls_version = ESP_TLS_VER_ANY;
+        char cached_ip[IPADDR_STRLEN_MAX];
+        const bool cached_dns = CopyVoiceDns(addr.host, cached_ip);
+        if (cached_dns) {
+            connect_host = cached_ip;
+            dns_path = "cached_ip";
+        }
+        // Address selection is independent of certificate verification and SNI.
+        config.common_name = addr.host;
+#endif
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+        config.client_session = s_wss_ticket.For(addr);
+        ticket_offered = config.client_session != nullptr;
+#endif
 #if CONFIG_MBEDTLS_DYNAMIC_BUFFER
         // Reserve the peer's full record after the handshake, before Opus.
         // Dynamic TX remains small; RX is reused for the life of this call.
         config.esp_tls_dyn_buf_strategy = ESP_TLS_DYN_BUF_RX_STATIC;
 #endif
         const int64_t deadline = esp_timer_get_time() + kConnectTimeoutMs * 1000LL;
-        int result = 0;
-        while (Current(epoch) && esp_timer_get_time() < deadline) {
-            result = esp_tls_conn_new_async(addr.host, strlen(addr.host), addr.port, &config, tls);
-            if (result != 0) break;
-            vTaskDelay(1);
+        const auto handshake = [&] {
+            const int64_t setup_started = esp_timer_get_time();
+            setup_ms = -1;
+            while (Current(epoch) && esp_timer_get_time() < deadline) {
+                const int result = esp_tls_conn_new_async(connect_host, strlen(connect_host), addr.port, &config, tls);
+                if (setup_ms < 0) setup_ms = static_cast<int>((esp_timer_get_time() - setup_started) / 1000);
+                if (result != 0) return result == 1 && Current(epoch);
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+                // ESP-IDF reapplies client_session on every handshake step.
+                // mbedTLS accepts it only before processing the ClientHello.
+                esp_tls_conn_state_t state;
+                if (config.client_session && esp_tls_get_conn_state(tls, &state) == ESP_OK &&
+                    state == ESP_TLS_HANDSHAKE) config.client_session = nullptr;
+#endif
+                vTaskDelay(1);
+            }
+            return false;
+        };
+        if (!handshake()) {
+#if CONFIG_IDF_TARGET_ESP32S3
+            if (!Current(epoch) || (!cached_dns && !ticket_offered)) return false;
+            LogTransportFailure(tls, "TLS initial attempt", -1, errno);
+            // No session.connect has been sent. The grant can still be used
+            // immediately on the fresh TLS socket.
+            if (cached_dns) {
+                cloud_realtime_invalidate_dns();
+                dns_path = "resolver_fallback";
+                connect_host = addr.host;
+            }
+#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+            if (ticket_offered) s_wss_ticket.session.reset();
+            config.client_session = nullptr;
+#endif
+            ticket_fallback = ticket_offered;
+            esp_tls_conn_destroy(tls);
+            tls = esp_tls_init();
+            if (!tls || !handshake()) return false;
+#else
+            return false;
+#endif
         }
-        if (result != 1 || !Current(epoch)) return false;
+        tls_ready_us = esp_timer_get_time();
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_USING_MBEDTLS
+        if (const auto* ssl = static_cast<const mbedtls_ssl_context*>(esp_tls_get_ssl_context(tls))) {
+            tls_version = mbedtls_ssl_get_version(ssl);
+            if (const char* cipher = mbedtls_ssl_get_ciphersuite(ssl)) tls_cipher = cipher;
+        }
+#endif
         int socket = -1;
         const int enabled = 1;
         if (esp_tls_get_conn_sockfd(tls, &socket) != ESP_OK || socket < 0) return false;
@@ -1650,6 +1905,7 @@ public:
             "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Protocol: tidb-link.realtime.v1\r\n\r\n", addr.path, addr.host, addr.port, key);
         if (request_size <= 0 || request_size >= static_cast<int>(sizeof scratch.json)) return false;
+        int result = 0;
         size_t sent = 0, received = 0;
         auto* header = reinterpret_cast<char*>(storage.Data());
         while (Current(epoch) && esp_timer_get_time() < deadline) {
@@ -1681,30 +1937,58 @@ public:
         return false;
     }
     esp_tls_t* tls;
+    int64_t tls_ready_us = 0;
+    int setup_ms = -1;
+    const char* tls_version = "-";
+    const char* tls_cipher = "-";
+    const char* dns_path = "resolver";
+    bool ticket_offered = false;
+    bool ticket_fallback = false;
 };
 
-// One resident C3 worker owns TLS, framing and codecs. I2S capture/playback stay
-// on the board's independent workers. No 40 KB task is allocated during a call.
+// One worker owns the nonblocking TLS socket. S3 uses separate audio workers;
+// C3 also runs the codecs here to fit its smaller RAM budget.
 bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery) {
     WssAddress addr{};
     if (!ParseWss(grant.url, &addr)) return false;
     agentlink::cloud::NetworkMemoryLock memory;
     if (!Current(grant.epoch)) return false;
     VoiceWifiPower power;
+#if CONFIG_IDF_TARGET_ESP32S3
+    ReportDmaHeap("before_wss");
+#endif
     agentlink::realtime::MessageBuffer message(kMessageInitialBytes, kMessageBytes, ResizeMessage);
-    std::unique_ptr<TxScratch> scratch(new (std::nothrow) TxScratch{});
+    std::unique_ptr<TxScratch, decltype(&free)> scratch(
+        static_cast<TxScratch*>(heap_caps_malloc(sizeof(TxScratch), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)), &free);
+    if (!scratch) scratch.reset(static_cast<TxScratch*>(malloc(sizeof(TxScratch))));
     // Keep metadata off the shared stack: the codec needs most of its depth.
-    std::unique_ptr<Call> owner(new (std::nothrow) Call(grant.epoch, grant.audio, grant.platform, grant.token));
+    std::unique_ptr<Call> owner(new (std::nothrow) Call(grant.epoch, grant.audio, grant.platform, grant.token,
+                                                      grant.platform ? grant.session_id : nullptr));
     if (!message.Data() || !scratch || !owner) return false;
     NativeWss connection;
     size_t trailing = 0;
     int status = 0;
     if (s_cb.state) s_cb.state(false, "Connecting voice");
-    if (!connection.Connect(addr, grant.epoch, *scratch, message, &trailing, &status)) {
+    const int64_t handshake_started = esp_timer_get_time();
+    const bool connected = connection.Connect(addr, grant.epoch, *scratch, message, &trailing, &status);
+    const int64_t handshake_finished = esp_timer_get_time();
+    const int tls_ms = connection.tls_ready_us ? static_cast<int>((connection.tls_ready_us - handshake_started) / 1000) : -1;
+    const int upgrade_ms = connection.tls_ready_us ? static_cast<int>((handshake_finished - connection.tls_ready_us) / 1000) : -1;
+    ESP_LOGI(TAG, "Voice stage WSS handshake: ms=%u tls=%s cipher=%s tls_ms=%d setup_ms=%d upgrade_ms=%d dns=%s ticket=%s end_ms=%u result=%d (nonblocking)",
+             static_cast<unsigned>((handshake_finished - handshake_started) / 1000),
+             connection.tls_version, connection.tls_cipher, tls_ms, connection.setup_ms,
+             upgrade_ms, connection.dns_path,
+             connection.ticket_fallback ? "fallback" : connection.ticket_offered ? "offered" : "none",
+             static_cast<unsigned>(handshake_finished / 1000),
+             connected ? 0 : -1);
+    if (!connected) {
         LogTransportFailure(connection.tls, "connect/upgrade", -1, errno);
         ESP_LOGW(TAG, "WSS connection failed (upgrade HTTP %d)", status);
         return status <= 0 || status >= 500;
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    ReportDmaHeap("after_wss");
+#endif
     // Keep a full message alongside the fixed TLS record. Growing/shrinking
     // this buffer during playback otherwise introduces another large realloc.
     if (!message.Reserve(kMessageBytes)) {
@@ -1719,7 +2003,9 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     Call& call = *owner;
     if (!Current(grant.epoch) || !call.Prepare() || !call.Start()) return false;
     WsSender sender{connection.tls, scratch->wire, sizeof scratch->wire};
+#if CONFIG_IDF_TARGET_ESP32C3
     call.BindNetwork(&sender, scratch.get());
+#endif
     char hello[sizeof Grant::token * 2 + 128];
     size_t n = snprintf(hello, sizeof hello, "{\"type\":\"session.connect\",\"connect_token\":\"");
     for (const char* p = grant.token; *p && n + 4 < sizeof hello; ++p) {
@@ -1731,16 +2017,22 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     const bool queued = Send(sender, hello, n);
     memset(hello, 0, sizeof hello);
     if (!queued) return true;
+    bool hello_sent = false;
 
     agentlink::realtime::FrameReader reader(kMessageBytes);
     agentlink::realtime::Message assembler(message.Data(), message.Capacity());
     uint8_t control[125]{}, pong[125]{};
     size_t control_size = 0, pong_size = 0;
-    bool pong_pending = false, retryable = false;
+    bool pong_pending = false, retryable = false, pending_message = false;
+    uint32_t pending_reset = 0;
+    int64_t pending_at = 0;
     const int64_t connected_at = esp_timer_get_time();
     int64_t last_rx = connected_at, last_ping = connected_at, last_yield = connected_at;
     uint32_t observed_tx = s_tx_sent_frames.load();
-    auto receive = [&](const uint8_t* data, size_t bytes) {
+    auto deliver = [&](unsigned opcode) {
+        pending_message = !call.Deliver(opcode, message.Data(), assembler.Size(), pending_at, pending_reset);
+    };
+    auto receive = [&](const uint8_t* data, size_t bytes, size_t* consumed) {
         return reader.Consume(data, bytes, [&](unsigned opcode, bool first, bool end, bool fin,
                                               const uint8_t* payload, size_t count) {
             if (opcode >= 8) {
@@ -1765,35 +2057,64 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             if (result == agentlink::realtime::Message::kError) return false;
             if (result == agentlink::realtime::Message::kComplete) {
                 if (assembler.Opcode() == 1 && IsInterruption(message.Data(), assembler.Size())) s_reset.fetch_add(1);
-                call.Deliver(assembler.Opcode(), message.Data(), assembler.Size(), last_rx, s_reset.load());
-                // Retain the reservation through every reply; no realloc here.
+                pending_at = last_rx;
+#if CONFIG_IDF_TARGET_ESP32S3
+                sender.last_data_received_ms = pending_at / 1000;
+#endif
+                pending_reset = s_reset.load();
+                deliver(assembler.Opcode());
             }
             return call.Healthy() && Current(grant.epoch);
-        });
+        }, &pending_message, consumed);
     };
     // Preserve bytes received with the HTTP upgrade (including an early ping).
-    bool valid = !trailing || receive(scratch->read, trailing);
+    size_t rx_offset = 0, rx_size = trailing;
+    bool valid = true;
     while (valid && Current(grant.epoch) && call.Healthy()) {
-        if (!call.Pump() || !PumpWire(sender)) { retryable = call.Healthy() || call.TransportFailed(); break; }
+#if CONFIG_IDF_TARGET_ESP32C3
+        if (!call.Pump()) { retryable = call.TransportFailed(); break; }
+#endif
+        if (!PumpWire(sender)) { retryable = true; break; }
         const int64_t now = esp_timer_get_time();
+        if (!hello_sent && !sender.pending.Busy()) {
+            hello_sent = true;
+#if !CONFIG_IDF_TARGET_ESP32C3
+            call.NoteHelloSent();
+#endif
+            ESP_LOGI(TAG, "Voice stage session.connect sent: after_upgrade_ms=%u",
+                     static_cast<unsigned>((now - handshake_finished) / 1000));
+        }
         // Reply to server pings and send our keepalive before queuing more audio.
         if (!PumpControl(sender, pong, pong_size, &pong_pending, &last_ping, now)) {
             retryable = true; break;
         }
-        if (!call.FlushTx(sender, scratch.get())) { retryable = call.TransportFailed(); break; }
+        if (hello_sent && !call.FlushTx(sender, scratch.get())) { retryable = call.TransportFailed(); break; }
         if ((!s_ready && now - connected_at > kReadyTimeoutUs) || now - last_rx > 45000000) {
             ESP_LOGW(TAG, "voice session timed out"); retryable = true; break;
         }
-        SetWorkerPhase(3);
-        errno = 0;
-        const int got = esp_tls_conn_read(connection.tls, scratch->read, sizeof scratch->read);
-        SetWorkerPhase(0);
-        if (got > 0) {
-            s_rx_bytes.fetch_add(got); last_rx = esp_timer_get_time();
-            valid = receive(scratch->read, got);
-            if (!valid) retryable = call.TransportFailed();
-        } else if (!TlsWouldBlock(got)) {
-            LogTransportFailure(connection.tls, "read", got, errno); retryable = true; break;
+        if (pending_message) deliver(assembler.Opcode());
+        int got = 0;
+        if (!pending_message) {
+            if (rx_offset == rx_size) {
+                SetWorkerPhase(3);
+                errno = 0;
+                got = esp_tls_conn_read(connection.tls, scratch->read, sizeof scratch->read);
+                SetWorkerPhase(0);
+                if (got > 0) {
+                    s_rx_bytes.fetch_add(got);
+                    last_rx = esp_timer_get_time();
+                    rx_offset = 0;
+                    rx_size = static_cast<size_t>(got);
+                } else if (!TlsWouldBlock(got)) {
+                    LogTransportFailure(connection.tls, "read", got, errno); retryable = true; break;
+                }
+            }
+            if (rx_offset < rx_size) {
+                size_t consumed = 0;
+                valid = receive(scratch->read + rx_offset, rx_size - rx_offset, &consumed);
+                rx_offset += consumed;
+                if (!valid) retryable = call.TransportFailed();
+            }
         }
         const uint32_t sent_frames = s_tx_sent_frames.load();
         if (recovery.Observe(s_ready.load(), sent_frames != observed_tx, got > 0,
@@ -1810,6 +2131,9 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     if (!retryable && !sender.pending.Busy()) {
         if (Send(sender, "{\"type\":\"session.end\"}")) (void)PumpWire(sender);
     }
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+    s_wss_ticket.Save(addr, connection.tls);
+#endif
     memset(scratch->wire, 0, sizeof scratch->wire);
     return retryable;
 }
@@ -1926,9 +2250,15 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             uint32_t pending_reset = 0;
             const int64_t connected_at = esp_timer_get_time();
             int64_t last_rx = connected_at, last_ping = connected_at;
+            int64_t last_yield = connected_at;
             uint32_t observed_tx = s_tx_sent_frames.load();
             SetWorkerPhase(0);
             while (Current(grant.epoch) && call.Healthy()) {
+                // A backlog can keep both TLS writes and zero-time polls immediately runnable.
+                if (esp_timer_get_time() - last_yield >= kWorkerYieldUs) {
+                    vTaskDelay(1);
+                    last_yield = esp_timer_get_time();
+                }
                 if (!call.FlushTx(sender, scratch)) {
                     retryable = call.TransportFailed();
                     break;
@@ -2075,35 +2405,133 @@ void FinishGrant(uint32_t epoch) {
     }
 }
 
+bool SameRoute(const Grant& grant, int agent_id, const char* session_id) {
+    return grant.agent_id == agent_id && strcmp(grant.session_id, session_id) == 0;
+}
+
+// The worker serializes HTTPS renewal and consumption. A call queued during a
+// refresh can use its result, and no background job ever enters ConnectOnce().
+void MaintainPreparedGrant() {
+    Grant next = {};
+    uint32_t generation = 0;
+    bool refresh = false;
+    int64_t previous_expiry_us = 0;
+    AudioFormat previous_audio{};
+    const int64_t now = esp_timer_get_time();
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (s_prepared.expires_us <= now) s_prepared = {};
+        if (now >= s_prepare.maintain_until_us || now < s_prepare.next_attempt_us ||
+            uxQueueMessagesWaiting(s_grants)) return;
+        next.platform = true;
+        next.agent_id = s_prepare.agent_id;
+        memcpy(next.session_id, s_prepare.session_id, sizeof next.session_id);
+        generation = s_prepare.generation;
+        refresh = SameRoute(s_prepared, next.agent_id, next.session_id);
+        // A refresh may invalidate the previous token even if its response is lost.
+        if (refresh) {
+            previous_expiry_us = s_prepared.expires_us;
+            previous_audio = s_prepared.audio;
+            s_prepared = {};
+        }
+    }
+    int status = 0;
+    int business_code = 0;
+    const auto fetch = [&](bool renew) {
+        return cloud_platform_grant(next.agent_id, next.session_id, renew,
+                                    next.url, sizeof next.url, next.token, sizeof next.token,
+                                    &next.audio, &status, &next.expires_us, renew ? &previous_audio : nullptr,
+                                    renew ? &business_code : nullptr);
+    };
+    esp_err_t result = fetch(refresh);
+    const bool ended = refresh && result != ESP_OK && business_code == kVoiceGrantSessionEnded;
+    const bool unsupported = refresh && result == ESP_ERR_NOT_SUPPORTED && next.url[0] && next.token[0];
+    if (ended || unsupported) {
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (generation != s_prepare.generation || !s_run.load()) return;
+        }
+        if (ended) {
+            ESP_LOGI(TAG, "Voice grant cache: renewal code=%d; immediately requesting a fresh grant", business_code);
+        } else {
+            ESP_LOGW(TAG, "Voice grant audio: replacing unsupported renewal with a fresh grant");
+            cloud_platform_end_grant(next.agent_id, next.session_id);
+        }
+        memset(next.url, 0, sizeof next.url);
+        memset(next.token, 0, sizeof next.token);
+        next.audio = {};
+        result = fetch(false);
+    }
+    const int64_t finished = esp_timer_get_time();
+    const int64_t remaining_us = std::max<int64_t>(0, next.expires_us - finished);
+    const bool valid = result == ESP_OK && remaining_us > kPreparedUseMarginUs;
+    ESP_LOGI(TAG, "Voice grant cache: action=%s ms=%u http=%d result=%s remaining_ms=%u previous_remaining_ms=%d usable=%s",
+             ended || unsupported ? "regrant" : refresh ? "renew" : "prefetch",
+             static_cast<unsigned>((finished - now) / 1000), status,
+             esp_err_to_name(result), static_cast<unsigned>(remaining_us / 1000),
+             refresh ? static_cast<int>((previous_expiry_us - finished) / 1000) : -1, valid ? "yes" : "no");
+    // A successful reservation with no usable expiry must not block retries.
+    if (!valid && result == ESP_OK) cloud_platform_end_grant(next.agent_id, next.session_id);
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (generation != s_prepare.generation || !s_run.load()) return;
+    if (valid) {
+        s_prepared = next;
+#if CONFIG_IDF_TARGET_ESP32S3
+        PrefetchVoiceDns(next.url);
+#endif
+        const int64_t lead = std::min<int64_t>(15000000, (remaining_us + kPreparedUseMarginUs) / 2);
+        s_prepare.next_attempt_us = next.expires_us - lead;
+    } else {
+        s_prepare.next_attempt_us = esp_timer_get_time() + kPrepareRetryUs;
+    }
+}
+
+bool TakePreparedGrant(Grant* grant) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    const int64_t remaining_us = s_prepared.expires_us - esp_timer_get_time();
+    if (remaining_us <= kPreparedUseMarginUs ||
+        !SameRoute(s_prepared, grant->agent_id, grant->session_id)) return false;
+    const uint32_t epoch = grant->epoch;
+    *grant = s_prepared;
+    grant->epoch = epoch;
+    s_prepared = {};
+    ESP_LOGI(TAG, "Voice stage grant: source=cache remaining_ms=%u", static_cast<unsigned>(remaining_us / 1000));
+    return true;
+}
+
 void Worker(void*) {
     Grant grant = {};
     while (s_run.load(std::memory_order_acquire)) {
-        if (xQueueReceive(s_grants, &grant, pdMS_TO_TICKS(500)) != pdTRUE) continue;
+        if (xQueueReceive(s_grants, &grant, pdMS_TO_TICKS(250)) != pdTRUE) {
+            MaintainPreparedGrant();
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(s_mutex);
             if (!Current(grant.epoch)) continue;
             s_busy.store(true);
         }
         const char* hint = "Voice ended. Tap Connect to retry";
+        bool cached = grant.platform && TakePreparedGrant(&grant);
         agentlink::realtime::RecoverTransport([&](agentlink::realtime::RetryBudget& recovery) {
-            bool granted = !grant.direct && !grant.platform;
+            bool granted = cached || (!grant.direct && !grant.platform);
 #if CONFIG_AGENT_LINK_REALTIME_DIRECT
             if (grant.direct && Current(grant.epoch)) granted = FetchDirectGrant(&grant, &hint);
 #endif
-            if (grant.platform && Current(grant.epoch)) {
+            if (grant.platform && !cached && Current(grant.epoch)) {
                 int status = 0;
                 int64_t started = esp_timer_get_time();
                 esp_err_t result = cloud_platform_grant(grant.agent_id, grant.session_id, false,
                                                         grant.url, sizeof grant.url, grant.token, sizeof grant.token,
-                                                        &grant.audio, &status);
-                ESP_LOGI(TAG, "Voice stage grant: ms=%u http=%d result=%s",
+                                                        &grant.audio, &status, &grant.expires_us);
+                ESP_LOGI(TAG, "Voice stage grant: source=network ms=%u http=%d result=%s",
                          static_cast<unsigned>((esp_timer_get_time() - started) / 1000), status, esp_err_to_name(result));
                 granted = result == ESP_OK;
                 if (!granted && status == 409 && Current(grant.epoch)) {
                     started = esp_timer_get_time();
                     result = cloud_platform_grant(grant.agent_id, grant.session_id, true,
                                                   grant.url, sizeof grant.url, grant.token, sizeof grant.token,
-                                                  &grant.audio, &status);
+                                                  &grant.audio, &status, &grant.expires_us);
                     ESP_LOGI(TAG, "Voice stage grant refresh: ms=%u http=%d result=%s",
                              static_cast<unsigned>((esp_timer_get_time() - started) / 1000), status, esp_err_to_name(result));
                     granted = result == ESP_OK;
@@ -2134,6 +2562,8 @@ void Worker(void*) {
             while (Current(grant.epoch) && esp_timer_get_time() < until) vTaskDelay(pdMS_TO_TICKS(50));
             if (!Current(grant.epoch)) return false;
             // Tokens are one-use. Obtain a fresh grant on the next iteration.
+            cached = false;
+            grant.expires_us = 0;
             memset(grant.url, 0, sizeof grant.url);
             memset(grant.token, 0, sizeof grant.token);
             return true;
@@ -2142,8 +2572,15 @@ void Worker(void*) {
         s_busy.store(false);
         grant = {};
     }
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+    s_wss_ticket.session.reset();
+#endif
     s_task.store(nullptr, std::memory_order_release);
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM
+    vTaskDeleteWithCaps(nullptr);
+#else
     vTaskDelete(nullptr);
+#endif
 }
 }  // namespace
 
@@ -2156,7 +2593,12 @@ bool StartWorker() {
 #else
     constexpr unsigned stack_bytes = 12288;
 #endif
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM
+    if (xTaskCreateWithCaps(&Worker, "agentlink_rt", stack_bytes, nullptr, 5, &task,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) return false;
+#else
     if (xTaskCreate(&Worker, "agentlink_rt", stack_bytes, nullptr, 5, &task) != pdPASS) return false;
+#endif
     s_task.store(task, std::memory_order_release);
 #if CONFIG_IDF_TARGET_ESP32C3
     ESP_LOGD(TAG, "resident voice task ready: stack=%uB, internal free=%u largest=%u",
@@ -2225,10 +2667,13 @@ void cloud_realtime_stop(void) {
         std::lock_guard<std::mutex> lock(s_mutex);
         s_run.store(false, std::memory_order_release);
         s_recovering.store(false);
+        s_prepare = {};
+        s_prepared = {};
         s_epoch.fetch_add(1);
         s_ready.store(false);
     }
     while (s_task.load(std::memory_order_acquire)) vTaskDelay(pdMS_TO_TICKS(50));
+    cloud_realtime_invalidate_dns();
     std::lock_guard<std::mutex> lock(s_mutex);
     if (s_grants_caps) vQueueDeleteWithCaps(s_grants);
     else vQueueDelete(s_grants);
@@ -2279,7 +2724,7 @@ esp_err_t cloud_realtime_request_direct(void) {
 #endif
 }
 
-esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id) {
+esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id, bool standby) {
     if (!cloud_platform_enabled() || agent_id <= 0 || !session_id || !*session_id ||
         strlen(session_id) >= sizeof Grant::session_id) return ESP_ERR_INVALID_ARG;
     for (const unsigned char* p = reinterpret_cast<const unsigned char*>(session_id); *p; ++p) {
@@ -2287,6 +2732,15 @@ esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id) 
     }
     std::lock_guard<std::mutex> lock(s_mutex);
     if (!s_grants || !s_run) return ESP_ERR_INVALID_STATE;
+    if (standby) {
+        if (!StartWorker()) return ESP_ERR_NO_MEM;
+        if (s_prepare.agent_id != agent_id || strcmp(s_prepare.session_id, session_id) != 0) {
+            s_prepare = {agent_id, {}, 0, 0, s_prepare.generation + 1};
+            memcpy(s_prepare.session_id, session_id, strlen(session_id) + 1);
+        }
+        s_prepare.maintain_until_us = esp_timer_get_time() + kPrepareLeaseUs;
+        return ESP_OK;
+    }
     Grant grant = {};
     grant.direct = false;
     grant.platform = true;
@@ -2306,6 +2760,14 @@ extern "C" void agent_link_platform_set_user_transcript_callback(agent_link_plat
 bool cloud_realtime_ready(void) { return s_ready.load(); }
 bool cloud_realtime_recovering(void) { return s_recovering.load(); }
 
+void cloud_realtime_invalidate_dns(void) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    std::lock_guard<std::mutex> lock(s_voice_dns_mutex);
+    s_voice_dns.expires_us = 0;
+    ++s_voice_dns.generation;
+#endif
+}
+
 void cloud_realtime_cancel(void) {
     std::lock_guard<std::mutex> lock(s_mutex);
     s_epoch.fetch_add(1);
@@ -2313,6 +2775,8 @@ void cloud_realtime_cancel(void) {
     s_mute.store(true);
     s_recovering.store(false);
     s_input = AGENT_STREAM_KIND_COUNT;
+    s_prepare = {0, {}, 0, 0, s_prepare.generation + 1};
+    s_prepared = {};
     if (s_grants) xQueueReset(s_grants);
     if (s_tx) xQueueReset(s_tx);
 }

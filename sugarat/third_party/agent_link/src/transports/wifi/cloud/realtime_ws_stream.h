@@ -12,7 +12,10 @@ class FrameReader {
 public:
     explicit FrameReader(size_t maximum) : maximum_(maximum) {}
     template <typename Chunk>
-    bool Consume(const uint8_t* data, size_t bytes, Chunk chunk) {
+    bool Consume(const uint8_t* data, size_t bytes, Chunk chunk,
+                 const bool* pause = nullptr, size_t* consumed = nullptr) {
+        const uint8_t* start = data;
+        if (consumed) *consumed = 0;
         while (bytes || (header_size_ == header_need_ && remaining_ == 0)) {
             if (!payload_) {
                 while (bytes && header_size_ < header_need_) {
@@ -22,6 +25,7 @@ public:
                         header_need_ = length == 126 ? 4 : length == 127 ? 10 : 2;
                     }
                 }
+                if (consumed) *consumed = static_cast<size_t>(data - start);
                 if (header_size_ != header_need_) return true;
                 if ((header_[0] & 0x70) || (header_[1] & 0x80)) return false;
                 opcode_ = header_[0] & 15;
@@ -45,7 +49,9 @@ public:
             if (!chunk(opcode_, first_, end, fin_, data, take)) return false;
             first_ = false;
             data += take; bytes -= take; remaining_ -= take;
+            if (consumed) *consumed = static_cast<size_t>(data - start);
             if (end) { payload_ = false; header_size_ = 0; header_need_ = 2; }
+            if (pause && *pause) return true;
         }
         return true;
     }
@@ -62,23 +68,24 @@ private:
 // inactivity deadline; a separate maximum age bounds a slowly dripping frame.
 class PendingWrite {
 public:
+    static constexpr int64_t kStallMs = 3000;
     bool Begin(size_t bytes, int64_t now_ms) {
         if (Busy() || !bytes) return false;
         size_ = bytes; offset_ = 0; started_ = last_progress_ = now_ms;
         return true;
     }
-    bool Advance(int result, bool would_block, int64_t now_ms) {
+    bool Advance(int result, bool would_block, int64_t now_ms, int64_t stall_ms = kStallMs) {
         if (!Busy()) return false;
         if (result > 0) {
             if (static_cast<size_t>(result) > Remaining()) return false;
             offset_ += result; last_progress_ = now_ms;
             if (!Busy()) return true;
         } else if (!would_block) return false;
-        return !Expired(now_ms);
+        return !Expired(now_ms, stall_ms);
     }
     bool Busy() const { return offset_ < size_; }
-    bool Expired(int64_t now_ms) const {
-        return Busy() && (now_ms - last_progress_ >= 3000 || now_ms - started_ >= 15000);
+    bool Expired(int64_t now_ms, int64_t stall_ms = kStallMs) const {
+        return Busy() && (now_ms - last_progress_ >= stall_ms || now_ms - started_ >= 15000);
     }
     int64_t StalledMs(int64_t now_ms) const { return now_ms - last_progress_; }
     int64_t AgeMs(int64_t now_ms) const { return now_ms - started_; }

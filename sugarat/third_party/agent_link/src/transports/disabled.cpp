@@ -38,7 +38,7 @@ extern "C" esp_err_t agent_link_wifi_setup(void) { return ESP_ERR_NOT_SUPPORTED;
 extern "C" esp_err_t agent_link_ble_enable(bool) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" bool agent_link_ble_enabled(void) { return false; }
 extern "C" agent_transport_t* agent_transport_wifi(void) { return nullptr; }
-extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int, const char*) {
+extern "C" esp_err_t agent_transport_wifi_request_realtime_session(int, const char*, bool) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 

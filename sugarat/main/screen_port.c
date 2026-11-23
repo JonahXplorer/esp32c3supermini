@@ -1,6 +1,7 @@
 #include "screen_port.h"
 
 #include "board.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "lvgl.h"
@@ -8,7 +9,8 @@
 enum { DRAW_BUFFER_ROWS = 12 };
 
 static const char *TAG = "sugarat_display";
-static LV_ATTRIBUTE_MEM_ALIGN uint16_t draw_buffer[SCREEN_SIZE * DRAW_BUFFER_ROWS];
+// The LCD adapter copies pixels into its own DMA buffer before queuing the transaction.
+static EXT_RAM_BSS_ATTR LV_ATTRIBUTE_MEM_ALIGN uint16_t draw_buffer[SCREEN_SIZE * DRAW_BUFFER_ROWS];
 
 static uint32_t tick_ms(void)
 {

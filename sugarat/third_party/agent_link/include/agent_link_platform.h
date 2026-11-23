@@ -38,6 +38,9 @@ esp_err_t agent_link_platform_delete_conversation(int agent_id, const char* conv
 
 // Asynchronously request one grant and connect the existing realtime voice worker.
 esp_err_t agent_link_request_realtime_session(int agent_id, const char* session_id);
+// Maintain an unused HTTPS grant for the idle conversation. Call periodically
+// while idle. Only agent_link_request_realtime_session() opens the WebSocket.
+esp_err_t agent_link_prepare_realtime_session(int agent_id, const char* session_id);
 
 struct cJSON;
 typedef esp_err_t (*agent_link_platform_tool_cb_t)(const char* action, const struct cJSON* params,
