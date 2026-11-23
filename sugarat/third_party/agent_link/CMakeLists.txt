@@ -51,7 +51,7 @@ if(_backend STREQUAL "WIFI" OR _backend STREQUAL "")
             src/transports/wifi/wifi_friends.cc
             src/transports/wifi/wifi_ble.cpp
             src/transports/wifi/cloud/cloud_credential.cc src/transports/wifi/cloud/cloud_api.cc
-            src/transports/wifi/cloud/cloud_session.cc src/transports/wifi/cloud/cloud_mqtt.cc
+            src/transports/wifi/cloud/cloud_session.cc src/transports/wifi/cloud/cloud_mqtt.cc src/transports/wifi/cloud/cloud_tools.cc
             src/transports/wifi/cloud/cloud_realtime.cc src/transports/wifi/cloud/cloud_platform.cc
             src/transports/wifi/cloud/cloud_chat.cc
             src/transports/wifi/cloud/realtime_codec_memory.cc

@@ -1,6 +1,7 @@
 #include "board.h"
 #include "screen.h"
 #include "servo_radio.h"
+#include "servo_tool.h"
 #include "voice.h"
 
 #include "esp_log.h"
@@ -16,6 +17,7 @@ enum {
     LINK_TIMEOUT_US = 1500000,
     STATUS_POLL_US = 200000,
     MAX_SENDS = 4,
+    MAX_VOICE_SENDS = 8,
     REMOTE_STACK_BYTES = 8192,
 };
 
@@ -62,6 +64,7 @@ static void remote_task(void *context)
     screen_update(&state);
     (void)screen_poll();
     ESP_ERROR_CHECK(sugarat_display_light());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(servo_tool_init());
     const bool wifi_managed = sugarat_voice_start() == ESP_OK;
     const bool radio_ready = (wifi_managed ? servo_radio_attach(SERVO_PEER_MAC)
                                           : servo_radio_start(SERVO_PEER_MAC, SERVO_RADIO_FIXED)) == ESP_OK;
@@ -76,6 +79,8 @@ static void remote_task(void *context)
     int64_t next_status_poll = 0;
     unsigned attempts = 0;
     servo_message_t pending = {0};
+    servo_tool_request_t tool_request = {0};
+    bool pending_tool = false;
 
     while (true) {
         const int64_t now = esp_timer_get_time();
@@ -93,6 +98,11 @@ static void remote_task(void *context)
             reply.angle_deg <= reply.angle_limit_deg) {
             const bool confirmed_command = pending.type && pending.sequence == reply.sequence;
             if (confirmed_command) {
+                if (pending_tool) {
+                    servo_tool_complete(&tool_request, reply.position == pending.position ? ESP_OK : ESP_FAIL,
+                                        reply.moving != 0);
+                    pending_tool = false;
+                }
                 pending.type = 0;
                 next_query = now;
             }
@@ -104,7 +114,7 @@ static void remote_task(void *context)
             state.angle_limit_deg = reply.angle_limit_deg;
             state.moving = reply.moving != 0;
             state.receiver_channel = reply.channel;
-            if (!previous.online || confirmed_command || state.position != previous.position ||
+            if (!previous.online || confirmed_command || state.position != previous.position || state.moving != previous.moving ||
                 state.speed != previous.speed || state.angle_deg != previous.angle_deg ||
                 state.angle_limit_deg != previous.angle_limit_deg || state.receiver_channel != previous.receiver_channel) {
                 ESP_LOGI(TAG, "C3 confirmed target %c on channel %u, speed %u us per 10 ms, B angle %u/%u degrees%s",
@@ -120,25 +130,46 @@ static void remote_task(void *context)
         state.pending = pending.type != 0;
         screen_update(&state);
         const screen_action_t action = screen_poll();
+        bool command_started = false;
         if (action.kind == SCREEN_START_CALL) {
             sugarat_voice_start_call();
         } else if (action.kind == SCREEN_END_CALL && state.voice.can_end) {
             sugarat_voice_end_call();
         } else if (state.online && !pending.type && create_command(action, state, &pending)) {
+            command_started = true;
+            ESP_LOGI(TAG, "Touch command %u", (unsigned)pending.type);
+        }
+        if (!pending.type && servo_tool_receive(&tool_request)) {
+            if (esp_timer_get_time() >= tool_request.deadline_us) {
+                servo_tool_complete(&tool_request, ESP_ERR_TIMEOUT, false);
+            } else if (!radio_ready) {
+                servo_tool_complete(&tool_request, ESP_ERR_INVALID_STATE, false);
+            } else {
+                pending.type = SERVO_SET_POSITION;
+                pending.position = tool_request.position;
+                pending_tool = true;
+                command_started = true;
+            }
+        }
+        if (command_started) {
             pending.session = session;
             pending.sequence = ++sequence;
             attempts = 0;
             next_retry = now;
-            ESP_LOGI(TAG, "Touch command %u", (unsigned)pending.type);
         }
 
         if (radio_ready && pending.type && now >= next_retry) {
-            if (attempts < MAX_SENDS) {
+            const unsigned max_attempts = pending_tool ? MAX_VOICE_SENDS : MAX_SENDS;
+            if (attempts < max_attempts && (!pending_tool || esp_timer_get_time() < tool_request.deadline_us)) {
                 (void)servo_radio_send(pending);
                 ++attempts;
                 next_retry = now + RETRY_US;
             } else {
-                ESP_LOGW(TAG, "C3 did not acknowledge touch command");
+                ESP_LOGW(TAG, "C3 did not acknowledge %s command", pending_tool ? "voice" : "touch");
+                if (pending_tool) {
+                    servo_tool_complete(&tool_request, ESP_ERR_TIMEOUT, false);
+                    pending_tool = false;
+                }
                 pending.type = 0;
                 next_query = now;
                 last_reply = now - LINK_TIMEOUT_US;

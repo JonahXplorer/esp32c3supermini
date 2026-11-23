@@ -39,6 +39,20 @@ esp_err_t agent_link_platform_delete_conversation(int agent_id, const char* conv
 // Asynchronously request one grant and connect the existing realtime voice worker.
 esp_err_t agent_link_request_realtime_session(int agent_id, const char* session_id);
 
+struct cJSON;
+typedef esp_err_t (*agent_link_platform_tool_cb_t)(const char* action, const struct cJSON* params,
+                                                    struct cJSON* result, void* ctx);
+// Install before agent_link_start(). The callback runs on the MQTT task.
+void agent_link_platform_set_tool_callback(agent_link_platform_tool_cb_t callback, void* ctx);
+// Install before agent_link_start(). Invoked on the voice worker for final user speech.
+typedef void (*agent_link_platform_user_transcript_cb_t)(const char* text);
+void agent_link_platform_set_user_transcript_callback(agent_link_platform_user_transcript_cb_t callback);
+// Attach one tool to the bound device's conversation; leave other tools in the session intact.
+esp_err_t agent_link_platform_attach_tool(int agent_id, const char* session_id, const char* definition_json);
+esp_err_t agent_link_platform_refresh_tool(int agent_id, const char* session_id);
+bool agent_link_platform_tool_ready(void);
+void agent_link_platform_detach_tool(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
 #include "realtime_ws_stream.h"
 #include "realtime_ws_upgrade.h"
 #include "audio_downlink.h"
+#include "agent_link_platform.h"
 #include "cloud_platform.h"
 #include "cloud_limits.h"
 #include "cloud_memory.h"
@@ -151,6 +152,7 @@ QueueHandle_t             s_tx = nullptr;
 bool                      s_tx_caps = false;
 agent_stream_t            s_input = AGENT_STREAM_KIND_COUNT;
 cloud_realtime_callbacks_t s_cb = {};
+agent_link_platform_user_transcript_cb_t s_user_transcript = nullptr;
 
 // Diagnostics for the continuous uplink. Only counters and timings are retained.
 std::atomic<uint32_t> s_tx_sent_frames{0};
@@ -622,9 +624,10 @@ void ResetInput() {
 
 class Call {
 public:
-    Call(uint32_t epoch, AudioFormat audio, bool continuous, const char* connect_token = nullptr)
+    Call(uint32_t epoch, AudioFormat audio, bool continuous, const char* connect_token = nullptr,
+         const char* conversation_id = nullptr)
         : epoch_(epoch), continuous_(continuous), audio_(audio), input_opus_(audio.input_opus),
-          connect_token_(connect_token), created_at_(esp_timer_get_time()) {}
+          connect_token_(connect_token), conversation_id_(conversation_id), created_at_(esp_timer_get_time()) {}
     ~Call() {
         Stop();
         if (encoded_queue_) {
@@ -1028,6 +1031,16 @@ public:
         const char* event = cJSON_IsString(type) ? type->valuestring : "";
         bool keep = true;
         if (strcmp(event, "session.ready") == 0) {
+            if (conversation_id_ && conversation_id_[0]) {
+                const auto* connection = cJSON_GetObjectItemCaseSensitive(json, "realtime_connection");
+                const auto* id = cJSON_GetObjectItemCaseSensitive(connection, "sessionId");
+                if (!cJSON_IsString(id)) id = cJSON_GetObjectItemCaseSensitive(connection, "session_id");
+                const bool reported = cJSON_IsString(id);
+                const bool matches = reported && strcmp(conversation_id_, id->valuestring) == 0;
+                ESP_LOGI(TAG, "Voice WSS conversation: session_match=%s",
+                         !reported ? "not_reported" : matches ? "yes" : "no");
+                if (reported && !matches) { cJSON_Delete(json); return false; }
+            }
             AudioFormat format = audio_;
             if (agentlink::realtime::AudioSettings(json)) keep = ReadAudioFormat(json, &format, false);
             if (s_ready && (format.input_opus != audio_.input_opus || format.output_opus != audio_.output_opus))
@@ -1127,9 +1140,24 @@ public:
             ++interruptions_;
             ESP_LOGD(TAG, "reply interrupted #%u (started=%u, ended=%u)", interruptions_, replies_, reply_ends_);
             if (reset_ != s_reset.load()) ResetAudio();
+        } else if (strcmp(event, "task.accepted") == 0) {
+            ESP_LOGI(TAG, "Realtime tool task: %s", event);
+        } else if (strcmp(event, "task.result") == 0) {
+            const cJSON* status = cJSON_GetObjectItemCaseSensitive(json, "status");
+            const cJSON* summary = cJSON_GetObjectItemCaseSensitive(json, "summary");
+            ESP_LOGI(TAG, "Realtime tool task: result=%s summary=%.220s",
+                     cJSON_IsString(status) ? status->valuestring : "unknown",
+                     cJSON_IsString(summary) ? summary->valuestring : "");
         } else if (strcmp(event, "transcript.partial") == 0 || strcmp(event, "transcript.final") == 0) {
             const cJSON* text = cJSON_GetObjectItemCaseSensitive(json, "text");
-            if (s_cb.text && cJSON_IsString(text)) s_cb.text(text->valuestring);
+            if (cJSON_IsString(text)) {
+                if (s_cb.text) s_cb.text(text->valuestring);
+                const cJSON* role = cJSON_GetObjectItemCaseSensitive(json, "role");
+                if (s_user_transcript && conversation_id_ && conversation_id_[0] && s_ready &&
+                    Current(epoch_) && strcmp(event, "transcript.final") == 0 &&
+                    cJSON_IsString(role) && strcmp(role->valuestring, "user") == 0)
+                    s_user_transcript(text->valuestring);
+            }
         } else if (strcmp(event, "error") == 0 || strcmp(event, "session.error") == 0 ||
                    strcmp(event, "session.ended") == 0) {
             agentlink::realtime::EndDiagnostic diagnostic;
@@ -1550,6 +1578,7 @@ private:
     std::atomic<bool> running_{true}, media_done_{false};
     int16_t* decode_pcm_ = nullptr;
     const char* connect_token_ = nullptr;
+    const char* conversation_id_ = nullptr;
     const int64_t created_at_;
     int64_t received_at_ = 0;
     size_t samples_ = 0, encoded_bytes_ = 0;
@@ -1838,7 +1867,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
         return false;
     }
     if (s_cb.state) s_cb.state(false, "Connecting voice");
-    Call call(grant.epoch, grant.audio, grant.platform, grant.token);
+    Call call(grant.epoch, grant.audio, grant.platform, grant.token, grant.platform ? grant.session_id : nullptr);
     // Reserve large codec states early, but leave the 40 KB C3 task stack free
     // for certificate parsing and RSA verification during the TLS handshake.
     if (!call.Prepare()) {
@@ -2268,6 +2297,10 @@ esp_err_t cloud_realtime_request_platform(int agent_id, const char* session_id) 
 
 void cloud_realtime_set_callbacks(const cloud_realtime_callbacks_t* callbacks) {
     s_cb = callbacks ? *callbacks : cloud_realtime_callbacks_t{};
+}
+
+extern "C" void agent_link_platform_set_user_transcript_callback(agent_link_platform_user_transcript_cb_t callback) {
+    s_user_transcript = callback;
 }
 
 bool cloud_realtime_ready(void) { return s_ready.load(); }

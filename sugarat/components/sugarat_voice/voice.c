@@ -16,6 +16,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "playback.h"
+#include "servo_tool.h"
 #include "wake_word.h"
 
 enum {
@@ -23,6 +24,7 @@ enum {
     START_TIMEOUT_MS = 20000,
     CONVERSATION_CACHE_MS = 120000,
     CONVERSATION_RETRY_MS = 15000,
+    TOOL_ATTACH_RETRY_MS = 30000,
 };
 
 typedef enum {
@@ -39,6 +41,8 @@ typedef struct {
     int agent_id;
     uint32_t valid_until;
     uint32_t retry_after;
+    uint32_t tool_retry_after;
+    bool tool_attached;
     agent_link_platform_conversation_t latest;
 } conversation_cache_t;
 
@@ -157,14 +161,49 @@ static esp_err_t lookup_latest(conversation_cache_t *cache, int agent_id, const 
         err = ESP_ERR_INVALID_STATE;
     }
     const uint32_t finished = now_ms();
+    const bool same_conversation = err == ESP_OK && cache->agent_id == agent_id && latest.id[0] &&
+                                   strcmp(cache->latest.id, latest.id) == 0;
+    const bool tool_attached = same_conversation && cache->tool_attached;
+    const uint32_t tool_retry = same_conversation ? cache->tool_retry_after : 0;
     *cache = (conversation_cache_t){.agent_id = agent_id, .retry_after = finished + CONVERSATION_RETRY_MS};
     if (err == ESP_OK) {
         cache->latest = latest;
         cache->valid_until = finished + CONVERSATION_CACHE_MS;
+        cache->tool_attached = tool_attached;
+        cache->tool_retry_after = tool_retry;
     }
     ESP_LOGI(TAG, "Voice stage conversation lookup: source=%s ms=%lu result=%s found=%u", source,
              (unsigned long)(finished - started), esp_err_to_name(err), (unsigned)count);
     return err;
+}
+
+static esp_err_t create_voice_conversation(conversation_cache_t *cache)
+{
+    agent_link_platform_conversation_t conversation = {0};
+    const uint32_t started = now_ms();
+    const esp_err_t err = agent_link_platform_create_conversation(cache->agent_id, conversation.id, sizeof(conversation.id));
+    ESP_LOGI(TAG, "Voice stage conversation create: ms=%lu result=%s",
+             (unsigned long)(now_ms() - started), esp_err_to_name(err));
+    if (err != ESP_OK) return err;
+    if (!conversation.id[0]) return ESP_ERR_INVALID_RESPONSE;
+    cache->latest = conversation;
+    cache->valid_until = now_ms() + CONVERSATION_CACHE_MS;
+    return ESP_OK;
+}
+
+static void attach_session_tool(conversation_cache_t *cache)
+{
+    if (cache->tool_attached && !agent_link_platform_tool_ready()) cache->tool_attached = false;
+    if (!cache->tool_attached && cache->latest.id[0] && !before_deadline(cache->tool_retry_after)) {
+        esp_err_t err = servo_tool_attach(cache->agent_id, cache->latest.id);
+        if (err == ESP_ERR_NOT_ALLOWED && !atomic_load(&stop_call)) {
+            // A different client owns this conversation's active tool connection.
+            err = create_voice_conversation(cache);
+            if (err == ESP_OK) err = servo_tool_attach(cache->agent_id, cache->latest.id);
+        }
+        cache->tool_attached = err == ESP_OK;
+        cache->tool_retry_after = now_ms() + TOOL_ATTACH_RETRY_MS;
+    }
 }
 
 static void prefetch_conversation(conversation_cache_t *cache)
@@ -174,10 +213,14 @@ static void prefetch_conversation(conversation_cache_t *cache)
     }
     const int agent_id = voice_agent_id();
     if (cache->agent_id != agent_id) {
+        agent_link_platform_detach_tool();
         *cache = (conversation_cache_t){.agent_id = agent_id};
     }
     if (agent_id > 0 && !before_deadline(cache->valid_until) && !before_deadline(cache->retry_after)) {
         (void)lookup_latest(cache, agent_id, "background");
+    }
+    if (agent_id > 0 && before_deadline(cache->valid_until)) {
+        attach_session_tool(cache);
     }
 }
 
@@ -197,15 +240,13 @@ static esp_err_t request_session(conversation_cache_t *cache)
         }
     }
     if (!cache->latest.id[0]) {
-        const uint32_t started = now_ms();
-        err = agent_link_platform_create_conversation(agent_id, cache->latest.id, sizeof(cache->latest.id));
-        ESP_LOGI(TAG, "Voice stage conversation create: ms=%lu result=%s",
-                 (unsigned long)(now_ms() - started), esp_err_to_name(err));
-        if (err != ESP_OK || !cache->latest.id[0]) {
-            return err != ESP_OK ? err : ESP_ERR_INVALID_RESPONSE;
-        }
-        cache->valid_until = now_ms() + CONVERSATION_CACHE_MS;
+        err = create_voice_conversation(cache);
+        if (err != ESP_OK) return err;
     }
+    if (atomic_load(&stop_call) || voice_agent_id() != agent_id) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    attach_session_tool(cache);
     if (atomic_load(&stop_call) || voice_agent_id() != agent_id) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -214,6 +255,7 @@ static esp_err_t request_session(conversation_cache_t *cache)
 
 static void close_stream(agent_stream_handle_t *stream)
 {
+    servo_tool_accept_transcripts(false);
     voice_playback_accept(false);
     if (*stream) {
         (void)agent_link_stream_close(*stream, false);
@@ -248,6 +290,14 @@ static esp_err_t run_session(conversation_cache_t *cache)
             continue;
         }
         if (!stream) {
+            if (cache->tool_attached) {
+                const uint32_t refresh_started = now_ms();
+                const esp_err_t refresh = agent_link_platform_refresh_tool(cache->agent_id, cache->latest.id);
+                ESP_LOGI(TAG, "Voice stage tool hot-update: ms=%lu result=%s",
+                         (unsigned long)(now_ms() - refresh_started), esp_err_to_name(refresh));
+                if (atomic_load(&stop_call)) break;
+                if (agent_link_state() != AGENT_STATE_READY) continue;
+            }
             const uint32_t started = now_ms();
             err = agent_link_stream_open(AGENT_STREAM_VOICE, NULL, &stream);
             if (err != ESP_OK) {
@@ -260,6 +310,7 @@ static esp_err_t run_session(conversation_cache_t *cache)
                          (unsigned long)(now_ms() - atomic_load(&requested_at)), (unsigned long)(now_ms() - started));
             }
             opened = true;
+            servo_tool_accept_transcripts(true);
             voice_playback_accept(true);
             atomic_store(&mode, VOICE_ACTIVE);
         }
