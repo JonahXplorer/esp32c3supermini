@@ -3,6 +3,7 @@
 #include "cloud_limits.h"
 #include "cloud_log.h"
 #include "cloud_memory.h"
+#include "wifi_cloud_recovery.h"
 
 #include <cctype>
 #include <cerrno>
@@ -22,6 +23,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_tls.h"
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
@@ -43,11 +45,13 @@ constexpr int64_t kVoiceIdleUs = 45 * 1000000LL;
 std::mutex s_voice_http_mutex;
 esp_http_client_handle_t s_voice_http = nullptr;
 int64_t s_voice_idle_until = 0;
+uint32_t s_voice_http_generation = 0;
 
 void CloseVoiceHttp() {
     if (s_voice_http) esp_http_client_cleanup(s_voice_http);
     s_voice_http = nullptr;
     s_voice_idle_until = 0;
+    s_voice_http_generation = 0;
 }
 
 bool VoiceSocketIdle() {
@@ -166,6 +170,8 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     const char* device_key = cloud_cred_auth_key();
     if (!s_base[0] || !device_key[0] || !path || !root_out)
         return ESP_ERR_INVALID_STATE;
+    const uint32_t network_generation = wifi_cloud_network_generation();
+    if (!wifi_cloud_requests_allowed()) return ESP_ERR_INVALID_STATE;
 
     char url[800];
     const int url_len = snprintf(url, sizeof url, "%s%s", s_base, path);
@@ -181,7 +187,11 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
 #endif
     std::unique_lock<std::mutex> voice_lock(s_voice_http_mutex, std::defer_lock);
     if (keep_voice) voice_lock.lock();
-    if (keep_voice && !VoiceSocketIdle()) CloseVoiceHttp();
+    if (keep_voice && (s_voice_http_generation != network_generation || !VoiceSocketIdle())) CloseVoiceHttp();
+    if (network_generation != wifi_cloud_network_generation() || !wifi_cloud_requests_allowed()) {
+        free(buffer);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     Response response{buffer, capacity, 0, false};
     esp_http_client_config_t config = {};
@@ -205,7 +215,10 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     const bool reused = keep_voice && s_voice_http;
     esp_http_client_handle_t client = reused ? s_voice_http : esp_http_client_init(&config);
     if (!client) { free(buffer); return ESP_ERR_NO_MEM; }
-    if (keep_voice) s_voice_http = client;
+    if (keep_voice) {
+        s_voice_http = client;
+        s_voice_http_generation = network_generation;
+    }
 
     esp_err_t result = ESP_OK;
     if (reused) {
@@ -221,6 +234,13 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     const int64_t request_started = esp_timer_get_time();
     if (result == ESP_OK) result = esp_http_client_perform(client);
     const int64_t finished = esp_timer_get_time();
+    if (result == ESP_ERR_HTTP_CONNECT && esp_http_client_get_and_clear_last_tls_error(client, nullptr, nullptr) ==
+        ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
+        wifi_cloud_dns_result(network_generation, false);
+    } else if (response.connected_at) {
+        wifi_cloud_dns_result(network_generation, true);
+    }
+    if (network_generation != wifi_cloud_network_generation()) result = ESP_ERR_INVALID_STATE;
     if (timing) *timing = {request_started, response.server_utc_ms};
     const int status = result == ESP_OK ? esp_http_client_get_status_code(client) : 0;
     if (keep_voice || status_out) {
@@ -439,6 +459,13 @@ bool EncodeCursor(const char* value, char* out, size_t capacity) {
     return true;
 }
 }  // namespace
+
+void cloud_platform_drop_tools_on_network_loss() {
+    std::lock_guard<std::mutex> guard(s_registration_mutex);
+    agent_link_platform_detach_tool();
+    cJSON_free(s_registration.json);
+    s_registration = {};
+}
 
 extern "C" esp_err_t agent_link_platform_conversations(int agent_id, size_t offset,
                                                            agent_link_platform_conversation_t* entries,

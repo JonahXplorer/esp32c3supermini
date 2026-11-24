@@ -1,4 +1,5 @@
 #include "cloud_tools.h"
+#include "wifi_cloud_recovery.h"
 
 #include <atomic>
 #include <cstdio>
@@ -137,7 +138,8 @@ void OnEvent(void*, esp_event_base_t, int32_t id, void* data) {
                 ESP_LOGI(TAG, "tool MQTT received %d bytes (enabled=%d retained=%d)",
                          ev->total_data_len, s_enabled.load(), ev->retain);
             }
-            if (s_enabled.load() && s_subscribed.load() && !ev->retain && ev->topic && ev->data &&
+            if (s_enabled.load() && s_subscribed.load() && wifi_cloud_requests_allowed() &&
+                !ev->retain && ev->topic && ev->data &&
                 ev->topic_len == static_cast<int>(strlen(s_down)) && !memcmp(ev->topic, s_down, ev->topic_len) &&
                 ev->current_data_offset == 0 && ev->data_len > 0 && ev->data_len == ev->total_data_len) {
                 ESP_LOGI(TAG, "received tool request (%d bytes)", ev->data_len);
@@ -169,6 +171,8 @@ extern "C" bool agent_link_platform_tool_ready() {
 }
 
 esp_err_t cloud_tools_start(const CloudToolCredentials& token) {
+    const uint32_t network_generation = wifi_cloud_network_generation();
+    if (!wifi_cloud_requests_allowed()) return ESP_ERR_INVALID_STATE;
     const bool wss = strcmp(token.protocol, "wss") == 0;
     if (!wss && strcmp(token.protocol, "mqtts") != 0) return ESP_ERR_NOT_SUPPORTED;
     agent_link_platform_detach_tool();
@@ -194,10 +198,12 @@ esp_err_t cloud_tools_start(const CloudToolCredentials& token) {
     if (err == ESP_OK) err = esp_mqtt_client_start(s_client);
     if (err == ESP_OK) {
         const int64_t deadline = esp_timer_get_time() + 12000000;
-        while (!s_subscribed.load() && !s_rejected.load() && esp_timer_get_time() < deadline) {
+        while (!s_subscribed.load() && !s_rejected.load() && esp_timer_get_time() < deadline &&
+               network_generation == wifi_cloud_network_generation()) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
-        if (!s_subscribed.load()) err = s_rejected.load() ? ESP_ERR_INVALID_RESPONSE : ESP_ERR_TIMEOUT;
+        if (network_generation != wifi_cloud_network_generation()) err = ESP_ERR_INVALID_STATE;
+        else if (!s_subscribed.load()) err = s_rejected.load() ? ESP_ERR_INVALID_RESPONSE : ESP_ERR_TIMEOUT;
     }
     if (err != ESP_OK) agent_link_platform_detach_tool();
     else s_renew_at_us = esp_timer_get_time() + (token.expires_in - token.expires_in / 10) * 1000000LL;

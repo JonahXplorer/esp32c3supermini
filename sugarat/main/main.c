@@ -27,7 +27,11 @@ static bool create_command(screen_action_t action, screen_state_t state, servo_m
 {
     switch (action.kind) {
     case SCREEN_SET_TARGET:
-        if (action.value > 1 || action.value == state.position) {
+        if (action.value > 1) {
+            return false;
+        }
+        if (action.value == state.position && (state.light == SERVO_LIGHT_UNKNOWN ||
+            state.light == (action.value ? SERVO_LIGHT_ON : SERVO_LIGHT_OFF))) {
             return false;
         }
         message->type = SERVO_SET_POSITION;
@@ -46,6 +50,14 @@ static bool create_command(screen_action_t action, screen_state_t state, servo_m
         }
         message->type = SERVO_SET_ANGLE;
         message->angle_deg = action.value;
+        return true;
+    case SCREEN_SET_LIGHT:
+        if (state.light == SERVO_LIGHT_UNKNOWN || action.value == state.light ||
+            (action.value != SERVO_LIGHT_OFF && action.value != SERVO_LIGHT_ON)) {
+            return false;
+        }
+        message->type = SERVO_SET_LIGHT;
+        message->light = action.value;
         return true;
     default:
         return false;
@@ -114,12 +126,16 @@ static void remote_task(void *context)
             state.angle_limit_deg = reply.angle_limit_deg;
             state.moving = reply.moving != 0;
             state.receiver_channel = reply.channel;
+            state.light = reply.light <= SERVO_LIGHT_ON ? reply.light : SERVO_LIGHT_UNKNOWN;
             if (!previous.online || confirmed_command || state.position != previous.position || state.moving != previous.moving ||
                 state.speed != previous.speed || state.angle_deg != previous.angle_deg ||
-                state.angle_limit_deg != previous.angle_limit_deg || state.receiver_channel != previous.receiver_channel) {
-                ESP_LOGI(TAG, "C3 confirmed target %c on channel %u, speed %u us per 10 ms, B angle %u/%u degrees%s",
+                state.angle_limit_deg != previous.angle_limit_deg || state.receiver_channel != previous.receiver_channel ||
+                state.light != previous.light) {
+                const char *light = state.light == SERVO_LIGHT_ON ? "on" :
+                                    state.light == SERVO_LIGHT_OFF ? "off" : "unavailable";
+                ESP_LOGI(TAG, "C3 confirmed target %c on channel %u, speed %u us per 10 ms, B angle %u/%u degrees%s, light %s",
                          'A' + state.position, (unsigned)state.receiver_channel, (unsigned)state.speed, (unsigned)state.angle_deg,
-                         (unsigned)state.angle_limit_deg, state.moving ? ", moving" : "");
+                         (unsigned)state.angle_limit_deg, state.moving ? ", moving" : "", light);
             }
         }
         state.online = now - last_reply < LINK_TIMEOUT_US;

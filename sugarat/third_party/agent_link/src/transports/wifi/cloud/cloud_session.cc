@@ -15,6 +15,7 @@
 #include "cloud_mqtt.h"
 #include "cloud_memory.h"
 #include "device_identity.h"
+#include "wifi_cloud_recovery.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -87,11 +88,12 @@ int64_t             s_token_retry  = 0;         // do not ask for one before the
 
 portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
-void Publish(agent_cloud_state_t st, const cloud_api_err_t* err) {
+void Publish(agent_cloud_state_t st, const cloud_api_err_t* err, uint32_t network_generation = 0) {
     agent_cloud_status_t snap;
 
     taskENTER_CRITICAL(&s_lock);
     s_status.state = st;
+    s_status.network_generation = network_generation;
     if (err) {
         s_status.api_code = err->code;
         snprintf(s_status.message, sizeof s_status.message, "%s", err->message);
@@ -177,9 +179,10 @@ void StopMqtt();
 
 // Backoff remains interruptible when local mode is requested while offline,
 // claiming or waiting for an Agent. Only the session task closes its clients.
-void SessionDelay(uint32_t ms) {
+void SessionDelay(uint32_t ms, uint32_t network_generation = 0) {
     const int64_t until = esp_timer_get_time() + static_cast<int64_t>(ms) * 1000;
-    while (s_run && !s_pause_request.load() && esp_timer_get_time() < until)
+    while (s_run && !s_pause_request.load() && esp_timer_get_time() < until &&
+           (!network_generation || network_generation == wifi_cloud_network_generation()))
         vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -352,14 +355,18 @@ enum class Leave {
 // Authenticated: heartbeats and the MQTT connection, in the order auth -> mqtt-token -> MQTT. The
 // token is renewed shortly before it expires or at once when the broker refuses it, and is otherwise
 // kept, across network drops too. The link stays CONNECTED: MQTT carries nothing yet.
-Leave StayOnline() {
+Leave StayOnline(uint32_t network_generation) {
     int64_t next_beat = esp_timer_get_time() + static_cast<int64_t>(kHeartbeatMs) * 1000;
     int64_t next_auth = next_beat;
+    bool heartbeat_unanswered = false;
     Leave   why;
     for (;;) {
         if (!s_run)                 { why = Leave::kStopped;   break; }
         if (!cloud_cred_is_bound()) { why = Leave::kKeyGone;   break; }
-        if (!NetReady())            { why = Leave::kNoNetwork; break; }
+        if (!NetReady() || network_generation != wifi_cloud_network_generation()) {
+            why = Leave::kNoNetwork;
+            break;
+        }
         const int64_t now = esp_timer_get_time();
 
         if (kMqttEnabled) {
@@ -390,10 +397,15 @@ Leave StayOnline() {
             if (now >= next_beat) {
                 next_beat = now + static_cast<int64_t>(kHeartbeatMs) * 1000;
                 cloud_api_err_t hb = {};
-                if (cloud_api_heartbeat(cloud_cred_auth_key(), &hb) != ESP_OK) {
+                const esp_err_t result = cloud_api_heartbeat(cloud_cred_auth_key(), &hb);
+                heartbeat_unanswered = result != ESP_OK && hb.code < 0;
+                if (result != ESP_OK) {
+                    if (network_generation != wifi_cloud_network_generation()) {
+                        why = Leave::kNoNetwork;
+                        break;
+                    }
                     if (HandleRevoked(hb)) { why = Leave::kKeyGone; break; }
-                    // Anything else: stay online and retry on the next beat.
-                    ESP_LOGW(TAG, "heartbeat failed (code=%d) — staying online", hb.code);
+                    ESP_LOGW(TAG, "heartbeat failed (code=%d); checking authentication", hb.code);
                 }
             }
 
@@ -402,10 +414,19 @@ Leave StayOnline() {
                 cloud_api_err_t refreshed = {};
                 if (cloud_api_auth(cloud_cred_auth_key(), StaMac(), agent_link_ota_running_version(),
                                    s_agent_json, kAgentJsonCap, &refreshed) != ESP_OK) {
+                    if (network_generation != wifi_cloud_network_generation()) {
+                        why = Leave::kNoNetwork;
+                        break;
+                    }
                     if (HandleRevoked(refreshed)) { why = Leave::kKeyGone; break; }
                     if (refreshed.code == CLOUD_API_NO_AGENT) {
                         Publish(AGENT_CLOUD_NO_AGENT, &refreshed);
                         why = Leave::kNoAgent;
+                        break;
+                    }
+                    if (heartbeat_unanswered && refreshed.code < 0) {
+                        ESP_LOGW(TAG, "Heartbeat and authentication unavailable; reconnecting cloud services");
+                        why = Leave::kNoNetwork;
                         break;
                     }
                 }
@@ -421,12 +442,18 @@ Leave StayOnline() {
         }
     }
     StopMqtt();
+    if (why == Leave::kNoNetwork) {
+        cloud_api_drop_connection();
+        Publish(AGENT_CLOUD_NO_NETWORK, nullptr);
+    }
     if (why == Leave::kKeyGone) s_token_ok = false;   // issued against a key that is gone
     return why;
 }
 
 // Authenticate, then stay online. Returns when the key stops working.
 void OnlineLoop() {
+    uint32_t transport_retry_ms = kRetryMs;
+    uint32_t retry_generation = 0;
     while (s_run && cloud_cred_is_bound()) {
         WaitForNet();
         if (!s_run) return;
@@ -439,28 +466,45 @@ void OnlineLoop() {
         }
 
         cloud_api_err_t err = {};
-        if (cloud_api_auth(cloud_cred_auth_key(), StaMac(),
-                           agent_link_ota_running_version(),
-                           s_agent_json, kAgentJsonCap, &err) != ESP_OK) {
+        const uint32_t network_generation = wifi_cloud_network_generation();
+        if (network_generation != retry_generation) {
+            retry_generation = network_generation;
+            transport_retry_ms = kRetryMs;
+        }
+        const esp_err_t result = cloud_api_auth(cloud_cred_auth_key(), StaMac(),
+                                               agent_link_ota_running_version(),
+                                               s_agent_json, kAgentJsonCap, &err);
+        if (network_generation != wifi_cloud_network_generation() || !NetReady()) {
+            cloud_api_drop_connection();
+            continue;
+        }
+        if (result != ESP_OK) {
             if (HandleRevoked(err)) return;
             // NO_AGENT: claimed, but no agent attached yet. Keep retrying until one is bound.
             PublishFailure(err.code == CLOUD_API_NO_AGENT ? AGENT_CLOUD_NO_AGENT
                                                           : AGENT_CLOUD_FAULT, err);
-            SessionDelay(BackoffFor(err));
+            if (err.code < 0) {
+                SessionDelay(transport_retry_ms, network_generation);
+                transport_retry_ms = transport_retry_ms < kFaultRetryMs / 2 ? transport_retry_ms * 2 : kFaultRetryMs;
+            } else {
+                transport_retry_ms = kRetryMs;
+                SessionDelay(BackoffFor(err), network_generation);
+            }
             continue;
         }
         NoteAccepted();
+        transport_retry_ms = kRetryMs;
 
         if (s_agent_json && s_agent_json[0]) {
             ESP_LOGI(TAG, "agent configuration received (%uB)",
                      static_cast<unsigned>(strlen(s_agent_json)));
         }
 
-        Publish(AGENT_CLOUD_ONLINE, &err);
+        Publish(AGENT_CLOUD_ONLINE, &err, network_generation);
         ESP_LOGI(TAG, "online");
 
         // No agent: wait as after auth's own refusal, then authenticate again.
-        if (StayOnline() == Leave::kNoAgent) SessionDelay(kFaultRetryMs);
+        if (StayOnline(network_generation) == Leave::kNoAgent) SessionDelay(kFaultRetryMs, network_generation);
     }
 }
 

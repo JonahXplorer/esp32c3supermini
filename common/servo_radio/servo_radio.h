@@ -21,7 +21,19 @@ typedef enum {
     SERVO_SET_SPEED,
     SERVO_SET_ANGLE,
     SERVO_STATE,
+    SERVO_SET_LIGHT,
 } servo_message_type_t;
+
+enum {
+    SERVO_LIGHT_UNKNOWN = 0, // Reserved byte in replies from older receivers.
+    SERVO_LIGHT_OFF,
+    SERVO_LIGHT_ON,
+};
+
+static inline bool servo_message_is_command(uint8_t type)
+{
+    return (type >= SERVO_QUERY && type <= SERVO_SET_ANGLE) || type == SERVO_SET_LIGHT;
+}
 
 typedef enum {
     SERVO_RADIO_FIXED,
@@ -39,7 +51,7 @@ typedef struct {
     uint8_t angle_deg;
     uint8_t angle_limit_deg;
     uint8_t channel;
-    uint8_t reserved;
+    uint8_t light;
 } servo_message_t;
 
 esp_err_t servo_radio_start(const char *peer_mac, servo_radio_mode_t mode);

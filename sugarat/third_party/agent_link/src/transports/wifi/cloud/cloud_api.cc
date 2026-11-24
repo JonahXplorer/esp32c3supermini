@@ -5,6 +5,7 @@
 #include "cloud_credential.h"
 #include "cloud_log.h"
 #include "cloud_memory.h"
+#include "wifi_cloud_recovery.h"
 
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_tls.h"
 #include "sdkconfig.h"
 
 namespace {
@@ -82,7 +84,7 @@ esp_http_client_handle_t Client(const char* url) {
 // One request/response, on the kept connection or a new one. The body is left in s_rx, unparsed.
 // On failure the connection is dropped, and *reused tells the caller whether it had been reused.
 esp_err_t Exchange(const char* path, const char* url, const char* body,
-                   int* status, int* got, bool* reused, cloud_api_err_t* err) {
+                   int* status, int* got, bool* reused, cloud_api_err_t* err, uint32_t network_generation) {
     *reused = (s_client != nullptr && s_reusable);
     esp_http_client_handle_t cl = Client(url);
     if (!cl) { SetErr(err, -1, false, "http init failed"); return ESP_FAIL; }
@@ -97,6 +99,10 @@ esp_err_t Exchange(const char* path, const char* url, const char* body,
     const int body_len = static_cast<int>(strlen(body));
     esp_err_t r = esp_http_client_open(cl, body_len);
     if (r != ESP_OK) {
+        if (r == ESP_ERR_HTTP_CONNECT &&
+            esp_http_client_get_and_clear_last_tls_error(cl, nullptr, nullptr) == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
+            wifi_cloud_dns_result(network_generation, false);
+        }
         if (!*reused) {
             // The heap figures tell a TLS allocation failure from a network one; both surface as
             // ESP_ERR_HTTP_CONNECT.
@@ -109,6 +115,7 @@ esp_err_t Exchange(const char* path, const char* url, const char* body,
         DropConnection();
         return r;
     }
+    if (!*reused) wifi_cloud_dns_result(network_generation, true);
     if (esp_http_client_write(cl, body, body_len) != body_len) {
         if (!*reused) ESP_LOGW(TAG, "POST %s: short write", path);
         SetErr(err, -1, false, "short write");
@@ -158,11 +165,17 @@ esp_err_t PostJson(const char* path, const char* body, cJSON** root_out, cJSON**
 
     int  status = 0, got = 0;
     bool reused = false;
-    esp_err_t r = Exchange(path, url, body, &status, &got, &reused, err);
-    if (r != ESP_OK && reused) {
+    const uint32_t network_generation = wifi_cloud_network_generation();
+    esp_err_t r = Exchange(path, url, body, &status, &got, &reused, err, network_generation);
+    if (r != ESP_OK && reused && network_generation == wifi_cloud_network_generation()) {
         // The kept connection went stale while idle; retry once on a new one.
         ESP_LOGD(TAG, "POST %s: kept connection was stale — reconnecting", path);
-        r = Exchange(path, url, body, &status, &got, &reused, err);
+        r = Exchange(path, url, body, &status, &got, &reused, err, network_generation);
+    }
+    if (network_generation != wifi_cloud_network_generation()) {
+        DropConnection();
+        SetErr(err, -1, false, "station connection changed");
+        return ESP_ERR_INVALID_STATE;
     }
     if (r != ESP_OK) return r;
 

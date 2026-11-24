@@ -31,6 +31,7 @@ typedef enum {
 /** @brief Snapshot of the cloud session. */
 typedef struct {
     agent_cloud_state_t state;
+    uint32_t            network_generation; ///< Station connection authenticated for ONLINE
     char                code[8];      ///< Activation code (CLAIMING only)
     uint32_t            expires_s;    ///< Seconds left on the code
     int                 api_code;     ///< Last platform business code; 0 ok, <0 no response

@@ -11,6 +11,7 @@ typedef struct {
     uint8_t angle_deg;
     uint8_t angle_limit_deg;
     uint8_t receiver_channel;
+    uint8_t light;
     bool online;
     bool pending;
     bool moving;
@@ -23,6 +24,7 @@ typedef enum {
     SCREEN_SET_SPEED,
     SCREEN_SET_ANGLE,
     SCREEN_SET_TARGET,
+    SCREEN_SET_LIGHT,
     SCREEN_START_CALL,
     SCREEN_END_CALL,
 } screen_action_kind_t;

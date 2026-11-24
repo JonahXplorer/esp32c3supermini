@@ -22,32 +22,55 @@ enum {
     JITTER_HOLD_MS = 30000,
     // Leave room for Agent Link to deliver a decoded chunk even if PCM uses partial slots.
     PREBUFFER_SLOT_LIMIT = PLAYBACK_FRAMES * 2 / 3,
-    PA_DRAIN_MS = 120,
+    PA_DRAIN_MS = SUGARAT_SPEAKER_DMA_MS + 40,
     ECHO_GUARD_MS = 220,
+    DRAIN_REPORTS = SUGARAT_SPEAKER_DMA_DESCRIPTORS + 2,
     REPORT_PLAYBACK_GAP_MS = 150,
 };
 
 typedef struct {
+    unsigned received_samples;
+    unsigned dropped_frames;
+    unsigned dropped_samples;
+} playback_delivery_t;
+
+typedef struct {
     unsigned generation;
     unsigned reply_id;
+    // A zero-length frame marks the end of the reply after the preceding PCM.
     size_t count;
-    int16_t pcm[SUGARAT_AUDIO_FRAME];
+    union {
+        int16_t pcm[SUGARAT_AUDIO_FRAME];
+        playback_delivery_t delivery;
+    };
 } playback_frame_t;
 
 typedef struct {
     unsigned id;
-    unsigned received_samples;
+    playback_delivery_t delivery;
     unsigned enqueued_samples;
-    unsigned played_samples;
-    unsigned dropped_frames;
-    unsigned dropped_samples;
-    unsigned underruns;
-    unsigned max_empty_ms;
+    unsigned consumed_samples;
     int64_t first_audio_us;
     int64_t last_audio_us;
-    int64_t empty_since_us;
-    bool rebuffer_pending;
 } playback_stats_t;
+
+typedef struct {
+    unsigned id;
+    unsigned submitted_samples;
+    unsigned write_errors;
+    unsigned underruns;
+    unsigned dma_empty_slots;
+    unsigned max_write_gap_ms;
+    unsigned max_empty_ms;
+    int64_t last_write_us;
+    sugarat_speaker_dma_t dma;
+} playback_progress_t;
+
+typedef struct {
+    playback_delivery_t delivery;
+    playback_progress_t progress;
+    unsigned generation;
+} playback_report_t;
 
 static const char *TAG = "jarvis_speaker";
 static QueueHandle_t queue;
@@ -80,23 +103,31 @@ static size_t playback_buffer_level(void *context)
     return queue ? uxQueueMessagesWaiting(queue) * sizeof(((playback_frame_t *)0)->pcm) : 0;
 }
 
-static void finish_reply(const char *reason)
+static void log_reply(unsigned id, const char *reason, const playback_delivery_t *delivery,
+                      const playback_progress_t *progress)
 {
-    portENTER_CRITICAL(&stats_lock);
-    const playback_stats_t stats = reply;
-    reply = (playback_stats_t){0};
-    portEXIT_CRITICAL(&stats_lock);
-    if (stats.id) {
-        ESP_LOGI(TAG, "Reply #%u %s: pcm=%u ms, dropped_frames=%u, dropped_samples=%u, underruns=%u, max_empty=%u ms",
-                 stats.id, reason, stats.received_samples / (SUGARAT_SAMPLE_RATE / 1000),
-                 stats.dropped_frames, stats.dropped_samples, stats.underruns, stats.max_empty_ms);
-    }
+    ESP_LOGI(TAG, "Reply #%u %s: pcm=%u ms, i2s_submitted=%u ms, dropped_frames=%u, dropped_samples=%u, "
+                  "underruns=%u, dma_empty_slots=%u, max_write_gap=%u ms, max_empty=%u ms, write_errors=%u",
+             id, reason, delivery->received_samples / (SUGARAT_SAMPLE_RATE / 1000),
+             progress->submitted_samples / (SUGARAT_SAMPLE_RATE / 1000), delivery->dropped_frames,
+             delivery->dropped_samples, progress->underruns, progress->dma_empty_slots,
+             progress->max_write_gap_ms, progress->max_empty_ms, progress->write_errors);
 }
 
 void voice_playback_end(void *context)
 {
     (void)context;
-    finish_reply("complete");
+    portENTER_CRITICAL(&stats_lock);
+    const playback_stats_t stats = reply;
+    const unsigned current = atomic_load(&generation);
+    reply = (playback_stats_t){0};
+    portEXIT_CRITICAL(&stats_lock);
+    if (stats.id) {
+        const playback_frame_t end = {.generation = current, .reply_id = stats.id, .delivery = stats.delivery};
+        if (!stats.enqueued_samples || xQueueSend(queue, &end, 0) != pdTRUE) {
+            log_reply(stats.id, "discarded", &stats.delivery, &(playback_progress_t){0});
+        }
+    }
     if (worker) {
         xTaskNotify(worker, 0, eNoAction);
     }
@@ -105,11 +136,17 @@ void voice_playback_end(void *context)
 void voice_playback_reset(void *context)
 {
     (void)context;
+    portENTER_CRITICAL(&stats_lock);
     atomic_fetch_add(&generation, 1);
+    const playback_stats_t stats = reply;
+    reply = (playback_stats_t){0};
+    portEXIT_CRITICAL(&stats_lock);
     if (queue) {
         xQueueReset(queue);
     }
-    finish_reply("reset");
+    if (stats.id) {
+        ESP_LOGI(TAG, "Reply #%u reset before speaker drain", stats.id);
+    }
     if (worker) {
         xTaskNotify(worker, 0, eNoAction);
     }
@@ -119,6 +156,7 @@ void voice_playback_accept(bool enabled)
 {
     atomic_store(&accepting, enabled);
     if (!enabled) {
+        sugarat_speaker_enable(false);
         voice_playback_reset(NULL);
     }
 }
@@ -132,7 +170,6 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         return;
     }
     const int64_t arrival_us = esp_timer_get_time();
-    int64_t gap_start_us = 0;
     portENTER_CRITICAL(&stats_lock);
     if (current != atomic_load(&generation) || !atomic_load(&accepting)) {
         portEXIT_CRITICAL(&stats_lock);
@@ -146,23 +183,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         jitter_until_us = arrival_us + JITTER_HOLD_MS * 1000LL;
     }
     reply.last_audio_us = arrival_us;
-    // Count a gap only when more audio arrives for this reply. Allow for PCM still in DMA.
-    if (reply.empty_since_us) {
-        const int64_t empty_ms = (arrival_us - reply.empty_since_us) / 1000;
-        if (empty_ms >= SUGARAT_SPEAKER_DMA_MS) {
-            ++reply.underruns;
-            reply.rebuffer_pending = true;
-            jitter_until_us = arrival_us + JITTER_HOLD_MS * 1000LL;
-            if (empty_ms > reply.max_empty_ms) {
-                reply.max_empty_ms = (unsigned)empty_ms;
-            }
-        }
-        if (empty_ms >= REPORT_PLAYBACK_GAP_MS) {
-            gap_start_us = reply.empty_since_us;
-        }
-        reply.empty_since_us = 0;
-    }
-    reply.received_samples += samples;
+    reply.delivery.received_samples += samples;
     playback_frame_t frame = {.generation = current, .reply_id = reply.id};
     portEXIT_CRITICAL(&stats_lock);
 
@@ -174,7 +195,9 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         }
         const size_t copied = frame.count * sizeof(frame.pcm[0]);
         memcpy(frame.pcm, pcm, copied);
-        if (xQueueSend(queue, &frame, 0) != pdTRUE) {
+        // Leave one slot for voice_playback_end even if a burst fills the PCM queue.
+        if (current != atomic_load(&generation) || uxQueueSpacesAvailable(queue) <= 1 ||
+            xQueueSend(queue, &frame, 0) != pdTRUE) {
             break;
         }
         pcm += copied;
@@ -183,17 +206,12 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     portENTER_CRITICAL(&stats_lock);
     if (reply.id == frame.reply_id) {
         reply.enqueued_samples += samples - remaining;
-        reply.dropped_samples += remaining;
-        reply.dropped_frames += (remaining + SUGARAT_AUDIO_FRAME - 1) / SUGARAT_AUDIO_FRAME;
+        reply.delivery.dropped_samples += remaining;
+        reply.delivery.dropped_frames += (remaining + SUGARAT_AUDIO_FRAME - 1) / SUGARAT_AUDIO_FRAME;
     }
     portEXIT_CRITICAL(&stats_lock);
     if (remaining != samples) {
         xTaskNotify(worker, 0, eNoAction);
-    }
-    if (gap_start_us) {
-        ESP_LOGI(TAG, "Playback gap: reply=%u start_ms=%u end_ms=%u empty_ms=%u", frame.reply_id,
-                 (unsigned)(gap_start_us / 1000), (unsigned)(arrival_us / 1000),
-                 (unsigned)((arrival_us - gap_start_us) / 1000));
     }
 }
 
@@ -211,8 +229,8 @@ static void wait_for_prebuffer(const playback_frame_t *frame, int64_t last_write
         const int64_t now_us = esp_timer_get_time();
         portENTER_CRITICAL(&stats_lock);
         const bool finished = reply.id != frame->reply_id;
-        const unsigned samples = reply.enqueued_samples > reply.played_samples
-                                 ? reply.enqueued_samples - reply.played_samples : 0;
+        const unsigned samples = reply.enqueued_samples > reply.consumed_samples
+                                 ? reply.enqueued_samples - reply.consumed_samples : 0;
         const int64_t first_audio_us = reply.first_audio_us;
         const unsigned target_ms = rebuffer || now_us < jitter_until_us ? JITTER_PREBUFFER_MS : BASE_PREBUFFER_MS;
         portEXIT_CRITICAL(&stats_lock);
@@ -235,31 +253,82 @@ static void wait_for_prebuffer(const playback_frame_t *frame, int64_t last_write
     }
 }
 
+static void report_drained(playback_report_t reports[DRAIN_REPORTS])
+{
+    const unsigned current = atomic_load(&generation);
+    const unsigned completed = sugarat_speaker_dma().completed;
+    const int64_t now_us = esp_timer_get_time();
+    for (unsigned i = 0; i < DRAIN_REPORTS; ++i) {
+        playback_report_t *report = &reports[i];
+        const playback_progress_t *progress = &report->progress;
+        if (!progress->id) continue;
+        const bool drained = !progress->last_write_us ||
+            completed - progress->dma.completed >= SUGARAT_SPEAKER_DMA_DESCRIPTORS;
+        const bool timed_out = now_us - progress->last_write_us >= PA_DRAIN_MS * 1000LL;
+        if (!drained && report->generation == current && !timed_out) continue;
+        const char *reason = report->generation != current ? "reset" : drained ? "complete" : "drain_timeout";
+        log_reply(progress->id, reason, &report->delivery, progress);
+        report->progress.id = 0;
+    }
+}
+
+static void queue_drain_report(playback_report_t reports[DRAIN_REPORTS], const playback_frame_t *end,
+                               const playback_progress_t *progress)
+{
+    for (unsigned i = 0; i < DRAIN_REPORTS; ++i) {
+        if (reports[i].progress.id) continue;
+        reports[i] = (playback_report_t){.delivery = end->delivery, .progress = *progress,
+                                         .generation = end->generation};
+        return;
+    }
+    log_reply(progress->id, "drain_unverified", &end->delivery, progress);
+}
+
+static bool check_playback_gap(playback_progress_t *progress, int64_t now_us)
+{
+    if (!progress->last_write_us) return false;
+    const unsigned gap_ms = (unsigned)((now_us - progress->last_write_us) / 1000);
+    const unsigned empty = sugarat_speaker_dma().empty_slots - progress->dma.empty_slots;
+    if (!empty) return false;
+
+    ++progress->underruns;
+    progress->dma_empty_slots += empty;
+    const unsigned empty_ms = empty * SUGARAT_SPEAKER_DMA_SAMPLES * 1000 / SUGARAT_SAMPLE_RATE;
+    if (empty_ms > progress->max_empty_ms) progress->max_empty_ms = empty_ms;
+    portENTER_CRITICAL(&stats_lock);
+    jitter_until_us = now_us + JITTER_HOLD_MS * 1000LL;
+    portEXIT_CRITICAL(&stats_lock);
+    if (gap_ms >= REPORT_PLAYBACK_GAP_MS) {
+        ESP_LOGW(TAG, "Playback gap: reply=%u write_gap_ms=%u dma_empty_slots=%u", progress->id, gap_ms, empty);
+    }
+    return true;
+}
+
 static void play_audio(void *context)
 {
     (void)context;
     playback_frame_t frame;
-    unsigned playing_reply = 0;
-    unsigned last_written_reply = 0;
+    playback_progress_t progress = {0};
+    playback_report_t reports[DRAIN_REPORTS] = {0};
     int64_t last_write_us = 0;
     while (true) {
-        if (last_written_reply && uxQueueMessagesWaiting(queue) == 0) {
-            portENTER_CRITICAL(&stats_lock);
-            if (reply.id == last_written_reply) {
-                reply.empty_since_us = last_write_us;
-            }
-            portEXIT_CRITICAL(&stats_lock);
-            last_written_reply = 0;
-        }
+        report_drained(reports);
         if (xQueueReceive(queue, &frame, pdMS_TO_TICKS(PA_DRAIN_MS)) != pdTRUE) {
             sugarat_speaker_enable(false);
             continue;
         }
-        const bool first = frame.reply_id != playing_reply;
-        portENTER_CRITICAL(&stats_lock);
-        const bool rebuffer = !first && reply.id == frame.reply_id && reply.rebuffer_pending;
-        if (reply.id == frame.reply_id) reply.rebuffer_pending = false;
-        portEXIT_CRITICAL(&stats_lock);
+        if (!frame_is_current(&frame)) continue;
+        if (!frame.count) {
+            if (progress.id == frame.reply_id) {
+                queue_drain_report(reports, &frame, &progress);
+                progress = (playback_progress_t){0};
+            }
+            continue;
+        }
+
+        const bool first = progress.id != frame.reply_id;
+        if (first) progress = (playback_progress_t){.id = frame.reply_id};
+        const bool rebuffer = !first && check_playback_gap(&progress, esp_timer_get_time());
         if (first || rebuffer) {
             wait_for_prebuffer(&frame, last_write_us, rebuffer);
         }
@@ -267,34 +336,49 @@ static void play_audio(void *context)
             sugarat_speaker_enable(false);
             continue;
         }
-        playing_reply = frame.reply_id;
-        portENTER_CRITICAL(&stats_lock);
-        if (reply.id == frame.reply_id) {
-            reply.empty_since_us = 0;
-            reply.played_samples += frame.count;
-        }
-        portEXIT_CRITICAL(&stats_lock);
         atomic_store(&echo_until, now_ms() + ECHO_GUARD_MS);
         sugarat_speaker_enable(true);
+        const unsigned empty_before_write = sugarat_speaker_dma().empty_slots;
         const esp_err_t err = sugarat_speaker_write(frame.pcm, frame.count);
         atomic_store(&echo_until, now_ms() + ECHO_GUARD_MS);
+        if (!frame_is_current(&frame)) {
+            sugarat_speaker_enable(false);
+            continue;
+        }
+        portENTER_CRITICAL(&stats_lock);
+        if (reply.id == frame.reply_id) reply.consumed_samples += frame.count;
+        portEXIT_CRITICAL(&stats_lock);
         if (err != ESP_OK) {
+            ++progress.write_errors;
             ESP_LOGW(TAG, "Speaker write: %s", esp_err_to_name(err));
             sugarat_speaker_enable(false);
         } else {
-            last_written_reply = frame.reply_id;
             last_write_us = esp_timer_get_time();
+            const sugarat_speaker_dma_t dma = sugarat_speaker_dma();
+            if (progress.last_write_us) {
+                const unsigned gap_ms = (unsigned)((last_write_us - progress.last_write_us) / 1000);
+                if (gap_ms > progress.max_write_gap_ms) progress.max_write_gap_ms = gap_ms;
+                const unsigned empty = dma.empty_slots - empty_before_write;
+                if (empty) {
+                    ++progress.underruns;
+                    progress.dma_empty_slots += empty;
+                    ESP_LOGW(TAG, "Speaker DMA starved during write: reply=%u empty_slots=%u", progress.id, empty);
+                }
+            }
+            progress.last_write_us = last_write_us;
+            progress.submitted_samples += frame.count;
+            progress.dma = dma;
         }
     }
 }
 
 esp_err_t voice_playback_start(void)
 {
-    storage = heap_caps_malloc(PLAYBACK_FRAMES * sizeof(playback_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    storage = heap_caps_malloc((PLAYBACK_FRAMES + 1) * sizeof(playback_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (storage) {
-        queue = xQueueCreateStatic(PLAYBACK_FRAMES, sizeof(playback_frame_t), storage, &queue_control);
+        queue = xQueueCreateStatic(PLAYBACK_FRAMES + 1, sizeof(playback_frame_t), storage, &queue_control);
     }
-    if (!queue || xTaskCreateWithCaps(play_audio, TAG, 4096, NULL, 4, &worker,
+    if (!queue || xTaskCreateWithCaps(play_audio, TAG, 4096, NULL, 6, &worker,
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         voice_playback_stop();
         return ESP_ERR_NO_MEM;

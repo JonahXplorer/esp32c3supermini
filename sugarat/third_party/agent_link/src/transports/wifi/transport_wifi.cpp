@@ -31,6 +31,7 @@
 #include "cloud_session.h"
 #include "wifi_provision.h"
 #include "wifi_join.h"
+#include "wifi_cloud_recovery.h"
 
 #include <atomic>
 #include <cstring>
@@ -60,6 +61,7 @@ constexpr const char* kNvsPass = "pass";
 
 constexpr unsigned kProvFailLimit = 3;
 constexpr int64_t kProvTeardownMs = 4000;
+constexpr int64_t kStationRetryMs = 15000;
 
 ESP_EVENT_DEFINE_BASE(kWifiControl);
 enum { kWifiTick, kWifiCredentials, kWifiSetup };
@@ -109,6 +111,10 @@ std::atomic<bool> s_local_radio{false};
 bool s_ignore_leave = false;
 std::mutex s_wifi_mtx;
 agentlink::wifi::JoinWindow s_join;
+agentlink::wifi::DnsRecovery s_dns_recovery;
+std::atomic<uint32_t> s_network_generation{1};
+bool s_station_had_ip = false;
+int64_t s_station_retry_at = 0;
 int64_t s_portal_close_at = 0;
 unsigned s_prov_failures = 0;
 
@@ -126,6 +132,8 @@ esp_timer_handle_t s_tick_timer = nullptr;
 
 void StartProvisioning();
 void ReportStatus();
+void UpdateLink();
+bool NetReady();
 
 // NVS credential store
 esp_err_t EnsureNvs() {
@@ -194,6 +202,30 @@ const char* JoinMessage(JoinFailure reason) {
 
 int64_t NowMs() { return esp_timer_get_time() / 1000; }
 
+bool CloudAuthenticated() {
+    taskENTER_CRITICAL(&s_status_lock);
+    const bool authenticated = s_last_cloud.state == AGENT_CLOUD_ONLINE &&
+        s_last_cloud.network_generation == s_network_generation.load();
+    taskEXIT_CRITICAL(&s_status_lock);
+    return authenticated;
+}
+
+// Serialized with WiFi transitions and DNS reports from the HTTP workers.
+void AdvanceNetworkGeneration() {
+    s_network_generation.fetch_add(1);
+    s_dns_recovery.Resolved();
+    cloud_realtime_invalidate_dns();
+}
+
+void ReportNetworkChange(uint32_t previous_generation) {
+    if (s_network_generation.load() != previous_generation) {
+        s_realtime_wanted.store(false);
+        s_platform_voice.store(false);
+        cloud_realtime_cancel();
+    }
+    UpdateLink();
+}
+
 void UpdateJoinProgress() {
     s_join_left = s_join.RemainingSeconds(NowMs());
     s_join_attempt = s_join.Attempts();
@@ -238,12 +270,34 @@ void ConnectStation() {
 
 void DisconnectStation() { s_ignore_leave = esp_wifi_disconnect() == ESP_OK; }
 
+void RejoinStation(const char* reason) {
+    ESP_LOGW(TAG, "%s; reconnecting station with saved WiFi credentials", reason);
+    s_phase = Phase::kStaConnecting;
+    AdvanceNetworkGeneration();
+    s_station_retry_at = 0;
+    const int64_t now = NowMs();
+    s_join.Begin(now);
+    s_join.Failed(now);
+    s_join_failure = JoinFailure::kDisconnected;
+    UpdateJoinProgress();
+    DisconnectStation();
+}
+
 // Station reached the network
-void OnGotIp(const esp_netif_ip_info_t& ip) {
+void OnGotIp(const ip_event_got_ip_t& event) {
     char ip_str[16];
-    esp_ip4addr_ntoa(&ip.ip, ip_str, sizeof ip_str);
-    if (!s_want_connect || !s_join.Active()) return;
+    esp_ip4addr_ntoa(&event.ip_info.ip, ip_str, sizeof ip_str);
+    if (!s_want_connect) return;
+    if (!s_join.Active()) {
+        if (s_phase == Phase::kStaConnected && event.ip_changed) {
+            ESP_LOGI(TAG, "STA IP changed; reconnecting cloud services");
+            AdvanceNetworkGeneration();
+        }
+        return;
+    }
     s_join.Stop();
+    s_station_had_ip = true;
+    s_station_retry_at = 0;
     s_prov_failures = 0;
     s_join_failure = JoinFailure::kNone;
     UpdateJoinProgress();
@@ -256,17 +310,18 @@ void OnGotIp(const esp_netif_ip_info_t& ip) {
         ESP_LOGI(TAG, "provisioning succeeded; credentials saved");
         s_portal_close_at = NowMs() + kProvTeardownMs;
     } else {
-        ESP_LOGI(TAG, "WiFi connected");
+        ESP_LOGI(TAG, "WiFi connected (IP ready)");
     }
     s_phase = Phase::kStaConnected;
 }
 
 void OnStaDisconnected(uint8_t reason) {
-    cloud_realtime_invalidate_dns();
     if (!s_want_connect) return;
     if (reason == WIFI_REASON_ASSOC_LEAVE && s_ignore_leave) { s_ignore_leave = false; return; }
+    if (s_station_retry_at) return;
     s_portal_close_at = 0;
     if (!s_join.Active()) {
+        AdvanceNetworkGeneration();
         s_join.Begin(NowMs());
         s_phase = al_wifi_prov_active() ? Phase::kProvisioning : Phase::kStaConnecting;
         ESP_LOGI(TAG, "WiFi disconnected; reconnecting for up to 20s");
@@ -285,6 +340,7 @@ void OnStaDisconnected(uint8_t reason) {
 
 void WifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (base != WIFI_EVENT) return;
+    const uint32_t generation = s_network_generation.load();
     {
         std::lock_guard<std::mutex> lock(s_wifi_mtx);
 #if defined(CONFIG_BOARD_TYPE_SDGOODS_ESP32S3_WIFI)
@@ -326,17 +382,21 @@ void WifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
             break;
         }
     }
-    if (id == WIFI_EVENT_STA_CONNECTED || id == WIFI_EVENT_STA_DISCONNECTED) ReportStatus();
+    if (id == WIFI_EVENT_STA_CONNECTED || id == WIFI_EVENT_STA_DISCONNECTED) ReportNetworkChange(generation);
 }
 
 void IpEvent(void*, esp_event_base_t base, int32_t id, void* data) {
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        {
-            std::lock_guard<std::mutex> lock(s_wifi_mtx);
-            OnGotIp(static_cast<const ip_event_got_ip_t*>(data)->ip_info);
+    if (base != IP_EVENT || (id != IP_EVENT_STA_GOT_IP && id != IP_EVENT_STA_LOST_IP)) return;
+    const uint32_t generation = s_network_generation.load();
+    {
+        std::lock_guard<std::mutex> lock(s_wifi_mtx);
+        if (id == IP_EVENT_STA_GOT_IP) {
+            OnGotIp(*static_cast<const ip_event_got_ip_t*>(data));
+        } else if (s_phase == Phase::kStaConnected && s_want_connect && !NetReady()) {
+            RejoinStation("STA IPv4 address lost");
         }
-        ReportStatus();
     }
+    ReportNetworkChange(generation);
 }
 
 void OnProvCreds(const char* ssid, const char* pass);
@@ -346,6 +406,7 @@ void TickCb(void*) { (void)esp_event_post(kWifiControl, kWifiTick, nullptr, 0, 0
 
 void WifiControl(void*, esp_event_base_t, int32_t id, void* data) {
     bool report = false;
+    const uint32_t generation = s_network_generation.load();
     {
         std::lock_guard<std::mutex> lock(s_wifi_mtx);
         if (s_local_radio.load()) return;
@@ -360,13 +421,19 @@ void WifiControl(void*, esp_event_base_t, int32_t id, void* data) {
             if (s_join.Expired(now)) {
                 if (s_join.WaitingIp()) s_join_failure = JoinFailure::kNoIp;
                 else if (s_join_failure == JoinFailure::kNone) s_join_failure = JoinFailure::kTimeout;
-                ESP_LOGW(TAG, "WiFi join stopped after 20s: %s; setup available", JoinMessage(s_join_failure));
                 s_join.Stop();
-                s_want_connect = false;
                 if (s_phase == Phase::kProvisioning) {
+                    s_want_connect = false;
+                    ESP_LOGW(TAG, "WiFi setup join stopped: %s", JoinMessage(s_join_failure));
                     al_wifi_prov_set_status(AL_PROV_FAILED, nullptr, PortalReason(s_join_failure));
                     DisconnectStation();
+                } else if (s_station_had_ip) {
+                    s_station_retry_at = now + kStationRetryMs;
+                    ESP_LOGW(TAG, "WiFi recovery join stopped: %s; retrying in %llds",
+                             JoinMessage(s_join_failure), static_cast<long long>(kStationRetryMs / 1000));
+                    DisconnectStation();
                 } else {
+                    ESP_LOGW(TAG, "WiFi join stopped after 20s: %s; setup available", JoinMessage(s_join_failure));
                     StartProvisioning();
                 }
                 UpdateJoinProgress();
@@ -380,6 +447,23 @@ void WifiControl(void*, esp_event_base_t, int32_t id, void* data) {
                 UpdateJoinProgress();
                 report = previous != s_join_left && s_join_left % 5 == 0;
             }
+        } else if (s_station_retry_at && NowMs() >= s_station_retry_at) {
+            s_station_retry_at = 0;
+            s_join.Begin(NowMs());
+            UpdateJoinProgress();
+            ConnectStation();
+            report = true;
+        } else if (s_phase == Phase::kStaConnected && !al_wifi_prov_active()) {
+            using agentlink::wifi::CloudRecovery;
+            const CloudRecovery recovery = s_dns_recovery.Take(NowMs(), CloudAuthenticated());
+            if (recovery == CloudRecovery::kRejoinStation) {
+                RejoinStation("Repeated platform DNS failures, renewing DHCP");
+                report = true;
+            } else if (recovery == CloudRecovery::kReauthenticate) {
+                ESP_LOGW(TAG, "Platform DNS still unavailable; re-authenticating cloud services");
+                AdvanceNetworkGeneration();
+                report = true;
+            }
         }
         if (s_portal_close_at && NowMs() >= s_portal_close_at) {
             s_portal_close_at = 0;
@@ -389,7 +473,7 @@ void WifiControl(void*, esp_event_base_t, int32_t id, void* data) {
             report = true;
         }
     }
-    if (report) ReportStatus();
+    if (report) ReportNetworkChange(generation);
 }
 
 // One-time WiFi stack bring-up: netif + event loop + default STA/AP interfaces + driver + handlers.
@@ -417,6 +501,7 @@ esp_err_t WifiInitOnce() {
 
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiEvent, nullptr, nullptr);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &IpEvent, nullptr, nullptr);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &IpEvent, nullptr, nullptr);
     esp_event_handler_instance_register(kWifiControl, ESP_EVENT_ANY_ID, &WifiControl, nullptr, nullptr);
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);   // we manage credential persistence ourselves (kNvsNs)
@@ -439,6 +524,9 @@ void StartSta(const char* ssid, const char* pass) {
         strncpy(s_pass, pass ? pass : "", sizeof(s_pass) - 1); s_pass[sizeof(s_pass) - 1] = '\0';
     }
     s_phase = Phase::kStaConnecting;
+    s_station_had_ip = false;
+    s_station_retry_at = 0;
+    AdvanceNetworkGeneration();
     s_want_connect = true;
     s_join.Begin(NowMs());
     s_join_failure = JoinFailure::kNone;
@@ -499,6 +587,9 @@ void StartProvisioning() {
     s_join.Stop();
     s_portal_close_at = 0;
     s_prov_failures = 0;
+    s_station_had_ip = false;
+    s_station_retry_at = 0;
+    AdvanceNetworkGeneration();
     UpdateJoinProgress();
     s_phase = Phase::kProvisioning;
 
@@ -543,8 +634,9 @@ void Compose(const agent_cloud_status_t& c, agent_link_status_t* out) {
             }
         } else {
             say(AGENT_LINK_PHASE_CONNECTING, "Joining WiFi", "");
-            snprintf(out->hint, sizeof out->hint, "%s. Attempt %u; setup in %us",
-                     s_waiting_ip ? "Waiting for IP" : reason, s_join_attempt.load(), left);
+            snprintf(out->hint, sizeof out->hint, "%s. Attempt %u",
+                     left ? (s_waiting_ip ? "Waiting for IP" : reason) : "Waiting to retry saved WiFi",
+                     s_join_attempt.load());
         }
         return;
     }
@@ -578,6 +670,10 @@ void Compose(const agent_cloud_status_t& c, agent_link_status_t* out) {
         break;
 
     case AGENT_CLOUD_ONLINE:
+        if (c.network_generation != s_network_generation.load()) {
+            say(AGENT_LINK_PHASE_CONNECTING, "Connecting", "Reconnecting to the platform");
+            break;
+        }
         say(cloud_realtime_ready() ? AGENT_LINK_PHASE_READY : AGENT_LINK_PHASE_CONNECTED,
             cloud_realtime_ready() ? "Voice ready" : "Online", "Connected to the platform");
         taskENTER_CRITICAL(&s_status_lock);
@@ -629,9 +725,7 @@ void ReportStatus() {
 
 void UpdateLink() {
     std::lock_guard<std::recursive_mutex> lk(s_core_mtx);
-    taskENTER_CRITICAL(&s_status_lock);
-    const bool online = !s_local_radio.load() && s_last_cloud.state == AGENT_CLOUD_ONLINE;
-    taskEXIT_CRITICAL(&s_status_lock);
+    const bool online = wifi_cloud_requests_allowed();
     const agent_state_t want = !online ? AGENT_STATE_DISCONNECTED
         : cloud_realtime_ready() ? AGENT_STATE_READY : AGENT_STATE_CONNECTED;
     if (s_link.exchange(want) != want && s_on_state) s_on_state(want);
@@ -642,14 +736,18 @@ void UpdateLink() {
 void OnCloudState(const agent_cloud_status_t* st, void* /*ctx*/) {
     if (!st) return;
     taskENTER_CRITICAL(&s_status_lock);
+    const bool was_online = s_last_cloud.state == AGENT_CLOUD_ONLINE;
     s_last_cloud = *st;
     taskEXIT_CRITICAL(&s_status_lock);
-    if (st->state != AGENT_CLOUD_ONLINE) {
+    const bool online = st->state == AGENT_CLOUD_ONLINE &&
+        st->network_generation == s_network_generation.load();
+    if (!online) {
         s_realtime_wanted.store(false);
         s_platform_voice.store(false);
         cloud_realtime_cancel();
     }
     UpdateLink();
+    if (was_online && !online) cloud_platform_drop_tools_on_network_loss();
 }
 
 void OnRealtimeState(bool /*ready*/, const char* hint) {
@@ -690,7 +788,7 @@ bool NetReady() {
     esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!sta) return false;
     esp_netif_ip_info_t ip = {};
-    return esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+    return esp_netif_is_netif_up(sta) && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
 }
 
 // The JSON layer hands each command to the core the way BLE's GATT write does.
@@ -700,7 +798,7 @@ void DeliverToCore(const uint8_t* frame, size_t len) {
 
 // A command from the platform, on the MQTT task.
 void OnDownlink(const char* data, size_t len, void* /*ctx*/) {
-    if (s_local_radio.load()) return;
+    if (!wifi_cloud_requests_allowed()) return;
     std::lock_guard<std::recursive_mutex> lk(s_core_mtx);
     cloud_json_handle_command(data, len);
 }
@@ -786,8 +884,10 @@ void wifi_stop(void* /*impl*/) {
         std::lock_guard<std::mutex> lock(s_wifi_mtx);
         s_want_connect = false;
         s_join.Stop();
+        s_station_retry_at = 0;
         s_portal_close_at = 0;
         s_phase = Phase::kIdle;
+        AdvanceNetworkGeneration();
         UpdateJoinProgress();
         if (s_tick_timer) esp_timer_stop(s_tick_timer);
         al_wifi_prov_stop();
@@ -845,6 +945,18 @@ agent_transport_t s_wifi = {
     wifi_is_ready, nullptr, nullptr,
 };
 }  // namespace
+
+uint32_t wifi_cloud_network_generation() { return s_network_generation.load(); }
+
+void wifi_cloud_dns_result(uint32_t generation, bool resolved) {
+    std::lock_guard<std::mutex> lock(s_wifi_mtx);
+    if (generation != s_network_generation.load() || s_local_radio.load() ||
+        s_phase != Phase::kStaConnected || al_wifi_prov_active()) return;
+    if (resolved) s_dns_recovery.Resolved();
+    else s_dns_recovery.Failed(NowMs());
+}
+
+bool wifi_cloud_requests_allowed() { return NetReady() && CloudAuthenticated(); }
 
 extern "C" agent_transport_t* agent_transport_wifi(void) { return &s_wifi; }
 

@@ -18,6 +18,7 @@
 
 enum {
     BUTTON_GPIO = GPIO_NUM_4,
+    LIGHT_GPIO = GPIO_NUM_21,
     BUTTON_POLL_MS = 10,
     BUTTON_DEBOUNCE_SAMPLES = 3,
     SETTINGS_DELAY_MS = 750,
@@ -201,6 +202,16 @@ static void poll_probe(const servo_t servos[], size_t servo_count, probe_t *prob
 
 void app_main(void)
 {
+    const gpio_config_t light = {
+        .pin_bit_mask = 1ULL << LIGHT_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_set_level(LIGHT_GPIO, 0));
+    ESP_ERROR_CHECK(gpio_config(&light));
+    bool light_on = false;
+    bool light_on_at_b = false;
+    ESP_LOGI(TAG, "GPIO%d light off at startup", LIGHT_GPIO);
+
     const esp_reset_reason_t reset = esp_reset_reason();
     if (reset == ESP_RST_BROWNOUT) ESP_LOGW(TAG, "Reset reason: brownout");
     else ESP_LOGI(TAG, "Reset reason: %d (esp_reset_reason)", reset);
@@ -271,6 +282,8 @@ void app_main(void)
     bool announced_peer = false;
     while (true) {
         poll_probe(servos, servo_count, &probe);
+        bool position_requested = false;
+        bool requested_light = light_on;
         const bool pressed = gpio_get_level(BUTTON_GPIO) == 1;
         if (pressed == button_pressed) {
             consecutive_samples = 0;
@@ -280,6 +293,7 @@ void app_main(void)
             if (button_pressed && probe.mask == 0) {
                 target_position = (target_position == SERVO_POSITION_A)
                                   ? SERVO_POSITION_B : SERVO_POSITION_A;
+                position_requested = true;
                 ESP_LOGI(TAG, "Button pressed; moving to %c: GPIO%d=%d us, GPIO%d=%d us",
                          target_position == SERVO_POSITION_A ? 'A' : 'B',
                          servos[0].gpio, servo_target_us(&servos[0], target_position, settings.angle_deg),
@@ -290,10 +304,11 @@ void app_main(void)
         servo_message_t message;
         const bool received = radio_ready && servo_radio_receive(&message);
         bool reply = false;
-        if (received && probe.mask == 0) {
+        if (received && (probe.mask == 0 || message.type == SERVO_SET_LIGHT)) {
             const bool new_command = message.session != last_session || message.sequence > last_sequence;
             if (new_command && message.type == SERVO_SET_POSITION && message.position < SERVO_POSITION_COUNT) {
                 target_position = message.position;
+                position_requested = true;
                 last_session = message.session;
                 last_sequence = message.sequence;
                 ESP_LOGI(TAG, "Sugarat requested position %c: GPIO%d=%d us, GPIO%d=%d us",
@@ -320,14 +335,27 @@ void app_main(void)
                 ESP_LOGI(TAG, "Sugarat set B angle to %u degrees: GPIO%d=%d us, GPIO%d=%d us", (unsigned)settings.angle_deg,
                          servos[0].gpio, servo_target_us(&servos[0], SERVO_POSITION_B, settings.angle_deg),
                          servos[1].gpio, servo_target_us(&servos[1], SERVO_POSITION_B, settings.angle_deg));
+            } else if (new_command && message.type == SERVO_SET_LIGHT &&
+                       (message.light == SERVO_LIGHT_OFF || message.light == SERVO_LIGHT_ON)) {
+                position_requested = false;
+                light_on_at_b = false;
+                requested_light = message.light == SERVO_LIGHT_ON;
+                last_session = message.session;
+                last_sequence = message.sequence;
             }
             if (!announced_peer && message.type == SERVO_QUERY) {
                 announced_peer = true;
                 ESP_LOGI(TAG, "Sugarat status request received");
             }
-            reply = message.type >= SERVO_QUERY && message.type <= SERVO_SET_ANGLE;
+            reply = servo_message_is_command(message.type);
         }
 
+        if (position_requested) {
+            light_on_at_b = target_position == SERVO_POSITION_B;
+            if (target_position == SERVO_POSITION_A) {
+                requested_light = false;
+            }
+        }
         bool moving = false;
         for (size_t i = 0; i < servo_count; ++i) {
             const int target_us = probe.mask & (1u << i) ? probe_pulse_us(&servos[i], probe.extra_us)
@@ -345,11 +373,21 @@ void app_main(void)
             servos[i].current_us += step_us;
             servo_set_pulse(servos[i].channel, servos[i].current_us);
         }
+        if (light_on_at_b && !moving && probe.mask == 0) {
+            requested_light = true;
+            light_on_at_b = false;
+        }
+        if (requested_light != light_on) {
+            ESP_ERROR_CHECK(gpio_set_level(LIGHT_GPIO, requested_light));
+            light_on = requested_light;
+            ESP_LOGI(TAG, "GPIO%d light %s, target %c", LIGHT_GPIO, light_on ? "on" : "off", 'A' + target_position);
+        }
         if (reply) {
             (void)servo_radio_send((servo_message_t){
                 .session = message.session, .sequence = message.sequence, .type = SERVO_STATE,
                 .position = target_position, .speed = settings.speed, .moving = moving,
                 .angle_deg = settings.angle_deg, .angle_limit_deg = angle_limit_deg,
+                .light = light_on ? SERVO_LIGHT_ON : SERVO_LIGHT_OFF,
             });
         }
         if (radio_ready) {

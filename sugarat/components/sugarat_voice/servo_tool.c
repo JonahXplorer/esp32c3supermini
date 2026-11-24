@@ -1,6 +1,7 @@
 #include "servo_tool.h"
 
 #include <string.h>
+#include <strings.h>
 
 #include "agent_link_platform.h"
 #include "cJSON.h"
@@ -16,11 +17,12 @@ static const char *TAG = "servo_tool";
 static const char *ACTION = "set_servo_power";
 static const char DEFINITION[] =
     "{\"name\":\"set_servo_power\","
-    "\"description\":\"此会话对应的 Sugarat 硬件连接了两只联动舵机，可通过此工具执行真实开关。"
-    "用户说打开舵机时立即调用 set_servo_power，传 power=true，到 B 点；说关闭舵机时传 power=false，到 A 点。"
-    "收到工具成功回执后再确认，moving 为 true 表示舵机仍在转动。\","
+    "\"description\":\"控制 Sugarat 上由两只舵机联动的开合机构。舵机、面具、面罩都指同一个机构。"
+    "用户要求开、打开、开启或掀开时调用本工具，传 power=true 到 B 点。要求关、关闭、关上或合上时传 power=false 到 A 点。"
+    "例如打开面罩、关闭面具、把面具掀开、把面罩合上。仅在用户明确要求实际开合时调用。"
+    "收到工具成功回执后再确认，moving=true 表示仍在转动。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"power\":{\"type\":\"boolean\","
-    "\"description\":\"true 打开到 B 点，false 关闭到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15}";
+    "\"description\":\"true 打开舵机、面具或面罩到 B 点，false 关闭到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15}";
 
 typedef struct {
     uint32_t id;
@@ -40,26 +42,59 @@ static struct {
     int64_t due_us;
 } transcript;
 
-static bool matches_command(const char *text, const char *command)
+static bool take_phrase(const char **text, const char *phrase)
 {
-    const size_t length = strlen(command);
-    if (strncmp(text, command, length) != 0) return false;
-    const char *tail = text + length;
-    tail += strspn(tail, " \t\r\n");
-    if (strncmp(tail, "。", strlen("。")) == 0 || strncmp(tail, "！", strlen("！")) == 0) {
-        tail += strlen("。");
-    } else if (*tail == '.' || *tail == '!') {
-        ++tail;
+    const size_t length = strlen(phrase);
+    if (strncmp(*text, phrase, length) != 0) return false;
+    *text += length;
+    *text += strspn(*text, " \t\r\n");
+    return true;
+}
+
+static bool take_one_of(const char **text, const char *const *phrases)
+{
+    for (; *phrases; ++phrases) {
+        if (take_phrase(text, *phrases)) return true;
     }
-    return tail[strspn(tail, " \t\r\n")] == '\0';
+    return false;
+}
+
+static bool parse_power_command(const char *text, bool *open)
+{
+    static const char *const wake_punctuation[] = {"，", "。", "：", ",", ".", ":", "！", "!", NULL};
+    static const char *const polite_prefixes[] = {"请帮我", "请帮忙", "帮我", "帮忙", "请", NULL};
+    static const char *const targets[] = {"舵机", "面具", "面罩", NULL};
+    static const char *const open_verbs[] = {"打开", "开启", "掀开", "开", NULL};
+    static const char *const close_verbs[] = {"关闭", "关上", "合上", "关", NULL};
+    static const char *const end_punctuation[] = {"。", "！", ".", "!", NULL};
+
+    text += strspn(text, " \t\r\n");
+    // The wake-word audio can be transcribed together with the first command.
+    if (strncasecmp(text, "Jarvis", sizeof("Jarvis") - 1) == 0) {
+        text += sizeof("Jarvis") - 1;
+        text += strspn(text, " \t\r\n");
+        (void)take_one_of(&text, wake_punctuation);
+    } else if (take_phrase(&text, "贾维斯")) {
+        (void)take_one_of(&text, wake_punctuation);
+    }
+    (void)take_one_of(&text, polite_prefixes);
+    const bool target_first = take_phrase(&text, "把");
+    if (target_first && !take_one_of(&text, targets)) return false;
+
+    const bool enabled = take_one_of(&text, open_verbs);
+    if (!enabled && !take_one_of(&text, close_verbs)) return false;
+    (void)take_phrase(&text, "一下");
+    if (!target_first && !take_one_of(&text, targets)) return false;
+    (void)take_one_of(&text, end_punctuation);
+    if (*text != '\0') return false;
+    *open = enabled;
+    return true;
 }
 
 static void on_user_transcript(const char *text)
 {
-    text += strspn(text, " \t\r\n");
-    if (strncmp(text, "请", strlen("请")) == 0) text += strlen("请");
-    const bool open = matches_command(text, "打开舵机");
-    if (!open && !matches_command(text, "关闭舵机")) return;
+    bool open;
+    if (!parse_power_command(text, &open)) return;
 
     const int64_t due_us = esp_timer_get_time() + MQTT_GRACE_MS * 1000;
     portENTER_CRITICAL(&transcript_lock);

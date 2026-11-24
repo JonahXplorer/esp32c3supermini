@@ -23,7 +23,10 @@
 
 enum {
     UPLINK_FRAMES = 400,   // Up to eight seconds of speech after wake, while the grant opens.
+    WAKE_PREROLL_SAMPLES = SUGARAT_SAMPLE_RATE,
     START_TIMEOUT_MS = 20000,
+    RESIDENT_RETRY_MS = 3000,
+    RESIDENT_RETRY_MAX_MS = 30000,
     CONVERSATION_CACHE_MS = 120000,
     CONVERSATION_RETRY_MS = 15000,
     TOOL_ATTACH_RETRY_MS = 30000,
@@ -38,6 +41,12 @@ typedef struct {
     size_t count;
     int16_t pcm[SUGARAT_AUDIO_FRAME];
 } audio_frame_t;
+
+typedef struct {
+    int16_t pcm[WAKE_PREROLL_SAMPLES];
+    size_t write_at;
+    size_t count;
+} wake_preroll_t;
 
 typedef struct {
     int agent_id;
@@ -61,6 +70,7 @@ static atomic_uint requested_at;
 static QueueHandle_t uplink;
 static StaticQueue_t uplink_queue;
 static uint8_t *uplink_storage;
+static wake_preroll_t *wake_preroll;
 static TaskHandle_t session_task;
 static TaskHandle_t capture_task;
 static TaskHandle_t tool_task;
@@ -111,7 +121,25 @@ static int voice_agent_id(void)
     return agent_link_platform_bound_agent(&agent) == ESP_OK && agent.voice_supported ? agent.id : 0;
 }
 
-static void start_call(const char *source)
+static void queue_preroll(const wake_preroll_t *history)
+{
+    size_t offset = (history->write_at + WAKE_PREROLL_SAMPLES - history->count) % WAKE_PREROLL_SAMPLES;
+    size_t remaining = history->count;
+    while (remaining) {
+        audio_frame_t frame = {.count = remaining < SUGARAT_AUDIO_FRAME ? remaining : SUGARAT_AUDIO_FRAME};
+        const size_t until_wrap = WAKE_PREROLL_SAMPLES - offset;
+        const size_t first = frame.count < until_wrap ? frame.count : until_wrap;
+        memcpy(frame.pcm, history->pcm + offset, first * sizeof(frame.pcm[0]));
+        memcpy(frame.pcm + first, history->pcm, (frame.count - first) * sizeof(frame.pcm[0]));
+        if (xQueueSend(uplink, &frame, 0) != pdTRUE) break;
+        offset = (offset + frame.count) % WAKE_PREROLL_SAMPLES;
+        remaining -= frame.count;
+    }
+    ESP_LOGI(TAG, "Voice preroll: wake_word=jarvis queued_ms=%u",
+             (unsigned)((history->count - remaining) * 1000 / SUGARAT_SAMPLE_RATE));
+}
+
+static void start_call(const char *source, const wake_preroll_t *history)
 {
     if (atomic_load(&mode) != VOICE_IDLE || voice_agent_id() <= 0) {
         return;
@@ -122,6 +150,7 @@ static void start_call(const char *source)
     }
     const uint32_t start = now_ms();
     xQueueReset(uplink);
+    if (history) queue_preroll(history);
     atomic_store(&requested_at, start);
     atomic_store(&stop_call, false);
     atomic_store(&error_until, 0);
@@ -132,7 +161,18 @@ static void start_call(const char *source)
 
 void sugarat_voice_start_call(void)
 {
-    start_call("touch");
+    start_call("touch", NULL);
+}
+
+static void save_wake_audio(wake_preroll_t *history, const audio_frame_t *frame)
+{
+    const size_t until_wrap = WAKE_PREROLL_SAMPLES - history->write_at;
+    const size_t first = frame->count < until_wrap ? frame->count : until_wrap;
+    memcpy(history->pcm + history->write_at, frame->pcm, first * sizeof(frame->pcm[0]));
+    memcpy(history->pcm, frame->pcm + first, (frame->count - first) * sizeof(frame->pcm[0]));
+    history->write_at = (history->write_at + frame->count) % WAKE_PREROLL_SAMPLES;
+    const size_t total = history->count + frame->count;
+    history->count = total < WAKE_PREROLL_SAMPLES ? total : WAKE_PREROLL_SAMPLES;
 }
 
 static void capture_audio(void *context)
@@ -160,19 +200,22 @@ static void capture_audio(void *context)
         if (current != VOICE_IDLE && wake_buffered) {
             wake_word_reset();
             wake_buffered = false;
+            wake_preroll->count = 0;
         }
         if (current == VOICE_IDLE) {
             overflow_logged = false;
             if (!voice_playback_echo_guard()) {
                 wake_buffered = true;
+                save_wake_audio(wake_preroll, &frame);
                 if (wake_word_feed(frame.pcm, frame.count)) {
                     wake_word_reset();
-                    wake_buffered = false;
                     ESP_LOGI(TAG, "Jarvis detected");
-                    start_call("wake_word");
+                    start_call("wake_word", wake_preroll);
                 }
+            } else {
+                wake_preroll->count = 0;
             }
-        } else if (current == VOICE_CONNECTING || current == VOICE_ACTIVE) {
+        } else if ((current == VOICE_CONNECTING || current == VOICE_ACTIVE) && !atomic_load(&stop_call)) {
             if (voice_playback_echo_guard()) {
                 memset(frame.pcm, 0, frame.count * sizeof(frame.pcm[0]));
             }
@@ -242,7 +285,8 @@ static void prefetch_conversation(void *context)
 {
     (void)context;
     while (true) {
-        if (atomic_load(&mode) == VOICE_IDLE && xSemaphoreTake(conversation_lookup, 0) == pdTRUE) {
+        if (!agent_link_realtime_running() && atomic_load(&mode) == VOICE_IDLE &&
+            xSemaphoreTake(conversation_lookup, 0) == pdTRUE) {
             const int agent_id = voice_agent_id();
             conversation_cache_t cache = load_conversation();
             if (cache.agent_id != agent_id) cache = (conversation_cache_t){.agent_id = agent_id};
@@ -261,7 +305,7 @@ static void prefetch_conversation(void *context)
 static esp_err_t request_session(conversation_cache_t *cache)
 {
     const int agent_id = voice_agent_id();
-    if (agent_id <= 0 || atomic_load(&stop_call)) {
+    if (agent_id <= 0) {
         return ESP_ERR_INVALID_STATE;
     }
     if (cache->agent_id == agent_id && cache->latest.id[0] && !tool_route_reserved(cache)) {
@@ -272,7 +316,7 @@ static esp_err_t request_session(conversation_cache_t *cache)
         xSemaphoreTake(conversation_lookup, portMAX_DELAY);
         *cache = load_conversation();
         esp_err_t err = ESP_OK;
-        if (atomic_load(&stop_call) || voice_agent_id() != agent_id) {
+        if (voice_agent_id() != agent_id) {
             err = ESP_ERR_INVALID_STATE;
         } else if (cache->agent_id != agent_id || !cache->latest.id[0]) {
             err = lookup_latest(cache, agent_id, "on_demand");
@@ -284,7 +328,7 @@ static esp_err_t request_session(conversation_cache_t *cache)
         xSemaphoreGive(conversation_lookup);
         if (err != ESP_OK) return err;
     }
-    if (atomic_load(&stop_call) || voice_agent_id() != agent_id) {
+    if (voice_agent_id() != agent_id) {
         return ESP_ERR_INVALID_STATE;
     }
     return agent_link_request_realtime_session(agent_id, cache->latest.id);
@@ -292,12 +336,12 @@ static esp_err_t request_session(conversation_cache_t *cache)
 
 static void close_stream(agent_stream_handle_t *stream)
 {
-    servo_tool_accept_transcripts(false);
-    voice_playback_accept(false);
     if (*stream) {
-        (void)agent_link_stream_close(*stream, false);
+        (void)agent_link_stream_close(*stream, true);
         *stream = NULL;
     }
+    servo_tool_accept_transcripts(false);
+    voice_playback_accept(false);
 }
 
 static void handle_tools(void *context)
@@ -338,81 +382,10 @@ static void handle_tools(void *context)
     }
 }
 
-static esp_err_t run_session(conversation_cache_t *cache)
+static void finish_call(agent_stream_handle_t *stream, esp_err_t err)
 {
-    ESP_LOGI(TAG, "Voice stage worker: ms=%lu", (unsigned long)(now_ms() - atomic_load(&requested_at)));
-    esp_err_t err = request_session(cache);
-    if (err != ESP_OK) {
-        return err;
-    }
-    const uint32_t opening_deadline = now_ms() + START_TIMEOUT_MS;
-    agent_stream_handle_t stream = NULL;
-    bool opened = false;
-    audio_frame_t frame;
-
-    while (agent_link_realtime_running()) {
-        const bool ready = agent_link_state() == AGENT_STATE_READY;
-        if (atomic_load(&stop_call)) break;
-        if (!ready) {
-            if (stream) {
-                close_stream(&stream);
-                xQueueReset(uplink);
-            }
-            const bool recovering = agent_link_realtime_recovering();
-            const voice_mode_t waiting = recovering ? VOICE_RECOVERING : opened ? VOICE_ENDING : VOICE_CONNECTING;
-            if (atomic_exchange(&mode, waiting) != waiting) {
-                ESP_LOGI(TAG, "Voice session state: %s",
-                         recovering ? "reconnecting" : opened ? "ending" : "connecting");
-            }
-            if (!opened && !before_deadline(opening_deadline)) {
-                err = ESP_ERR_TIMEOUT;
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        if (!stream) {
-            const uint32_t started = now_ms();
-            err = agent_link_stream_open(AGENT_STREAM_VOICE, NULL, &stream);
-            if (err != ESP_OK) {
-                break;
-            }
-            if (opened) {
-                ESP_LOGI(TAG, "Realtime voice resumed");
-            } else {
-                ESP_LOGI(TAG, "Realtime voice ready: total_ms=%lu stream_open_ms=%lu",
-                         (unsigned long)(now_ms() - atomic_load(&requested_at)), (unsigned long)(now_ms() - started));
-            }
-            opened = true;
-            servo_tool_accept_transcripts(true);
-            voice_playback_accept(true);
-            atomic_store(&mode, VOICE_ACTIVE);
-            queue_tools(cache, true);
-        }
-        if (xQueuePeek(uplink, &frame, pdMS_TO_TICKS(10)) != pdTRUE) {
-            continue;
-        }
-        const esp_err_t sent = agent_link_stream_write(stream, frame.pcm, frame.count * sizeof(frame.pcm[0]));
-        if (sent == ESP_OK) {
-            xQueueReceive(uplink, &frame, 0);
-        } else if (sent == ESP_ERR_NO_MEM || agent_link_state() != AGENT_STATE_READY) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } else {
-            err = sent;
-            break;
-        }
-    }
     atomic_store(&mode, VOICE_ENDING);
-    close_stream(&stream);
-    (void)agent_link_end_realtime();
-    while (agent_link_realtime_running()) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    return err == ESP_OK && !opened && !atomic_load(&stop_call) ? ESP_FAIL : err;
-}
-
-static void finish_call(esp_err_t err)
-{
+    close_stream(stream);
     if (err != ESP_OK && !atomic_load(&stop_call)) {
         atomic_store(&error_until, now_ms() + 3000);
         ESP_LOGW(TAG, "Voice session ended: %s", esp_err_to_name(err));
@@ -426,24 +399,84 @@ static void finish_call(esp_err_t err)
 static void handle_calls(void *context)
 {
     (void)context;
+    conversation_cache_t resident = {0};
+    agent_stream_handle_t stream = NULL;
+    uint32_t retry_at = 0;
+    uint32_t retry_ms = RESIDENT_RETRY_MS;
+    bool was_ready = false;
+    audio_frame_t frame;
+
     while (true) {
-        const voice_mode_t current = atomic_load(&mode);
-        if (current == VOICE_CONNECTING) {
-            conversation_cache_t cache = load_conversation();
-            finish_call(run_session(&cache));
-        } else if (current == VOICE_IDLE) {
-            const conversation_cache_t cache = load_conversation();
-            const int agent_id = voice_agent_id();
-            if (cache.agent_id == agent_id && atomic_load(&mode) == VOICE_IDLE) {
-                queue_tools(&cache, false);
-                if (agent_id > 0 && cache.latest.id[0] && !tool_route_reserved(&cache)) {
-                    (void)agent_link_prepare_realtime_session(agent_id, cache.latest.id);
+        voice_mode_t current = atomic_load(&mode);
+        bool talking = current == VOICE_CONNECTING || current == VOICE_ACTIVE || current == VOICE_RECOVERING;
+        const int agent_id = voice_agent_id();
+        const bool running = agent_link_realtime_running();
+        const bool ready = running && agent_link_state() == AGENT_STATE_READY;
+        if (ready && !was_ready) {
+            retry_ms = RESIDENT_RETRY_MS;
+            ESP_LOGI(TAG, "Resident voice connected: microphone=%s", stream ? "on" : "off");
+        }
+        was_ready = ready;
+
+        if (talking && (atomic_load(&stop_call) || agent_id <= 0 ||
+                        (!running && current != VOICE_CONNECTING) ||
+                        (current == VOICE_CONNECTING &&
+                         !before_deadline(atomic_load(&requested_at) + START_TIMEOUT_MS)))) {
+            finish_call(&stream, atomic_load(&stop_call) ? ESP_OK : ESP_ERR_TIMEOUT);
+            talking = false;
+            current = VOICE_IDLE;
+        }
+        if (running && (resident.agent_id != agent_id ||
+                        (current == VOICE_IDLE && tool_route_reserved(&resident)))) {
+            if (talking) finish_call(&stream, ESP_ERR_INVALID_STATE);
+            (void)agent_link_end_realtime();
+            resident = (conversation_cache_t){0};
+        } else if (!running && current != VOICE_BOOT && current != VOICE_FAULT && agent_id > 0) {
+            if (!before_deadline(retry_at)) {
+                conversation_cache_t next = load_conversation();
+                const esp_err_t err = request_session(&next);
+                if (err == ESP_OK) resident = next;
+                ESP_LOGI(TAG, "Resident voice connection requested: result=%s", esp_err_to_name(err));
+                retry_at = now_ms() + retry_ms;
+                retry_ms = retry_ms < RESIDENT_RETRY_MAX_MS / 2 ? retry_ms * 2 : RESIDENT_RETRY_MAX_MS;
+            }
+        } else if (talking && !ready) {
+            if (stream) {
+                close_stream(&stream);
+                xQueueReset(uplink);
+            }
+            if (agent_link_realtime_recovering() && current != VOICE_RECOVERING) {
+                atomic_store(&mode, VOICE_RECOVERING);
+                ESP_LOGI(TAG, "Voice session state: reconnecting");
+            }
+        } else if (talking && ready) {
+            if (!stream) {
+                const esp_err_t err = agent_link_stream_open(AGENT_STREAM_VOICE, NULL, &stream);
+                if (err == ESP_OK) {
+                    voice_playback_accept(true);
+                    servo_tool_accept_transcripts(true);
+                    ESP_LOGI(TAG, "Realtime voice ready: total_ms=%lu resident=yes",
+                             (unsigned long)(now_ms() - atomic_load(&requested_at)));
+                    atomic_store(&mode, VOICE_ACTIVE);
+                    queue_tools(&resident, true);
+                } else if (agent_link_state() == AGENT_STATE_READY) {
+                    finish_call(&stream, err);
                 }
             }
+            if (stream && !atomic_load(&stop_call) && xQueuePeek(uplink, &frame, 0) == pdTRUE) {
+                const esp_err_t err = agent_link_stream_write(stream, frame.pcm, frame.count * sizeof(frame.pcm[0]));
+                if (err == ESP_OK) {
+                    xQueueReceive(uplink, &frame, 0);
+                    continue;
+                }
+                if (err != ESP_ERR_NO_MEM && agent_link_state() == AGENT_STATE_READY) {
+                    finish_call(&stream, err);
+                }
+            }
+        } else if (current == VOICE_IDLE && ready) {
+            queue_tools(&resident, false);
         }
-        if (atomic_load(&mode) != VOICE_CONNECTING) {
-            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-        }
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(talking ? 10 : 250));
     }
 }
 
@@ -482,16 +515,20 @@ static void stop_audio_workers(void)
     }
     heap_caps_free(uplink_storage);
     uplink_storage = NULL;
+    heap_caps_free(wake_preroll);
+    wake_preroll = NULL;
 }
 
 static bool start_audio_workers(void)
 {
     conversation_lookup = xSemaphoreCreateMutexStatic(&conversation_mutex);
+    wake_preroll = heap_caps_calloc(1, sizeof(*wake_preroll), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uplink_storage = heap_caps_malloc(UPLINK_FRAMES * sizeof(audio_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (uplink_storage) {
         uplink = xQueueCreateStatic(UPLINK_FRAMES, sizeof(audio_frame_t), uplink_storage, &uplink_queue);
     }
-    if (uplink && sugarat_audio_init() == ESP_OK && wake_word_init() == ESP_OK && voice_playback_start() == ESP_OK &&
+    if (uplink && wake_preroll && sugarat_audio_init() == ESP_OK && wake_word_init() == ESP_OK &&
+        voice_playback_start() == ESP_OK &&
         xTaskCreateWithCaps(prefetch_conversation, "jarvis_prefetch", 8192, NULL, 3, &prefetch_task,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS &&
         xTaskCreateWithCaps(handle_calls, "jarvis_session", 8192, NULL, 4, &session_task,
@@ -577,4 +614,5 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
 void sugarat_voice_end_call(void)
 {
     atomic_store(&stop_call, true);
+    if (session_task) xTaskNotifyGive(session_task);
 }

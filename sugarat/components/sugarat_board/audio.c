@@ -1,8 +1,11 @@
 #include "audio.h"
 
+#include <stdatomic.h>
+
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_attr.h"
 
 enum { AMP_ENABLE = GPIO_NUM_3, PLAYBACK_VOLUME = 35 };
 
@@ -11,6 +14,34 @@ static i2s_chan_handle_t mic;
 static i2s_chan_handle_t speaker;
 static int32_t previous_input;
 static int32_t highpass;
+static DRAM_ATTR atomic_uint speaker_completed;
+static DRAM_ATTR atomic_uint speaker_empty_slots;
+
+static bool IRAM_ATTR speaker_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *context)
+{
+    (void)handle;
+    (void)event;
+    (void)context;
+    atomic_fetch_add_explicit(&speaker_completed, 1, memory_order_relaxed);
+    return false;
+}
+
+static bool IRAM_ATTR speaker_empty(i2s_chan_handle_t handle, i2s_event_data_t *event, void *context)
+{
+    (void)handle;
+    (void)event;
+    (void)context;
+    atomic_fetch_add_explicit(&speaker_empty_slots, 1, memory_order_relaxed);
+    return false;
+}
+
+sugarat_speaker_dma_t sugarat_speaker_dma(void)
+{
+    return (sugarat_speaker_dma_t){
+        .completed = atomic_load_explicit(&speaker_completed, memory_order_relaxed),
+        .empty_slots = atomic_load_explicit(&speaker_empty_slots, memory_order_relaxed),
+    };
+}
 
 static esp_err_t init_mic(void)
 {
@@ -44,6 +75,8 @@ static esp_err_t init_speaker(void)
     };
     config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(speaker, &config), TAG, "Initialize speaker TX");
+    const i2s_event_callbacks_t callbacks = {.on_sent = speaker_sent, .on_send_q_ovf = speaker_empty};
+    ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(speaker, &callbacks, NULL), TAG, "Watch speaker DMA");
     return i2s_channel_enable(speaker);
 }
 

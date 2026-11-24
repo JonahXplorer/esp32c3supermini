@@ -9,7 +9,7 @@
 #include "model_path.h"
 
 static const char *TAG = "sugarat_wake";
-static const float JARVIS_THRESHOLD = 0.55f;
+static const float JARVIS_THRESHOLD = 0.50f;
 static srmodel_list_t *models;
 static const esp_afe_sr_iface_t *afe;
 static esp_afe_sr_data_t *detector;

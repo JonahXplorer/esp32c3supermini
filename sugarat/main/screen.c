@@ -57,6 +57,8 @@ static lv_obj_t *tab_text[PAGE_COUNT];
 static lv_obj_t *voice_dot;
 static lv_obj_t *receiver_status;
 static lv_obj_t *targets[2];
+static lv_obj_t *light_button;
+static lv_obj_t *light_label;
 static lv_obj_t *angle_caption;
 static adjustment_t angle = {.action = SCREEN_SET_ANGLE};
 static adjustment_t speed = {.action = SCREEN_SET_SPEED};
@@ -153,6 +155,14 @@ static void command_clicked(lv_event_t *event)
 {
     const screen_action_t *command = lv_event_get_user_data(event);
     action = *command;
+}
+
+static void light_clicked(lv_event_t *event)
+{
+    action = (screen_action_t){
+        .kind = SCREEN_SET_LIGHT,
+        .value = displayed.light == SERVO_LIGHT_ON ? SERVO_LIGHT_OFF : SERVO_LIGHT_ON,
+    };
 }
 
 static void mark_enabled(lv_obj_t *object, bool enabled)
@@ -261,8 +271,14 @@ static void build_servos(lv_obj_t *page)
     build_adjustment(page, &speed, 244, 246, "Travel time / 90°", LILAC);
     lv_slider_set_range(speed.slider, 0, (SERVO_SPEED_MAX - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT);
 
-    quick_voice = button(page, 150, 30, "", NULL);
-    lv_obj_align(quick_voice, LV_ALIGN_TOP_MID, 0, 308);
+    light_button = button(page, 94, 34, "Light", &light_label);
+    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 306);
+    lv_obj_add_event_cb(light_button, light_clicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *quick_label;
+    quick_voice = button(page, 110, 34, "", &quick_label);
+    lv_obj_set_style_text_font(quick_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(quick_voice, LV_ALIGN_TOP_MID, 50, 306);
     lv_obj_set_style_bg_color(quick_voice, lv_color_hex(PANEL), 0);
     lv_obj_add_event_cb(quick_voice, tab_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_JARVIS);
 }
@@ -399,6 +415,7 @@ static void show_voice(const sugarat_voice_view_t *voice)
         lv_label_set_text(lv_obj_get_child(quick_voice, 0), shortcut);
     }
     set_hidden(quick_voice, shortcut == NULL);
+    lv_obj_align(light_button, LV_ALIGN_TOP_MID, shortcut ? -60 : 0, 306);
 }
 
 void screen_update(const screen_state_t *state)
@@ -421,6 +438,15 @@ void screen_update(const screen_state_t *state)
     if (!has_state || state->angle_limit_deg != displayed.angle_limit_deg) {
         lv_label_set_text_fmt(angle_caption, "B angle (0-%u°)", (unsigned)state->angle_limit_deg);
         lv_slider_set_range(angle.slider, 0, state->angle_limit_deg / SERVO_ANGLE_INCREMENT);
+    }
+    if (!has_state || state->light != displayed.light || state->online != displayed.online ||
+        state->pending != displayed.pending || state->touch_ready != displayed.touch_ready) {
+        const bool known = state->online && state->light != SERVO_LIGHT_UNKNOWN;
+        const bool on = known && state->light == SERVO_LIGHT_ON;
+        lv_label_set_text(light_label, known ? (on ? "Light on" : "Light off") : "Light");
+        lv_obj_set_style_bg_color(light_button, lv_color_hex(on ? AMBER : PANEL), 0);
+        lv_obj_set_style_text_color(light_label, lv_color_hex(on ? INK : TEXT), 0);
+        mark_enabled(light_button, enabled && known);
     }
     sync_adjustment(&angle, state->angle_deg / SERVO_ANGLE_INCREMENT, enabled, state->pending);
     sync_adjustment(&speed, (state->speed - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT, enabled, state->pending);

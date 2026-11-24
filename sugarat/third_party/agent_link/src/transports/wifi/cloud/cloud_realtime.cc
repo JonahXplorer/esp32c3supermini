@@ -47,6 +47,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "freertos/ringbuf.h"
+#endif
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_ESP_TLS_USING_MBEDTLS
@@ -211,6 +214,8 @@ std::atomic<bool>          s_mute{false};
 std::atomic<bool>          s_continuous{false};
 std::atomic<uint32_t>      s_epoch{0};
 std::atomic<uint32_t>      s_reset{0};
+// Odd while S3 platform microphone input is open. The value also tags queued PCM and Opus.
+std::atomic<uint32_t>      s_capture_turn{0};
 std::mutex                s_mutex;
 PrepareRoute              s_prepare = {};
 Grant                     s_prepared = {};
@@ -590,6 +595,7 @@ struct WsSender {
 #if AGENT_LINK_NATIVE_WSS
     agentlink::realtime::PendingWrite pending;
     unsigned audio_frames = 0, audio_messages = 0;
+    uint32_t audio_turn = 0;
     size_t audio_bytes = 0;
     int64_t queued_at = 0;
     uint32_t receive_at_first_wait = 0;
@@ -597,6 +603,7 @@ struct WsSender {
 #if CONFIG_IDF_TARGET_ESP32S3
     int64_t last_data_received_ms = 0;
     bool wait_extension_logged = false;
+    unsigned peak_uplink_queue_ms = 0;
 #endif
 #endif
 };
@@ -620,10 +627,29 @@ bool TlsWouldBlock(int result) {
 
 bool PumpWire(WsSender& sender) {
     if (!sender.pending.Busy()) return true;
+    std::unique_lock<std::mutex> capture_lock(s_mutex, std::defer_lock);
+    if (sender.audio_turn) {
+        capture_lock.lock();
+        // An untouched frame can be discarded. Once TLS has prepared a record
+        // or accepted part of a frame, it must finish with the original bytes.
+        if (sender.audio_turn != s_capture_turn.load() &&
+            !sender.first_wait_at && !sender.pending.Offset()) {
+            memset(sender.wire, 0, sender.pending.Size());
+            sender.pending = {};
+            sender.audio_frames = sender.audio_messages = 0;
+            sender.audio_bytes = 0;
+            sender.audio_turn = 0;
+            return true;
+        }
+    }
     const int64_t now_ms = esp_timer_get_time() / 1000;
     using agentlink::realtime::PendingWrite;
     int64_t stall_limit_ms = PendingWrite::kStallMs;
 #if CONFIG_IDF_TARGET_ESP32S3
+    if (sender.first_wait_at) {
+        const unsigned queued_ms = (uxQueueMessagesWaiting(s_tx) + s_encoded_pending.load()) * 20;
+        sender.peak_uplink_queue_ms = std::max(sender.peak_uplink_queue_ms, queued_ms);
+    }
     const bool receiving = sender.audio_messages && sender.first_wait_at &&
                            sender.last_data_received_ms >= sender.first_wait_at / 1000 &&
                            now_ms - sender.last_data_received_ms <= 1000;
@@ -643,6 +669,11 @@ bool PumpWire(WsSender& sender) {
                  static_cast<unsigned>(sender.pending.Remaining()),
                  static_cast<unsigned>(sender.pending.Offset()),
                  sender.first_wait_at ? static_cast<unsigned>(s_rx_bytes.load() - sender.receive_at_first_wait) : 0);
+#if CONFIG_IDF_TARGET_ESP32S3
+        ESP_LOGW(TAG, "Voice TLS write backlog: peak_uplink_ms=%u downlink_pending_bytes=%u microphone=%s",
+                 sender.peak_uplink_queue_ms, static_cast<unsigned>(s_downlink_bytes.load()),
+                 (s_capture_turn.load() & 1) ? "on" : "off");
+#endif
         LogTransportFailure(sender.tls, "write progress timeout", 0, 0);
         return false;
     };
@@ -677,17 +708,26 @@ bool PumpWire(WsSender& sender) {
     }
     if (!sender.pending.Busy()) {
         const uint32_t waited_rx = s_rx_bytes.load() - sender.receive_at_first_wait;
+#if CONFIG_IDF_TARGET_ESP32S3
+        if (sender.first_wait_at && esp_timer_get_time() - sender.first_wait_at >= kReportAudioGapUs) {
+            ESP_LOGI(TAG, "Voice TLS write resumed: wait_ms=%u rx_while_waiting=%u peak_uplink_ms=%u",
+                     static_cast<unsigned>((esp_timer_get_time() - sender.first_wait_at) / 1000),
+                     static_cast<unsigned>(waited_rx), sender.peak_uplink_queue_ms);
+        }
+        sender.peak_uplink_queue_ms = 0;
+#else
         if (sender.first_wait_at && waited_rx && esp_timer_get_time() - sender.first_wait_at >= kReportAudioGapUs) {
             ESP_LOGI(TAG, "Voice TLS write resumed: wait_ms=%u rx_while_waiting=%u",
                      static_cast<unsigned>((esp_timer_get_time() - sender.first_wait_at) / 1000),
                      static_cast<unsigned>(waited_rx));
         }
+#endif
         sender.first_wait_at = 0;
 #if CONFIG_IDF_TARGET_ESP32S3
         sender.wait_extension_logged = false;
 #endif
         memset(sender.wire, 0, sender.pending.Size());
-        if (sender.audio_messages) {
+        if (sender.audio_messages && (!sender.audio_turn || sender.audio_turn == s_capture_turn.load())) {
             const uint32_t elapsed = static_cast<uint32_t>((esp_timer_get_time() - sender.queued_at) / 1000);
             const uint32_t previously_sent = s_tx_sent_frames.fetch_add(sender.audio_frames);
             if (s_continuous.load() && previously_sent == 0)
@@ -698,9 +738,10 @@ bool PumpWire(WsSender& sender) {
             s_tx_write_calls.fetch_add(1);
             s_tx_send_ms.fetch_add(elapsed);
             if (elapsed > s_tx_send_max_ms.load()) s_tx_send_max_ms.store(elapsed);
-            sender.audio_frames = sender.audio_messages = 0;
-            sender.audio_bytes = 0;
         }
+        sender.audio_frames = sender.audio_messages = 0;
+        sender.audio_bytes = 0;
+        sender.audio_turn = 0;
     }
     return true;
 }
@@ -790,10 +831,15 @@ bool IsInterruption(const uint8_t* data, size_t bytes) {
     return interrupted;
 }
 
-void ResetInput() {
-    std::lock_guard<std::mutex> lock(s_mutex);
+void ResetInputLocked() {
+    if (s_capture_turn.load() & 1) s_capture_turn.fetch_add(1);
     s_input = AGENT_STREAM_KIND_COUNT;
     if (s_tx) xQueueReset(s_tx);
+}
+
+void ResetInput() {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    ResetInputLocked();
 }
 
 class Call {
@@ -809,12 +855,16 @@ public:
             else vQueueDelete(encoded_queue_);
         }
         s_encoded_pending.store(0);
+#if CONFIG_IDF_TARGET_ESP32S3
+        if (rx_ring_) vRingbufferDeleteWithCaps(rx_ring_);
+#else
         if (rx_queue_) {
             Rx packet;
             while (xQueueReceive(rx_queue_, &packet, 0) == pdTRUE) free(packet.data);
             if (rx_caps_) vQueueDeleteWithCaps(rx_queue_);
             else vQueueDelete(rx_queue_);
         }
+#endif
         s_downlink_bytes.store(0);
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
         if (decoder_) esp_opus_dec_close(decoder_);
@@ -850,10 +900,19 @@ public:
                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
         return true;
 #else
+#if CONFIG_IDF_TARGET_ESP32S3
+        // A no-split ring needs just over twice the largest item to guarantee
+        // it can accept that item at any position. Reserve it once in PSRAM.
+        constexpr size_t rx_ring_bytes = 2 * (kMessageBytes + sizeof(Rx) + 32);
+        rx_ring_ = xRingbufferCreateWithCaps(rx_ring_bytes, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!rx_ring_) return false;
+        ESP_LOGI(TAG, "Resident WSS downlink buffer: %uB PSRAM", static_cast<unsigned>(rx_ring_bytes));
+#else
         rx_queue_ = xQueueCreateWithCaps(kDownlinkDepth, sizeof(Rx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         rx_caps_ = rx_queue_ != nullptr;
         if (!rx_queue_) rx_queue_ = xQueueCreate(kDownlinkDepth, sizeof(Rx));
         if (!rx_queue_) return false;
+#endif
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
         constexpr unsigned stack_bytes = 24576;
 #else
@@ -892,6 +951,13 @@ public:
 
     bool Healthy() const { return running_.load(); }
     bool TransportFailed() const { return transport_failed_; }
+    bool CanPauseInput() const {
+#if CONFIG_IDF_TARGET_ESP32S3
+        return continuous_;
+#else
+        return false;
+#endif
+    }
     void Stop() {
         running_.store(false);
         while (media_started_ && !media_done_.load()) vTaskDelay(1);
@@ -1026,6 +1092,20 @@ public:
         const bool handled = opcode == WS_TRANSPORT_OPCODES_BINARY
                            ? Audio(const_cast<uint8_t*>(data), bytes) : Text(data, bytes);
         if (!handled) running_.store(false);
+        return true;
+#elif CONFIG_IDF_TARGET_ESP32S3
+        if (s_downlink_bytes.load() + bytes > kDownlinkBytes) return false;
+        void* item = nullptr;
+        if (xRingbufferSendAcquire(rx_ring_, &item, sizeof(Rx) + bytes, 0) != pdTRUE) return false;
+        auto* payload = static_cast<uint8_t*>(item) + sizeof(Rx);
+        const Rx packet{opcode, bytes, payload, received_at, reset};
+        memcpy(item, &packet, sizeof packet);
+        if (bytes) memcpy(payload, data, bytes);
+        s_downlink_bytes.fetch_add(bytes);
+        if (xRingbufferSendComplete(rx_ring_, item) != pdTRUE) {
+            running_.store(false);
+            return false;
+        }
         return true;
 #else
         if (s_downlink_bytes.load() + bytes > kDownlinkBytes || !uxQueueSpacesAvailable(rx_queue_)) return false;
@@ -1260,9 +1340,14 @@ public:
 #if CONFIG_IDF_TARGET_ESP32S3
             ReportDmaHeap("session_ready");
 #endif
-            s_mute.store(false);
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_AGENT_LINK_REALTIME_OPUS
+            // Allocate the encoder and its queue while bringing up the resident socket.
+            if (audio_.input_opus && !StartEncoder()) { cJSON_Delete(json); return false; }
+#endif
+            s_mute.store(CanPauseInput() && !(s_capture_turn.load() & 1));
             if (!s_ready.exchange(true) && s_cb.state)
-                s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
+                s_cb.state(true, CanPauseInput() && s_mute ? "Voice ready, microphone off" :
+                                 continuous_ ? "Microphone on" : "Hold to talk, release to send");
             SetRecovering(epoch_, false);
 #if !CONFIG_IDF_TARGET_ESP32C3
             const uint32_t sent_at = hello_sent_ms_.exchange(0);
@@ -1293,6 +1378,9 @@ public:
                     keep = Audio(decoded, got);
                 }
             }
+        } else if (CanPauseInput() && s_mute &&
+                   (strncmp(event, "response.", 9) == 0 || strncmp(event, "transcript.", 11) == 0)) {
+            // Keep receiving control/session events while the microphone and playback are off.
         } else if (strcmp(event, "response.audio.done") == 0) {
             ++reply_ends_;
 #if !CONFIG_IDF_TARGET_ESP32C3
@@ -1365,6 +1453,19 @@ public:
 #if CONFIG_AGENT_LINK_REALTIME_OPUS && !CONFIG_IDF_TARGET_ESP32C3
         if (input_opus_.load() && !StartEncoder()) return false;
 #endif
+        std::unique_lock<std::mutex> capture_lock(s_mutex, std::defer_lock);
+        if (CanPauseInput()) {
+            capture_lock.lock();
+            const uint32_t turn = s_capture_turn.load();
+            if (encoded_queue_) {
+                while (xQueuePeek(encoded_queue_, &encoded_packet_, 0) == pdTRUE &&
+                       encoded_packet_.turn != turn) {
+                    if (xQueueReceive(encoded_queue_, &encoded_packet_, 0) != pdTRUE) break;
+                    s_encoded_pending.fetch_sub(1);
+                }
+            }
+            if (!(turn & 1)) return true;
+        }
         if (!TxPending()) return true;
 #if !AGENT_LINK_NATIVE_WSS
         // The blocking transport adapter polls before writing. Native WSS queues
@@ -1505,15 +1606,26 @@ private:
             if (s_ready && input_opus_.load() && uxQueueMessagesWaiting(s_tx) &&
                 encoded_queue_ && uxQueueSpacesAvailable(encoded_queue_) >= 2) wait = 0;
 #endif
+#if CONFIG_IDF_TARGET_ESP32S3
+            size_t item_size = 0;
+            void* item = xRingbufferReceive(rx_ring_, &item_size, wait);
+            if (!item) continue;
+            memcpy(&packet, item, sizeof packet);
+#else
             if (xQueueReceive(rx_queue_, &packet, wait) != pdTRUE) continue;
+#endif
             received_at_ = packet.received_at;
             bool handled = true;
             if (packet.reset == s_reset.load()) {
                 handled = packet.opcode == WS_TRANSPORT_OPCODES_BINARY
                         ? Audio(packet.data, packet.bytes) : Text(packet.data, packet.bytes);
             }
-            free(packet.data);
             s_downlink_bytes.fetch_sub(packet.bytes);
+#if CONFIG_IDF_TARGET_ESP32S3
+            vRingbufferReturnItem(rx_ring_, item);
+#else
+            free(packet.data);
+#endif
             s_media_stack.store(uxTaskGetStackHighWaterMark(nullptr));
             if (!handled) running_.store(false);
         }
@@ -1547,6 +1659,7 @@ private:
 #if AGENT_LINK_NATIVE_WSS
         if (!WriteWire(ws, wire_bytes)) { transport_failed_ = true; return false; }
         ws.audio_frames = pcm_packets; ws.audio_messages = messages; ws.audio_bytes = json_bytes;
+        ws.audio_turn = CanPauseInput() ? s_capture_turn.load() : 0;
         return true;
 #else
         SetWorkerPhase(1);
@@ -1616,6 +1729,7 @@ private:
 
     bool QueueEncoded(const EncodedTx& packet) {
         while (Healthy() && Current(epoch_)) {
+            if (CanPauseInput() && packet.turn != s_capture_turn.load()) return true;
             s_encoded_pending.fetch_add(1);
 #if CONFIG_IDF_TARGET_ESP32C3
             // PumpEncoder reserves enough slots for the frame and end marker.
@@ -1733,9 +1847,17 @@ private:
         agentlink::realtime::PcmFrames<kMicBytes> frames;
         Tx input;
         EncodedTx output{};
+        uint32_t turn = 0;
         int64_t last_yield = esp_timer_get_time();
         while (valid && Healthy() && Current(epoch_)) {
             if (xQueueReceive(s_tx, &input, pdMS_TO_TICKS(10)) != pdTRUE) continue;
+            if (CanPauseInput()) {
+                if (input.turn != s_capture_turn.load()) continue;
+                if (input.turn != turn) {
+                    frames.Reset();
+                    turn = input.turn;
+                }
+            }
             valid = EncodeInput(input, frames, output);
             s_encoder_stack.store(uxTaskGetStackHighWaterMark(nullptr));
             if (esp_timer_get_time() - last_yield >= kWorkerYieldUs) {
@@ -1769,8 +1891,13 @@ private:
     EncodedTx encoded_packet_{};
     bool encoder_started_ = false, encoder_caps_ = false;
     std::atomic<bool> encoder_done_{false};
+#if CONFIG_IDF_TARGET_ESP32S3
+    RingbufHandle_t rx_ring_ = nullptr;
+#else
     QueueHandle_t rx_queue_ = nullptr;
-    bool rx_caps_ = false, media_started_ = false, media_caps_ = false;
+    bool rx_caps_ = false;
+#endif
+    bool media_started_ = false, media_caps_ = false;
     std::atomic<bool> running_{true}, media_done_{false};
     int16_t* decode_pcm_ = nullptr;
     const char* connect_token_ = nullptr;
@@ -2774,11 +2901,10 @@ void cloud_realtime_cancel(void) {
     s_ready.store(false);
     s_mute.store(true);
     s_recovering.store(false);
-    s_input = AGENT_STREAM_KIND_COUNT;
+    ResetInputLocked();
     s_prepare = {0, {}, 0, 0, s_prepare.generation + 1};
     s_prepared = {};
     if (s_grants) xQueueReset(s_grants);
-    if (s_tx) xQueueReset(s_tx);
 }
 
 esp_err_t cloud_realtime_wait_idle(uint32_t timeout_ms) {
@@ -2811,6 +2937,11 @@ esp_err_t cloud_realtime_stream_start(agent_stream_t type) {
         s_diag_prev_sent_frames = s_diag_prev_sent_messages = 0;
         s_diag_prev_tx_bytes = s_diag_prev_rx_bytes = s_diag_prev_samples = 0;
         s_input = type;
+#if CONFIG_IDF_TARGET_ESP32S3
+        s_capture_turn.fetch_add(1);
+        s_mute.store(false);
+        ESP_LOGI(TAG, "Resident voice microphone: on");
+#endif
         return ESP_OK;
     }
     if (uxQueueSpacesAvailable(s_tx) < 3) return ESP_ERR_NO_MEM;
@@ -2835,7 +2966,7 @@ esp_err_t cloud_realtime_stream_write(agent_stream_t type, const uint8_t* data, 
         }
         return ESP_ERR_NO_MEM;
     }
-    Tx packet = {TxKind::kPcm, 0, 0, {}};
+    Tx packet = {TxKind::kPcm, 0, s_capture_turn.load(), {}};
     while (bytes) {
         packet.bytes = bytes > kMicBytes ? kMicBytes : bytes;
         memcpy(packet.data, data, packet.bytes);
@@ -2856,7 +2987,18 @@ esp_err_t cloud_realtime_stream_write(agent_stream_t type, const uint8_t* data, 
 esp_err_t cloud_realtime_stream_end(agent_stream_t type, bool complete) {
     if (!complete) { cloud_realtime_cancel(); return ESP_OK; }
     std::lock_guard<std::mutex> lock(s_mutex);
-    if (!s_run || !s_ready || s_input != type) return ESP_ERR_INVALID_STATE;
+    if (!s_run || s_input != type) return ESP_ERR_INVALID_STATE;
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (s_continuous) {
+        s_mute.store(true);
+        ResetInputLocked();
+        s_reset.fetch_add(1);
+        ESP_LOGI(TAG, "Resident voice microphone: off; audio_frames=%u",
+                 static_cast<unsigned>(s_tx_sent_frames.load()));
+        return ESP_OK;
+    }
+#endif
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (s_continuous) {
         s_input = AGENT_STREAM_KIND_COUNT;
         return ESP_OK;

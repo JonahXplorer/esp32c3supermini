@@ -162,7 +162,7 @@ bool servo_radio_receive(servo_message_t *message)
             continue;
         }
         if (follower.first_channel != 0) {
-            if (message->type < SERVO_QUERY || message->type > SERVO_SET_ANGLE) {
+            if (!servo_message_is_command(message->type)) {
                 continue;
             }
             follower.last_activity = xTaskGetTickCount();
