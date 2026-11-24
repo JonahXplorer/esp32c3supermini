@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "device_settings.h"
 #include "esp_err.h"
 #include "voice.h"
 
@@ -19,6 +20,7 @@ typedef struct {
 
 typedef struct {
     manual_control_view_t manual;
+    device_settings_t settings;
     bool touch_ready;
     bool wifi_connected;
     bool wifi_setup_active;
@@ -34,11 +36,14 @@ typedef enum {
     SCREEN_START_CALL,
     SCREEN_END_CALL,
     SCREEN_SETUP_WIFI,
+    SCREEN_SET_VOLUME,
+    SCREEN_SET_BRIGHTNESS,
 } screen_action_kind_t;
 
 typedef struct {
     screen_action_kind_t kind;
     uint8_t value;
+    bool preview;
 } screen_action_t;
 
 esp_err_t screen_init(bool touch_ready);

@@ -14,6 +14,7 @@ enum {
     LCD_POWER = GPIO_NUM_12,
     LCD_RESET = GPIO_NUM_9,
     LCD_BACKLIGHT = GPIO_NUM_13,
+    LCD_BACKLIGHT_MAX_DUTY = (1 << 10) - 1,
     TOUCH_RESET = GPIO_NUM_5,
     LCD_STRIPE_ROWS = 12,
     LCD_STRIPE_BYTES = SCREEN_SIZE * LCD_STRIPE_ROWS * sizeof(uint16_t),
@@ -83,8 +84,9 @@ esp_err_t sugarat_display_write(int x, int y, int width, int height, const uint8
     return ESP_OK;
 }
 
-esp_err_t sugarat_display_light(void)
+esp_err_t sugarat_display_light(unsigned percent)
 {
+    if (percent < SUGARAT_BRIGHTNESS_MIN || percent > 100) return ESP_ERR_INVALID_ARG;
     const ledc_timer_config_t timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0,
         .duty_resolution = LEDC_TIMER_10_BIT, .freq_hz = 20000, .clk_cfg = LEDC_AUTO_CLK,
@@ -92,9 +94,17 @@ esp_err_t sugarat_display_light(void)
     ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "Backlight timer");
     const ledc_channel_config_t pwm = {
         .gpio_num = LCD_BACKLIGHT, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER_0, .duty = 760,
+        .timer_sel = LEDC_TIMER_0, .duty = percent * LCD_BACKLIGHT_MAX_DUTY / 100,
     };
     return ledc_channel_config(&pwm);
+}
+
+esp_err_t sugarat_display_set_brightness(unsigned percent)
+{
+    if (percent < SUGARAT_BRIGHTNESS_MIN || percent > 100) return ESP_ERR_INVALID_ARG;
+    const uint32_t duty = percent * LCD_BACKLIGHT_MAX_DUTY / 100;
+    ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty), TAG, "Backlight duty");
+    return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 esp_err_t sugarat_touch_init(void)

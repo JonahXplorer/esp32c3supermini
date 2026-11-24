@@ -59,6 +59,9 @@ if(_backend STREQUAL "WIFI" OR _backend STREQUAL "")
             src/transports/wifi/cloud/cloud_chat.cc
             src/transports/wifi/cloud/realtime_codec_memory.cc
             src/transports/wifi/cloud/cloud_json.cc src/transports/wifi/cloud/cloud_clock.cc)
+        if(IDF_TARGET STREQUAL "esp32s3")
+            list(APPEND _sources src/transports/wifi/cloud/realtime_tcp_diagnostics.cc)
+        endif()
         set(_assets portal/portal.html portal/connecting.html)
     endif()
 endif()

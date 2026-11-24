@@ -13,6 +13,9 @@
 #include "cloud_platform.h"
 #include "cloud_limits.h"
 #include "cloud_memory.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "realtime_tcp_diagnostics.h"
+#endif
 #if CONFIG_AGENT_LINK_REALTIME_OPUS && CONFIG_IDF_TARGET_ESP32C3
 #include "realtime_codec_memory.h"
 #endif
@@ -640,6 +643,7 @@ struct WsSender {
     int64_t last_pump_at = 0;
     bool wait_extension_logged = false;
     unsigned peak_uplink_queue_ms = 0;
+    agentlink::realtime::TcpStallStart tcp_stall_start;
     struct {
         int first_tls_wait = 0;
         int last_tls_wait = 0;
@@ -678,13 +682,14 @@ const char* TlsWaitName(int result) {
     return "none";
 }
 
-void LogWriteWaitStart(WsSender& sender, int64_t now_us) {
+bool LogWriteWaitStart(WsSender& sender, int64_t now_us) {
     auto& wait = sender.write_wait;
     // Remember the first sample, but avoid logging routine brief backpressure.
-    if (!sender.first_wait_at || wait.start_logged || now_us - sender.first_wait_at < kReportAudioGapUs) return;
+    if (!sender.first_wait_at || wait.start_logged || now_us - sender.first_wait_at < kReportAudioGapUs) return false;
     wait.start_logged = true;
     ESP_LOGI(TAG, "Voice TLS write stalled: tls_wait=%s socket_writable=%d loop_gap_us=%lld",
              TlsWaitName(wait.first_tls_wait), wait.first_writable, static_cast<long long>(wait.first_loop_gap_us));
+    return true;
 }
 #endif
 
@@ -737,7 +742,11 @@ bool PumpWire(WsSender& sender) {
 #endif
     const auto timed_out = [&](int64_t at_ms) {
 #if CONFIG_IDF_TARGET_ESP32S3
-        LogWriteWaitStart(sender, esp_timer_get_time());
+        if (capture_lock.owns_lock()) capture_lock.unlock();
+        if (LogWriteWaitStart(sender, esp_timer_get_time())) {
+            agentlink::realtime::LogTcpStall(sender.tls, agentlink::realtime::TcpStallPhase::kStart,
+                                            sender.tcp_stall_start);
+        }
 #endif
         ESP_LOGW(TAG, "voice TLS write expired: no_progress_ms=%lld age_ms=%lld limit_ms=%lld pending=%u offset=%u rx_while_waiting=%u",
                  static_cast<long long>(sender.pending.StalledMs(at_ms)),
@@ -754,6 +763,8 @@ bool PumpWire(WsSender& sender) {
                  (s_capture_turn.load() & 1) ? "on" : "off", TlsWaitName(wait.last_tls_wait),
                  wait.want_read, wait.want_write, writable, static_cast<long long>(loop_gap_us),
                  static_cast<long long>(std::max(wait.max_loop_gap_us, loop_gap_us)));
+        agentlink::realtime::LogTcpStall(sender.tls, agentlink::realtime::TcpStallPhase::kTimeout,
+                                        sender.tcp_stall_start);
 #endif
         LogTransportFailure(sender.tls, "write progress timeout", 0, 0);
         return false;
@@ -782,6 +793,7 @@ bool PumpWire(WsSender& sender) {
             sender.write_wait.first_writable = writable;
             sender.write_wait.first_loop_gap_us = loop_gap_us;
             sender.write_wait.max_loop_gap_us = loop_gap_us;
+            sender.tcp_stall_start = {};
 #endif
         }
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -794,14 +806,14 @@ bool PumpWire(WsSender& sender) {
     if (sent > 0 && writable == 0) s_tx_select0_accepted.fetch_add(1);
     const int64_t finished_us = esp_timer_get_time();
     const int64_t finished_ms = finished_us / 1000;
-#if CONFIG_IDF_TARGET_ESP32S3
-    LogWriteWaitStart(sender, finished_us);
-#endif
     if (!sender.pending.Advance(sent, waiting, finished_ms, stall_limit_ms)) {
         if (waiting && sender.pending.Expired(finished_ms, stall_limit_ms)) return timed_out(finished_ms);
         LogTransportFailure(sender.tls, "write", sent, errno);
         return false;
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    const bool report_tcp_start = LogWriteWaitStart(sender, finished_us);
+#endif
     if (!sender.pending.Busy()) {
         const uint32_t waited_rx = s_rx_bytes.load() - sender.receive_at_first_wait;
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -844,6 +856,13 @@ bool PumpWire(WsSender& sender) {
         sender.audio_bytes = 0;
         sender.audio_turn = 0;
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (report_tcp_start) {
+        if (capture_lock.owns_lock()) capture_lock.unlock();
+        agentlink::realtime::LogTcpStall(sender.tls, agentlink::realtime::TcpStallPhase::kStart,
+                                        sender.tcp_stall_start);
+    }
+#endif
     return true;
 }
 #endif

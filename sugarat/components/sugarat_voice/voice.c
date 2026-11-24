@@ -156,8 +156,9 @@ static void queue_preroll(const wake_preroll_t *history)
 
 static void start_call(const char *source, const wake_preroll_t *history)
 {
-    if (atomic_load(&mode) != VOICE_IDLE ||
-        !voice_connection_ready(agent_link_realtime_running()) || voice_agent_id() <= 0) {
+    if (atomic_load(&mode) != VOICE_IDLE) return;
+    if (!voice_connection_ready(agent_link_realtime_running()) || voice_agent_id() <= 0) {
+        if (history) ESP_LOGI(TAG, "Jarvis detected while the voice connection was not ready");
         return;
     }
     int idle = VOICE_IDLE;

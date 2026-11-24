@@ -1,4 +1,5 @@
 #include "agent_link_network.h"
+#include "audio.h"
 #include "board.h"
 #include "manual_control.h"
 #include "screen.h"
@@ -25,10 +26,12 @@ static void ui_task(void *context)
         .manual = {.speed = SERVO_SPEED_DEFAULT, .angle_deg = SERVO_ANGLE_DEFAULT,
                    .angle_limit_deg = SERVO_ANGLE_DEFAULT},
         .touch_ready = touch_ready,
+        .settings = device_settings_load(),
     };
     screen_update(&state);
     (void)screen_poll();
-    ESP_ERROR_CHECK(sugarat_display_light());
+    ESP_ERROR_CHECK(sugarat_display_light(state.settings.brightness));
+    sugarat_speaker_set_volume(state.settings.volume);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(servo_tool_init());
     const bool wifi_managed = sugarat_voice_start() == ESP_OK;
@@ -64,6 +67,18 @@ static void ui_task(void *context)
         } else if (action.kind == SCREEN_SETUP_WIFI && !call_active) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(agent_link_wifi_setup());
             next_wifi_poll = 0;
+        } else if (action.kind == SCREEN_SET_VOLUME) {
+            sugarat_speaker_set_volume(action.value);
+            state.settings.volume = action.value;
+            if (!action.preview) ESP_ERROR_CHECK_WITHOUT_ABORT(device_settings_save(state.settings));
+        } else if (action.kind == SCREEN_SET_BRIGHTNESS) {
+            const esp_err_t result = sugarat_display_set_brightness(action.value);
+            if (result == ESP_OK) {
+                state.settings.brightness = action.value;
+                if (!action.preview) ESP_ERROR_CHECK_WITHOUT_ABORT(device_settings_save(state.settings));
+            } else {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(result);
+            }
         }
         manual_control_update(screen_manual_is_open(), call_active, action, &state.manual);
         vTaskDelay(pdMS_TO_TICKS(UI_TICK_MS));

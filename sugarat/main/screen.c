@@ -21,7 +21,19 @@ enum {
     WAVE_BARS = 9,
 };
 
-typedef enum { PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_WIFI, PAGE_COUNT } page_t;
+typedef enum {
+    PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_WIFI, PAGE_VOLUME, PAGE_BRIGHTNESS, PAGE_COUNT
+} page_t;
+
+typedef struct {
+    lv_obj_t *slider;
+    lv_obj_t *readout;
+    screen_action_kind_t action;
+    bool dragging;
+} level_control_t;
+
+static level_control_t volume = {.action = SCREEN_SET_VOLUME};
+static level_control_t brightness = {.action = SCREEN_SET_BRIGHTNESS};
 
 typedef struct {
     lv_obj_t *slider;
@@ -55,6 +67,7 @@ static const voice_copy_t voice_copy[] = {
 };
 
 static lv_obj_t *pages[PAGE_COUNT];
+static lv_obj_t *home_grab;
 static lv_obj_t *receiver_status;
 static lv_obj_t *targets[2];
 static lv_obj_t *light_button;
@@ -79,6 +92,7 @@ static bool has_state;
 static uint32_t wave_updated;
 static int32_t pull_start_y;
 static bool pulling;
+static lv_point_t home_swipe_start;
 
 static lv_obj_t *surface(lv_obj_t *parent, int width, int height, int radius, uint32_t color)
 {
@@ -139,6 +153,7 @@ static void show_page(page_t page)
     set_hidden(pages[active_page], true);
     active_page = page;
     set_hidden(pages[page], false);
+    set_hidden(home_grab, page == PAGE_HOME);
     lv_obj_set_y(pages[page], 0);
     if (page == PAGE_SHADE) {
         lv_anim_t animation;
@@ -188,6 +203,26 @@ static void dismiss_shade(lv_event_t *event)
     }
 }
 
+static void swipe_home(lv_event_t *event)
+{
+    lv_indev_t *input = lv_indev_active();
+    if (!input) return;
+
+    lv_point_t point;
+    lv_indev_get_point(input, &point);
+    if (lv_event_get_code(event) == LV_EVENT_PRESSED) {
+        home_swipe_start = point;
+        return;
+    }
+
+    const int32_t dy = home_swipe_start.y - point.y;
+    const int32_t dx = point.x - home_swipe_start.x;
+    if (dy >= 48 && dy > 2 * dx && dy > -2 * dx) {
+        lv_indev_wait_release(input);
+        show_page(PAGE_HOME);
+    }
+}
+
 static void build_header(lv_obj_t *page, const char *title, page_t back)
 {
     lv_obj_t *back_button = button(page, 40, 40, LV_SYMBOL_LEFT, NULL);
@@ -198,9 +233,9 @@ static void build_header(lv_obj_t *page, const char *title, page_t back)
     lv_obj_align(label, LV_ALIGN_TOP_MID, 15, 52);
 }
 
-static lv_obj_t *menu_row(lv_obj_t *page, int y, const char *symbol, const char *title, uint32_t tint)
+static lv_obj_t *menu_row(lv_obj_t *page, int y, int height, const char *symbol, const char *title, uint32_t tint)
 {
-    lv_obj_t *row = button(page, 242, 58, "", NULL);
+    lv_obj_t *row = button(page, 242, height, "", NULL);
     lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_bg_color(row, lv_color_hex(PANEL), 0);
     lv_obj_set_style_radius(row, 20, 0);
@@ -216,6 +251,59 @@ static void command_clicked(lv_event_t *event)
 {
     const screen_action_t *command = lv_event_get_user_data(event);
     action = *command;
+}
+
+static void level_input(lv_event_t *event)
+{
+    level_control_t *control = lv_event_get_user_data(event);
+    const lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        control->dragging = true;
+    } else if (control->dragging && (code == LV_EVENT_VALUE_CHANGED ||
+                                     code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)) {
+        const int value = lv_slider_get_value(control->slider);
+        lv_label_set_text_fmt(control->readout, "%d%%", value);
+        control->dragging = code == LV_EVENT_VALUE_CHANGED;
+        action = (screen_action_t){.kind = control->action, .value = value, .preview = control->dragging};
+    }
+}
+
+static void build_level_page(lv_obj_t *page, level_control_t *control, int minimum,
+                             const char *title, const char *symbol, uint32_t accent)
+{
+    build_header(page, title, PAGE_SETTINGS);
+    control->slider = lv_slider_create(page);
+    lv_obj_t *slider = control->slider;
+    lv_obj_set_size(slider, 80, 176);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 99);
+    lv_obj_add_flag(slider, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_remove_flag(slider, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_ext_click_area(slider, 10);
+    lv_obj_set_style_pad_all(slider, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_clip_corner(slider, true, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(accent), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_slider_set_range(slider, minimum, 100);
+    lv_obj_add_event_cb(slider, level_input, LV_EVENT_ALL, control);
+
+    lv_obj_t *icon = surface(page, 32, 32, LV_RADIUS_CIRCLE, BG);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 229);
+    lv_obj_center(text_label(icon, symbol, &lv_font_montserrat_16, TEXT));
+    control->readout = text_label(page, "", &lv_font_montserrat_24, TEXT);
+    lv_obj_align(control->readout, LV_ALIGN_TOP_MID, 0, 292);
+}
+
+static void sync_level(level_control_t *control, int value)
+{
+    if (!control->dragging &&
+        (!has_state || lv_slider_get_value(control->slider) != value)) {
+        lv_slider_set_value(control->slider, value, LV_ANIM_OFF);
+        lv_label_set_text_fmt(control->readout, "%d%%", value);
+    }
 }
 
 static void light_clicked(lv_event_t *event)
@@ -334,7 +422,7 @@ static void build_servos(lv_obj_t *page)
     lv_slider_set_range(speed.slider, 0, (SERVO_SPEED_MAX - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT);
 
     light_button = button(page, 134, 42, "Light", &light_label);
-    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 294);
+    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 286);
     lv_obj_add_event_cb(light_button, light_clicked, LV_EVENT_CLICKED, NULL);
 
 }
@@ -406,7 +494,7 @@ static void build_settings(void)
     lv_obj_add_event_cb(shade, dismiss_shade, LV_EVENT_GESTURE, NULL);
     lv_obj_t *title = text_label(shade, "Control center", &lv_font_montserrat_24, TEXT);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 77);
-    lv_obj_t *settings = menu_row(shade, 137, LV_SYMBOL_SETTINGS, "Settings", LILAC);
+    lv_obj_t *settings = menu_row(shade, 137, 58, LV_SYMBOL_SETTINGS, "Settings", LILAC);
     lv_obj_add_event_cb(settings, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_SETTINGS);
     lv_obj_t *done = button(shade, 90, 42, "Done", NULL);
     lv_obj_align(done, LV_ALIGN_TOP_MID, 0, 245);
@@ -415,9 +503,13 @@ static void build_settings(void)
 
     lv_obj_t *page = pages[PAGE_SETTINGS];
     build_header(page, "Settings", PAGE_SHADE);
-    lv_obj_t *manual = menu_row(page, 115, LV_SYMBOL_LIST, "Manual control", TEAL);
+    lv_obj_t *sound = menu_row(page, 93, 50, LV_SYMBOL_VOLUME_MAX, "Volume", TEAL);
+    lv_obj_add_event_cb(sound, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_VOLUME);
+    lv_obj_t *light = menu_row(page, 149, 50, LV_SYMBOL_EYE_OPEN, "Brightness", AMBER);
+    lv_obj_add_event_cb(light, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_BRIGHTNESS);
+    lv_obj_t *manual = menu_row(page, 205, 50, LV_SYMBOL_LIST, "Manual control", TEAL);
     lv_obj_add_event_cb(manual, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_MANUAL);
-    lv_obj_t *network = menu_row(page, 189, LV_SYMBOL_WIFI, "Wi-Fi", LILAC);
+    lv_obj_t *network = menu_row(page, 261, 50, LV_SYMBOL_WIFI, "Wi-Fi", LILAC);
     lv_obj_add_event_cb(network, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_WIFI);
 
     static const screen_action_t setup = {.kind = SCREEN_SETUP_WIFI};
@@ -432,6 +524,9 @@ static void build_settings(void)
     lv_obj_set_style_bg_color(wifi_setup, lv_color_hex(PANEL), 0);
     lv_obj_align(wifi_setup, LV_ALIGN_TOP_MID, 0, 215);
     lv_obj_add_event_cb(wifi_setup, command_clicked, LV_EVENT_CLICKED, (void *)&setup);
+    build_level_page(pages[PAGE_VOLUME], &volume, 0, "Volume", LV_SYMBOL_VOLUME_MAX, TEAL);
+    build_level_page(pages[PAGE_BRIGHTNESS], &brightness, SUGARAT_BRIGHTNESS_MIN,
+                     "Brightness", LV_SYMBOL_EYE_OPEN, AMBER);
 }
 
 esp_err_t screen_init(bool touch_ready)
@@ -450,6 +545,17 @@ esp_err_t screen_init(bool touch_ready)
     build_home(pages[PAGE_HOME]);
     build_settings();
     build_servos(pages[PAGE_MANUAL]);
+
+    home_grab = surface(root, 160, 30, 0, BG);
+    lv_obj_align(home_grab, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(home_grab, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(home_grab, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(home_grab, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(home_grab, swipe_home, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(home_grab, swipe_home, LV_EVENT_PRESSING, NULL);
+    lv_obj_t *home_indicator = surface(home_grab, 40, 4, LV_RADIUS_CIRCLE, MUTED);
+    lv_obj_align(home_indicator, LV_ALIGN_BOTTOM_MID, 0, -9);
+    set_hidden(home_grab, true);
     return ESP_OK;
 }
 
@@ -568,6 +674,8 @@ static void update_manual(const screen_state_t *state)
 void screen_update(const screen_state_t *state)
 {
     update_manual(state);
+    sync_level(&volume, state->settings.volume);
+    sync_level(&brightness, state->settings.brightness);
     if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
         state->voice.speaking != displayed.voice.speaking ||
         strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {

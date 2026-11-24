@@ -6,16 +6,25 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 
-enum { AMP_ENABLE = GPIO_NUM_3, PLAYBACK_VOLUME = 35 };
+enum { AMP_ENABLE = GPIO_NUM_3, MIC_GAIN_NUM = 3, MIC_GAIN_DEN = 2, MIC_REPORT_US = 4000000 };
 
 static const char *TAG = "sugarat_audio";
 static i2s_chan_handle_t mic;
 static i2s_chan_handle_t speaker;
 static int32_t previous_input;
 static int32_t highpass;
+static atomic_uint speaker_volume = SUGARAT_VOLUME_DEFAULT;
 static DRAM_ATTR atomic_uint speaker_completed;
 static DRAM_ATTR atomic_uint speaker_empty_slots;
+static struct {
+    int64_t started_us;
+    uint32_t samples;
+    uint64_t absolute_sum;
+    uint32_t peak;
+    uint32_t clipped;
+} mic_stats;
 
 static bool IRAM_ATTR speaker_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *context)
 {
@@ -89,6 +98,7 @@ esp_err_t sugarat_audio_init(void)
     if (err == ESP_OK) {
         err = init_speaker();
     }
+    if (err == ESP_OK) ESP_LOGI(TAG, "Microphone digital gain %u/%u", MIC_GAIN_NUM, MIC_GAIN_DEN);
     if (err != ESP_OK) {
         sugarat_audio_deinit();
     }
@@ -120,12 +130,28 @@ esp_err_t sugarat_mic_read(int16_t *pcm, size_t *samples)
         return err;
     }
     *samples = bytes / sizeof(raw[0]);
+    if (*samples && !mic_stats.started_us) mic_stats.started_us = esp_timer_get_time();
+    uint32_t frame_sum = 0;
     for (size_t i = 0; i < *samples; ++i) {
-        int32_t input = raw[i] >> 14;
-        input = input > INT16_MAX ? INT16_MAX : input < INT16_MIN ? INT16_MIN : input;
+        const int32_t input = raw[i] >> 14;
         highpass = ((highpass + input - previous_input) * 32604LL) / 32768;
         previous_input = input;
-        pcm[i] = highpass > INT16_MAX ? INT16_MAX : highpass < INT16_MIN ? INT16_MIN : highpass;
+        const int32_t amplified = highpass * MIC_GAIN_NUM / MIC_GAIN_DEN;
+        const uint32_t absolute = highpass < 0 ? (uint32_t)-highpass : (uint32_t)highpass;
+        frame_sum += absolute;
+        if (absolute > mic_stats.peak) mic_stats.peak = absolute;
+        if (amplified > INT16_MAX || amplified < INT16_MIN) ++mic_stats.clipped;
+        pcm[i] = amplified > INT16_MAX ? INT16_MAX : amplified < INT16_MIN ? INT16_MIN : amplified;
+    }
+    mic_stats.absolute_sum += frame_sum;
+    mic_stats.samples += *samples;
+    const int64_t now_us = esp_timer_get_time();
+    if (mic_stats.samples && now_us - mic_stats.started_us >= MIC_REPORT_US) {
+        ESP_LOGI(TAG, "Mic level before gain: mean_abs=%lu peak=%lu; clipped_after_gain=%lu/%lu",
+                 (unsigned long)(mic_stats.absolute_sum / mic_stats.samples), (unsigned long)mic_stats.peak,
+                 (unsigned long)mic_stats.clipped, (unsigned long)mic_stats.samples);
+        mic_stats.started_us = now_us;
+        mic_stats.samples = mic_stats.absolute_sum = mic_stats.peak = mic_stats.clipped = 0;
     }
     return ESP_OK;
 }
@@ -135,14 +161,20 @@ esp_err_t sugarat_speaker_write(const int16_t *pcm, size_t samples)
     if (samples > SUGARAT_AUDIO_FRAME) {
         return ESP_ERR_INVALID_SIZE;
     }
+    const int32_t volume = (int32_t)atomic_load_explicit(&speaker_volume, memory_order_relaxed);
     int16_t stereo[SUGARAT_AUDIO_FRAME * 2];
     for (size_t i = 0; i < samples; ++i) {
-        stereo[i * 2] = stereo[i * 2 + 1] = (int32_t)pcm[i] * PLAYBACK_VOLUME / 100;
+        stereo[i * 2] = stereo[i * 2 + 1] = (int32_t)pcm[i] * volume / 100;
     }
     size_t bytes_written = 0;
     const size_t bytes = samples * 2 * sizeof(stereo[0]);
     const esp_err_t err = i2s_channel_write(speaker, stereo, bytes, &bytes_written, 100);
     return err == ESP_OK && bytes_written != bytes ? ESP_FAIL : err;
+}
+
+void sugarat_speaker_set_volume(unsigned percent)
+{
+    atomic_store_explicit(&speaker_volume, percent <= 100 ? percent : 100, memory_order_relaxed);
 }
 
 void sugarat_speaker_enable(bool enabled)
