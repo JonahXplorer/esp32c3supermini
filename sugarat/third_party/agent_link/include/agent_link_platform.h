@@ -50,6 +50,14 @@ void agent_link_platform_set_tool_callback(agent_link_platform_tool_cb_t callbac
 // Install before agent_link_start(). Invoked on the voice worker for final user speech.
 typedef void (*agent_link_platform_user_transcript_cb_t)(const char* text);
 void agent_link_platform_set_user_transcript_callback(agent_link_platform_user_transcript_cb_t callback);
+typedef enum {
+    AGENT_LINK_VOICE_USER_FINAL,
+    AGENT_LINK_VOICE_RESPONSE_STARTED,
+    AGENT_LINK_VOICE_FIRST_AUDIO,
+} agent_link_platform_voice_timing_event_t;
+// Install before agent_link_start(). Timestamps are local WSS receive times from esp_timer_get_time().
+typedef void (*agent_link_platform_voice_timing_cb_t)(agent_link_platform_voice_timing_event_t event, int64_t received_us);
+void agent_link_platform_set_voice_timing_callback(agent_link_platform_voice_timing_cb_t callback);
 // Attach one tool to the bound device's conversation; leave other tools in the session intact.
 esp_err_t agent_link_platform_attach_tool(int agent_id, const char* session_id, const char* definition_json);
 esp_err_t agent_link_platform_refresh_tool(int agent_id, const char* session_id);

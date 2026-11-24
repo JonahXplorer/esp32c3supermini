@@ -9,16 +9,17 @@
 #include "agent_link_platform.h"
 #include "agent_link_stream.h"
 #include "audio.h"
-#include "esp_heap_caps.h"
+#include "audio_meter.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "playback.h"
 #include "servo_tool.h"
+#include "turn_timing.h"
 #include "wake_word.h"
 
 enum {
@@ -30,6 +31,8 @@ enum {
     CONVERSATION_CACHE_MS = 120000,
     CONVERSATION_RETRY_MS = 15000,
     TOOL_ATTACH_RETRY_MS = 30000,
+    SESSION_STACK_BYTES = 16 * 1024,
+    SESSION_STACK_CHECK_MS = 15000,
 };
 
 typedef enum {
@@ -67,10 +70,16 @@ static atomic_int mode = VOICE_BOOT;
 static atomic_bool stop_call;
 static atomic_uint error_until;
 static atomic_uint requested_at;
+static atomic_uint mic_level;
 static QueueHandle_t uplink;
 static StaticQueue_t uplink_queue;
-static uint8_t *uplink_storage;
-static wake_preroll_t *wake_preroll;
+static EXT_RAM_BSS_ATTR audio_frame_t uplink_storage[UPLINK_FRAMES];
+static EXT_RAM_BSS_ATTR wake_preroll_t wake_history;
+static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t session_stack[SESSION_STACK_BYTES];
+static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t capture_stack[6144];
+static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t tool_stack[8192];
+static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t prefetch_stack[8192];
+static StaticTask_t session_tcb, capture_tcb, tool_tcb, prefetch_tcb;
 static TaskHandle_t session_task;
 static TaskHandle_t capture_task;
 static TaskHandle_t tool_task;
@@ -121,6 +130,12 @@ static int voice_agent_id(void)
     return agent_link_platform_bound_agent(&agent) == ESP_OK && agent.voice_supported ? agent.id : 0;
 }
 
+static bool voice_connection_ready(bool running)
+{
+    // The Wi-Fi transport publishes READY only after WSS session.ready.
+    return running && agent_link_state() == AGENT_STATE_READY;
+}
+
 static void queue_preroll(const wake_preroll_t *history)
 {
     size_t offset = (history->write_at + WAKE_PREROLL_SAMPLES - history->count) % WAKE_PREROLL_SAMPLES;
@@ -141,7 +156,8 @@ static void queue_preroll(const wake_preroll_t *history)
 
 static void start_call(const char *source, const wake_preroll_t *history)
 {
-    if (atomic_load(&mode) != VOICE_IDLE || voice_agent_id() <= 0) {
+    if (atomic_load(&mode) != VOICE_IDLE ||
+        !voice_connection_ready(agent_link_realtime_running()) || voice_agent_id() <= 0) {
         return;
     }
     int idle = VOICE_IDLE;
@@ -150,10 +166,14 @@ static void start_call(const char *source, const wake_preroll_t *history)
     }
     const uint32_t start = now_ms();
     xQueueReset(uplink);
-    if (history) queue_preroll(history);
+    if (history) {
+        ESP_LOGI(TAG, "Jarvis detected");
+        queue_preroll(history);
+    }
     atomic_store(&requested_at, start);
     atomic_store(&stop_call, false);
     atomic_store(&error_until, 0);
+    voice_timing_set_active(true);
     ESP_LOGI(TAG, "Voice connect requested: source=%s start_ms=%lu", source, (unsigned long)start);
     atomic_store(&mode, VOICE_CONNECTING);
     xTaskNotifyGive(session_task);
@@ -188,6 +208,8 @@ static void capture_audio(void *context)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        const bool echo_before_read = (before_read == VOICE_CONNECTING || before_read == VOICE_ACTIVE) &&
+                                      voice_playback_echo_guard();
         if (sugarat_mic_read(frame.pcm, &frame.count) != ESP_OK || frame.count == 0) {
             vTaskDelay(1);
             continue;
@@ -197,26 +219,30 @@ static void capture_audio(void *context)
             continue;
         }
         const voice_mode_t current = atomic_load(&mode);
+        const bool capturing = current == VOICE_CONNECTING || current == VOICE_ACTIVE;
+        const unsigned level = capturing ? voice_audio_level(frame.pcm, frame.count) : 0;
+        atomic_store(&mic_level, current == VOICE_ACTIVE ? level : 0);
         if (current != VOICE_IDLE && wake_buffered) {
             wake_word_reset();
             wake_buffered = false;
-            wake_preroll->count = 0;
+            wake_history.count = 0;
         }
         if (current == VOICE_IDLE) {
             overflow_logged = false;
             if (!voice_playback_echo_guard()) {
                 wake_buffered = true;
-                save_wake_audio(wake_preroll, &frame);
+                save_wake_audio(&wake_history, &frame);
                 if (wake_word_feed(frame.pcm, frame.count)) {
                     wake_word_reset();
-                    ESP_LOGI(TAG, "Jarvis detected");
-                    start_call("wake_word", wake_preroll);
+                    start_call("wake_word", &wake_history);
                 }
             } else {
-                wake_preroll->count = 0;
+                wake_history.count = 0;
             }
-        } else if ((current == VOICE_CONNECTING || current == VOICE_ACTIVE) && !atomic_load(&stop_call)) {
-            if (voice_playback_echo_guard()) {
+        } else if (capturing && !atomic_load(&stop_call)) {
+            const bool echo = voice_playback_echo_guard();
+            voice_timing_mic_level(level, echo_before_read || echo);
+            if (echo) {
                 memset(frame.pcm, 0, frame.count * sizeof(frame.pcm[0]));
             }
             if (xQueueSend(uplink, &frame, 0) != pdTRUE && !overflow_logged) {
@@ -336,6 +362,7 @@ static esp_err_t request_session(conversation_cache_t *cache)
 
 static void close_stream(agent_stream_handle_t *stream)
 {
+    voice_timing_set_active(false);
     if (*stream) {
         (void)agent_link_stream_close(*stream, true);
         *stream = NULL;
@@ -403,15 +430,26 @@ static void handle_calls(void *context)
     agent_stream_handle_t stream = NULL;
     uint32_t retry_at = 0;
     uint32_t retry_ms = RESIDENT_RETRY_MS;
+    uint32_t next_stack_check = 0;
+    UBaseType_t reported_stack_free = SESSION_STACK_BYTES;
     bool was_ready = false;
     audio_frame_t frame;
 
     while (true) {
+        if (!before_deadline(next_stack_check)) {
+            const UBaseType_t minimum_free = uxTaskGetStackHighWaterMark(NULL);
+            if (minimum_free < reported_stack_free) {
+                reported_stack_free = minimum_free;
+                ESP_LOGI(TAG, "jarvis_session stack: min_free=%uB total=%uB (PSRAM)",
+                         (unsigned)minimum_free, (unsigned)sizeof(session_stack));
+            }
+            next_stack_check = now_ms() + SESSION_STACK_CHECK_MS;
+        }
         voice_mode_t current = atomic_load(&mode);
         bool talking = current == VOICE_CONNECTING || current == VOICE_ACTIVE || current == VOICE_RECOVERING;
         const int agent_id = voice_agent_id();
         const bool running = agent_link_realtime_running();
-        const bool ready = running && agent_link_state() == AGENT_STATE_READY;
+        const bool ready = voice_connection_ready(running);
         if (ready && !was_ready) {
             retry_ms = RESIDENT_RETRY_MS;
             ESP_LOGI(TAG, "Resident voice connected: microphone=%s", stream ? "on" : "off");
@@ -435,6 +473,7 @@ static void handle_calls(void *context)
             if (!before_deadline(retry_at)) {
                 conversation_cache_t next = load_conversation();
                 const esp_err_t err = request_session(&next);
+                next_stack_check = 0;
                 if (err == ESP_OK) resident = next;
                 ESP_LOGI(TAG, "Resident voice connection requested: result=%s", esp_err_to_name(err));
                 retry_at = now_ms() + retry_ms;
@@ -453,6 +492,7 @@ static void handle_calls(void *context)
             if (!stream) {
                 const esp_err_t err = agent_link_stream_open(AGENT_STREAM_VOICE, NULL, &stream);
                 if (err == ESP_OK) {
+                    voice_timing_set_active(true);
                     voice_playback_accept(true);
                     servo_tool_accept_transcripts(true);
                     ESP_LOGI(TAG, "Realtime voice ready: total_ms=%lu resident=yes",
@@ -483,19 +523,19 @@ static void handle_calls(void *context)
 static void stop_audio_workers(void)
 {
     if (capture_task) {
-        vTaskDeleteWithCaps(capture_task);
+        vTaskDelete(capture_task);
         capture_task = NULL;
     }
     if (session_task) {
-        vTaskDeleteWithCaps(session_task);
+        vTaskDelete(session_task);
         session_task = NULL;
     }
     if (tool_task) {
-        vTaskDeleteWithCaps(tool_task);
+        vTaskDelete(tool_task);
         tool_task = NULL;
     }
     if (prefetch_task) {
-        vTaskDeleteWithCaps(prefetch_task);
+        vTaskDelete(prefetch_task);
         prefetch_task = NULL;
     }
     if (conversation_lookup) {
@@ -513,35 +553,35 @@ static void stop_audio_workers(void)
         vQueueDelete(uplink);
         uplink = NULL;
     }
-    heap_caps_free(uplink_storage);
-    uplink_storage = NULL;
-    heap_caps_free(wake_preroll);
-    wake_preroll = NULL;
+    wake_history.count = 0;
+    wake_history.write_at = 0;
 }
 
 static bool start_audio_workers(void)
 {
     conversation_lookup = xSemaphoreCreateMutexStatic(&conversation_mutex);
-    wake_preroll = heap_caps_calloc(1, sizeof(*wake_preroll), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uplink_storage = heap_caps_malloc(UPLINK_FRAMES * sizeof(audio_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (uplink_storage) {
-        uplink = xQueueCreateStatic(UPLINK_FRAMES, sizeof(audio_frame_t), uplink_storage, &uplink_queue);
-    }
-    if (uplink && wake_preroll && sugarat_audio_init() == ESP_OK && wake_word_init() == ESP_OK &&
-        voice_playback_start() == ESP_OK &&
-        xTaskCreateWithCaps(prefetch_conversation, "jarvis_prefetch", 8192, NULL, 3, &prefetch_task,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS &&
-        xTaskCreateWithCaps(handle_calls, "jarvis_session", 8192, NULL, 4, &session_task,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS &&
-        xTaskCreateWithCaps(capture_audio, "jarvis_mic", 6144, NULL, 5, &capture_task,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS) {
+    uplink = xQueueCreateStatic(UPLINK_FRAMES, sizeof(audio_frame_t), (uint8_t *)uplink_storage, &uplink_queue);
+    if (uplink && sugarat_audio_init() == ESP_OK && wake_word_init() == ESP_OK && voice_playback_start() == ESP_OK) {
+        prefetch_task = xTaskCreateStatic(prefetch_conversation, "jarvis_prefetch", sizeof(prefetch_stack), NULL, 3,
+                                         prefetch_stack, &prefetch_tcb);
+        session_task = xTaskCreateStatic(handle_calls, "jarvis_session", sizeof(session_stack), NULL, 4,
+                                         session_stack, &session_tcb);
+        capture_task = xTaskCreateStatic(capture_audio, "jarvis_mic", sizeof(capture_stack), NULL, 5,
+                                         capture_stack, &capture_tcb);
         tool_jobs = xQueueCreateStatic(1, sizeof(tool_job_t), tool_storage, &tool_queue);
-        if (!tool_jobs ||
-            xTaskCreateWithCaps(handle_tools, "jarvis_tools", 8192, NULL, 3, &tool_task,
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        if (tool_jobs) {
+            tool_task = xTaskCreateStatic(handle_tools, "jarvis_tools", sizeof(tool_stack), NULL, 3,
+                                         tool_stack, &tool_tcb);
+        }
+        if (!tool_task) {
             ESP_LOGW(TAG, "Background voice tool refresh unavailable");
         }
-        return true;
+        if (prefetch_task && session_task && capture_task) {
+            ESP_LOGI(TAG, "Static PSRAM voice: uplink=%uB preroll=%uB worker stacks=%uB",
+                     (unsigned)sizeof(uplink_storage), (unsigned)sizeof(wake_history),
+                     (unsigned)(sizeof(prefetch_stack) + sizeof(session_stack) + sizeof(capture_stack) + sizeof(tool_stack)));
+            return true;
+        }
     }
     stop_audio_workers();
     return false;
@@ -565,6 +605,7 @@ esp_err_t sugarat_voice_start(void)
     };
     esp_err_t err = agent_link_init(&config);
     if (err == ESP_OK) {
+        if (audio_ready) agent_link_platform_set_voice_timing_callback(voice_timing_ws_event);
         err = agent_link_start();
     }
     if (err != ESP_OK && audio_ready) {
@@ -590,6 +631,9 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
         snprintf(view->activation_code, sizeof(view->activation_code), "%.6s", link.code);
     } else if (current == VOICE_ACTIVE) {
         view->phase = SUGARAT_VOICE_IN_CALL;
+        const unsigned speaker_level = voice_playback_level();
+        view->speaking = speaker_level != 0;
+        view->level = view->speaking ? speaker_level : atomic_load(&mic_level);
     } else if (current == VOICE_STARTING || current == VOICE_CONNECTING) {
         view->phase = SUGARAT_VOICE_OPENING;
     } else if (current == VOICE_RECOVERING) {
@@ -602,12 +646,18 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
         view->phase = SUGARAT_VOICE_SETUP;
     } else if (link.phase == AGENT_LINK_PHASE_CONNECTING) {
         view->phase = SUGARAT_VOICE_JOINING;
-    } else if (before_deadline(atomic_load(&error_until))) {
-        view->phase = SUGARAT_VOICE_RETRY;
     } else if (current == VOICE_IDLE) {
-        agent_link_platform_agent_t agent;
-        view->phase = agent_link_platform_bound_agent(&agent) == ESP_OK && agent.voice_supported
-                      ? SUGARAT_VOICE_READY : SUGARAT_VOICE_BIND_AGENT;
+        if (voice_agent_id() <= 0) {
+            view->phase = SUGARAT_VOICE_BIND_AGENT;
+        } else if (voice_connection_ready(agent_link_realtime_running())) {
+            view->phase = SUGARAT_VOICE_READY;
+        } else if (agent_link_realtime_recovering()) {
+            view->phase = SUGARAT_VOICE_RECONNECTING;
+        } else if (before_deadline(atomic_load(&error_until))) {
+            view->phase = SUGARAT_VOICE_RETRY;
+        } else {
+            view->phase = SUGARAT_VOICE_PREPARING;
+        }
     }
 }
 

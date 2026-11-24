@@ -343,17 +343,18 @@ void WifiEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     const uint32_t generation = s_network_generation.load();
     {
         std::lock_guard<std::mutex> lock(s_wifi_mtx);
-#if defined(CONFIG_BOARD_TYPE_SDGOODS_ESP32S3_WIFI)
+#if CONFIG_IDF_TARGET_ESP32S3 && defined(CONFIG_ESP_PHY_MAX_WIFI_TX_POWER)
         if (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_AP_START) {
-            // The driver accepts this limit only after esp_wifi_start().
-            const auto power_error = esp_wifi_set_max_tx_power(60);
+            // The driver accepts the limit after start, in quarter-dBm units.
+            constexpr int8_t requested = CONFIG_ESP_PHY_MAX_WIFI_TX_POWER * 4;
+            const auto power_error = esp_wifi_set_max_tx_power(requested);
             int8_t actual = 0;
             const auto read_error = esp_wifi_get_max_tx_power(&actual);
-            if (power_error != ESP_OK || read_error != ESP_OK)
-                ESP_LOGW(TAG, "WiFi TX power request=60 set=0x%x read=0x%x", unsigned(power_error),
-                         unsigned(read_error));
+            if (power_error != ESP_OK || read_error != ESP_OK || actual != requested)
+                ESP_LOGW(TAG, "WiFi TX power requested=%d actual=%d set=%s read=%s (0.25 dBm units)",
+                         int(requested), int(actual), esp_err_to_name(power_error), esp_err_to_name(read_error));
             else
-                ESP_LOGI(TAG, "WiFi TX power requested=60 actual=%d (0.25 dBm units)", int(actual));
+                ESP_LOGI(TAG, "WiFi TX power requested=%d actual=%d (0.25 dBm units)", int(requested), int(actual));
         }
 #endif
         switch (id) {
@@ -453,7 +454,8 @@ void WifiControl(void*, esp_event_base_t, int32_t id, void* data) {
             UpdateJoinProgress();
             ConnectStation();
             report = true;
-        } else if (s_phase == Phase::kStaConnected && !al_wifi_prov_active()) {
+        } else if (s_phase == Phase::kStaConnected && !al_wifi_prov_active() && !cloud_realtime_ready()) {
+            // DNS failures in ancillary HTTPS requests must not tear down a live voice socket.
             using agentlink::wifi::CloudRecovery;
             const CloudRecovery recovery = s_dns_recovery.Take(NowMs(), CloudAuthenticated());
             if (recovery == CloudRecovery::kRejoinStation) {

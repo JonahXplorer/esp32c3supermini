@@ -1,25 +1,27 @@
 #include "screen.h"
 #include "screen_port.h"
 
+#include "board.h"
 #include "lvgl.h"
 #include "servo_radio.h"
 #include <string.h>
 
 enum {
-    BG = 0x10131F,
-    PANEL = 0x222838,
-    EDGE = 0x343D50,
-    TRACK = 0x414A5C,
+    BG = 0x05070C,
+    PANEL = 0x151B27,
+    EDGE = 0x283345,
+    TRACK = 0x344156,
     TEXT = 0xF3F6FC,
-    MUTED = 0xB4BDCF,
-    TEAL = 0x69E4CF,
-    INK = 0x102F2C,
-    LILAC = 0xB5A6FF,
-    AMBER = 0xFFCA89,
+    MUTED = 0xA2AEC3,
+    TEAL = 0x65EBDB,
+    INK = 0x112B2C,
+    LILAC = 0xB0A0FF,
+    AMBER = 0xFFCB80,
     RED = 0xFF9EAA,
+    WAVE_BARS = 9,
 };
 
-typedef enum { PAGE_SERVOS, PAGE_JARVIS, PAGE_COUNT } page_t;
+typedef enum { PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_WIFI, PAGE_COUNT } page_t;
 
 typedef struct {
     lv_obj_t *slider;
@@ -37,24 +39,22 @@ typedef struct {
 } voice_copy_t;
 
 static const voice_copy_t voice_copy[] = {
-    [SUGARAT_VOICE_BOOT]         = {"Starting Jarvis", "Getting voice ready", LILAC},
-    [SUGARAT_VOICE_SETUP]        = {"Set up Wi-Fi", "Join Sugarat-Jarvis Wi-Fi\non your phone", AMBER},
-    [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "Connecting to your network", AMBER},
+    [SUGARAT_VOICE_BOOT]         = {"Starting Jarvis", "", LILAC},
+    [SUGARAT_VOICE_SETUP]        = {"Set up Wi-Fi", "Join Sugarat-Jarvis on your phone", AMBER},
+    [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "", AMBER},
     [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "Enter this code at bot.sugarat.ai", AMBER},
     [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "Bind a voice agent in Sugarat", AMBER},
-    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Or tap to start a call", TEAL},
+    [SUGARAT_VOICE_PREPARING]    = {"Connecting voice", "Waiting for the voice server", LILAC},
+    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Or tap the waveform", TEAL},
     [SUGARAT_VOICE_OPENING]      = {"Opening a call", "You can start speaking", LILAC},
-    [SUGARAT_VOICE_IN_CALL]      = {"In conversation", "Speak to your voice agent", LILAC},
+    [SUGARAT_VOICE_IN_CALL]      = {"In conversation", "Listening", TEAL},
     [SUGARAT_VOICE_RECONNECTING] = {"Reconnecting", "Restoring your conversation", AMBER},
-    [SUGARAT_VOICE_ENDING]       = {"Ending the call", "Returning to wake-word mode", LILAC},
+    [SUGARAT_VOICE_ENDING]       = {"Ending the call", "", LILAC},
     [SUGARAT_VOICE_ERROR]        = {"Voice unavailable", "Restart Sugarat to try again", RED},
-    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Tap or say \"Jarvis\" to retry", AMBER},
+    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Restoring the voice connection", AMBER},
 };
 
 static lv_obj_t *pages[PAGE_COUNT];
-static lv_obj_t *tabs[PAGE_COUNT];
-static lv_obj_t *tab_text[PAGE_COUNT];
-static lv_obj_t *voice_dot;
 static lv_obj_t *receiver_status;
 static lv_obj_t *targets[2];
 static lv_obj_t *light_button;
@@ -64,16 +64,21 @@ static adjustment_t angle = {.action = SCREEN_SET_ANGLE};
 static adjustment_t speed = {.action = SCREEN_SET_SPEED};
 static lv_obj_t *voice_ring;
 static lv_obj_t *voice_core;
-static lv_obj_t *waveform[5];
+static lv_obj_t *voice_orbit[2];
+static lv_obj_t *waveform[WAVE_BARS];
 static lv_obj_t *voice_title;
 static lv_obj_t *voice_detail;
 static lv_obj_t *voice_end;
-static lv_obj_t *quick_voice;
+static lv_obj_t *wifi_status;
+static lv_obj_t *wifi_setup;
 
 static page_t active_page;
 static screen_action_t action;
 static screen_state_t displayed;
 static bool has_state;
+static uint32_t wave_updated;
+static int32_t pull_start_y;
+static bool pulling;
 
 static lv_obj_t *surface(lv_obj_t *parent, int width, int height, int radius, uint32_t color)
 {
@@ -122,33 +127,89 @@ static void set_hidden(lv_obj_t *object, bool hidden)
     }
 }
 
+static void slide_y(void *object, int32_t y)
+{
+    lv_obj_set_y(object, y);
+}
+
 static void show_page(page_t page)
 {
+    if (page == active_page) return;
+    lv_anim_delete(pages[active_page], slide_y);
+    set_hidden(pages[active_page], true);
     active_page = page;
-    for (int i = 0; i < PAGE_COUNT; ++i) {
-        const bool selected = i == page;
-        set_hidden(pages[i], !selected);
-        lv_obj_set_style_bg_color(tabs[i], lv_color_hex(selected ? TRACK : PANEL), 0);
-        lv_obj_set_style_text_color(tab_text[i], lv_color_hex(selected ? TEXT : MUTED), 0);
+    set_hidden(pages[page], false);
+    lv_obj_set_y(pages[page], 0);
+    if (page == PAGE_SHADE) {
+        lv_anim_t animation;
+        lv_anim_init(&animation);
+        lv_anim_set_var(&animation, pages[page]);
+        lv_anim_set_exec_cb(&animation, slide_y);
+        lv_anim_set_values(&animation, -SCREEN_SIZE, 0);
+        lv_anim_set_duration(&animation, 180);
+        lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+        lv_anim_start(&animation);
     }
 }
 
-static void tab_clicked(lv_event_t *event)
+static void navigate(lv_event_t *event)
 {
     show_page((page_t)(uintptr_t)lv_event_get_user_data(event));
 }
 
-static void swipe(lv_event_t *event)
+static void pull_down(lv_event_t *event)
 {
+    const lv_event_code_t code = lv_event_get_code(event);
     lv_indev_t *input = lv_indev_active();
-    const lv_dir_t direction = lv_indev_get_gesture_dir(input);
-    if (direction == LV_DIR_LEFT && active_page == PAGE_SERVOS) {
+    if (!input) return;
+    lv_point_t point;
+    lv_indev_get_point(input, &point);
+    if (code == LV_EVENT_PRESSED) {
+        pull_start_y = point.y;
+        pulling = true;
+    } else if (code == LV_EVENT_PRESSING && pulling && point.y - pull_start_y >= 36) {
+        pulling = false;
         lv_indev_wait_release(input);
-        show_page(PAGE_JARVIS);
-    } else if (direction == LV_DIR_RIGHT && active_page == PAGE_JARVIS) {
-        lv_indev_wait_release(input);
-        show_page(PAGE_SERVOS);
+        show_page(PAGE_SHADE);
+    } else if (code == LV_EVENT_CLICKED) {
+        show_page(PAGE_SHADE);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        pulling = false;
     }
+}
+
+static void dismiss_shade(lv_event_t *event)
+{
+    (void)event;
+    lv_indev_t *input = lv_indev_active();
+    if (input && lv_indev_get_gesture_dir(input) == LV_DIR_TOP) {
+        lv_indev_wait_release(input);
+        show_page(PAGE_HOME);
+    }
+}
+
+static void build_header(lv_obj_t *page, const char *title, page_t back)
+{
+    lv_obj_t *back_button = button(page, 40, 40, LV_SYMBOL_LEFT, NULL);
+    lv_obj_set_pos(back_button, 66, 40);
+    lv_obj_set_style_bg_color(back_button, lv_color_hex(PANEL), 0);
+    lv_obj_add_event_cb(back_button, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)back);
+    lv_obj_t *label = text_label(page, title, &lv_font_montserrat_16, TEXT);
+    lv_obj_align(label, LV_ALIGN_TOP_MID, 15, 52);
+}
+
+static lv_obj_t *menu_row(lv_obj_t *page, int y, const char *symbol, const char *title, uint32_t tint)
+{
+    lv_obj_t *row = button(page, 242, 58, "", NULL);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_color(row, lv_color_hex(PANEL), 0);
+    lv_obj_set_style_radius(row, 20, 0);
+    lv_obj_t *tile = surface(row, 38, 38, 12, tint);
+    lv_obj_align(tile, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_center(text_label(tile, symbol, &lv_font_montserrat_16, BG));
+    lv_obj_align(text_label(row, title, &lv_font_montserrat_16, TEXT), LV_ALIGN_LEFT_MID, 58, 0);
+    lv_obj_align(text_label(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, MUTED), LV_ALIGN_RIGHT_MID, -14, 0);
+    return row;
 }
 
 static void command_clicked(lv_event_t *event)
@@ -161,7 +222,7 @@ static void light_clicked(lv_event_t *event)
 {
     action = (screen_action_t){
         .kind = SCREEN_SET_LIGHT,
-        .value = displayed.light == SERVO_LIGHT_ON ? SERVO_LIGHT_OFF : SERVO_LIGHT_ON,
+        .value = displayed.manual.light == SERVO_LIGHT_ON ? SERVO_LIGHT_OFF : SERVO_LIGHT_ON,
     };
 }
 
@@ -249,11 +310,12 @@ static void build_servos(lv_obj_t *page)
         {.kind = SCREEN_SET_TARGET, .value = 0},
         {.kind = SCREEN_SET_TARGET, .value = 1},
     };
+    build_header(page, "Manual control", PAGE_SETTINGS);
     receiver_status = text_label(page, "", &lv_font_montserrat_14, MUTED);
-    lv_obj_align(receiver_status, LV_ALIGN_TOP_MID, 0, 89);
+    lv_obj_align(receiver_status, LV_ALIGN_TOP_MID, 0, 81);
 
     lv_obj_t *selector = surface(page, 254, 54, 27, PANEL);
-    lv_obj_align(selector, LV_ALIGN_TOP_MID, 0, 117);
+    lv_obj_align(selector, LV_ALIGN_TOP_MID, 0, 105);
     for (int i = 0; i < 2; ++i) {
         lv_obj_t *label;
         targets[i] = button(selector, 119, 46, i == 0 ? "Position A" : "Position B", &label);
@@ -267,95 +329,134 @@ static void build_servos(lv_obj_t *page)
         lv_obj_add_event_cb(targets[i], command_clicked, LV_EVENT_CLICKED, (void *)&target_commands[i]);
     }
 
-    angle_caption = build_adjustment(page, &angle, 178, 274, "", TEAL);
-    build_adjustment(page, &speed, 244, 246, "Travel time / 90°", LILAC);
+    angle_caption = build_adjustment(page, &angle, 165, 274, "", TEAL);
+    build_adjustment(page, &speed, 228, 250, "Travel time / 90°", LILAC);
     lv_slider_set_range(speed.slider, 0, (SERVO_SPEED_MAX - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT);
 
-    light_button = button(page, 94, 34, "Light", &light_label);
-    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 306);
+    light_button = button(page, 134, 42, "Light", &light_label);
+    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 294);
     lv_obj_add_event_cb(light_button, light_clicked, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *quick_label;
-    quick_voice = button(page, 110, 34, "", &quick_label);
-    lv_obj_set_style_text_font(quick_label, &lv_font_montserrat_14, 0);
-    lv_obj_align(quick_voice, LV_ALIGN_TOP_MID, 50, 306);
-    lv_obj_set_style_bg_color(quick_voice, lv_color_hex(PANEL), 0);
-    lv_obj_add_event_cb(quick_voice, tab_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_JARVIS);
 }
 
-static void build_voice(lv_obj_t *page)
+static lv_obj_t *orbit(lv_obj_t *parent, int size, int start, int end)
+{
+    lv_obj_t *arc = lv_arc_create(parent);
+    lv_obj_remove_style_all(arc);
+    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(arc, size, size);
+    lv_obj_center(arc);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_angles(arc, start, end);
+    lv_obj_set_style_arc_width(arc, 1, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(EDGE), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    return arc;
+}
+
+static void build_home(lv_obj_t *page)
 {
     static const screen_action_t start_command = {.kind = SCREEN_START_CALL};
     static const screen_action_t end_command = {.kind = SCREEN_END_CALL};
-    voice_ring = surface(page, 110, 110, LV_RADIUS_CIRCLE, BG);
-    lv_obj_align(voice_ring, LV_ALIGN_TOP_MID, 0, 87);
-    lv_obj_set_style_border_width(voice_ring, 1, 0);
-    lv_obj_add_event_cb(voice_ring, command_clicked, LV_EVENT_CLICKED, (void *)&start_command);
 
-    voice_core = surface(voice_ring, 88, 88, LV_RADIUS_CIRCLE, PANEL);
+    // The grab area starts at the top and extends until the drag threshold.
+    lv_obj_t *grab = surface(page, 200, 78, 0, BG);
+    lv_obj_align(grab, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_opa(grab, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(grab, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(grab, pull_down, LV_EVENT_ALL, NULL);
+    lv_obj_t *handle = surface(grab, 42, 4, 2, TRACK);
+    lv_obj_align(handle, LV_ALIGN_TOP_MID, 0, 27);
+
+    voice_ring = surface(page, 170, 170, LV_RADIUS_CIRCLE, BG);
+    lv_obj_align(voice_ring, LV_ALIGN_TOP_MID, 0, 75);
+    lv_obj_add_event_cb(voice_ring, command_clicked, LV_EVENT_CLICKED, (void *)&start_command);
+    voice_orbit[0] = orbit(voice_ring, 168, 202, 302);
+    voice_orbit[1] = orbit(voice_ring, 154, 16, 139);
+
+    voice_core = surface(voice_ring, 132, 132, LV_RADIUS_CIRCLE, PANEL);
     lv_obj_center(voice_core);
-    const int heights[] = {14, 26, 38, 26, 14};
-    for (int i = 0; i < 5; ++i) {
-        waveform[i] = surface(voice_core, 5, heights[i], LV_RADIUS_CIRCLE, LILAC);
-        lv_obj_align(waveform[i], LV_ALIGN_CENTER, (i - 2) * 11, 0);
+    lv_obj_set_style_border_width(voice_core, 1, 0);
+    lv_obj_set_style_border_color(voice_core, lv_color_hex(EDGE), 0);
+    lv_obj_set_style_bg_grad_dir(voice_core, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_grad_color(voice_core, lv_color_hex(BG), 0);
+    for (int i = 0; i < WAVE_BARS; ++i) {
+        waveform[i] = surface(voice_core, 5, 8, LV_RADIUS_CIRCLE, TEAL);
+        lv_obj_align(waveform[i], LV_ALIGN_CENTER, (i - WAVE_BARS / 2) * 11, 0);
     }
 
     voice_title = text_label(page, "", &lv_font_montserrat_24, TEXT);
-    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, 206);
+    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, 247);
     voice_detail = text_label(page, "", &lv_font_montserrat_14, MUTED);
     lv_obj_set_style_text_align(voice_detail, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(voice_detail, 242);
+    lv_obj_set_width(voice_detail, 232);
     lv_label_set_long_mode(voice_detail, LV_LABEL_LONG_WRAP);
-    lv_obj_align(voice_detail, LV_ALIGN_TOP_MID, 0, 255);
-    voice_end = button(page, 152, 42, "End call", NULL);
-    lv_obj_align(voice_end, LV_ALIGN_TOP_MID, 0, 291);
-    lv_obj_set_style_bg_color(voice_end, lv_color_hex(0x672839), 0);
+    lv_obj_align(voice_detail, LV_ALIGN_TOP_MID, 0, 281);
+    voice_end = button(page, 120, 37, LV_SYMBOL_CLOSE "   End call", NULL);
+    lv_obj_align(voice_end, LV_ALIGN_TOP_MID, 0, 304);
+    lv_obj_set_style_bg_color(voice_end, lv_color_hex(0x4C202B), 0);
     lv_obj_add_event_cb(voice_end, command_clicked, LV_EVENT_CLICKED, (void *)&end_command);
 }
 
-static void build_navigation(lv_obj_t *root)
+static void build_settings(void)
 {
-    lv_obj_t *tray = surface(root, 208, 40, LV_RADIUS_CIRCLE, PANEL);
-    lv_obj_align(tray, LV_ALIGN_TOP_MID, 0, 33);
-    const char *names[] = {"Servos", "Jarvis"};
-    for (int i = 0; i < PAGE_COUNT; ++i) {
-        tabs[i] = button(tray, 98, 34, names[i], &tab_text[i]);
-        lv_obj_set_pos(tabs[i], 3 + i * 104, 3);
-        lv_obj_add_event_cb(tabs[i], tab_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
-    }
-    lv_obj_align(tab_text[PAGE_JARVIS], LV_ALIGN_CENTER, -4, 0);
-    voice_dot = surface(tabs[PAGE_JARVIS], 6, 6, LV_RADIUS_CIRCLE, LILAC);
-    lv_obj_align(voice_dot, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_t *shade = pages[PAGE_SHADE];
+    lv_obj_add_flag(shade, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(shade, dismiss_shade, LV_EVENT_GESTURE, NULL);
+    lv_obj_t *title = text_label(shade, "Control center", &lv_font_montserrat_24, TEXT);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 77);
+    lv_obj_t *settings = menu_row(shade, 137, LV_SYMBOL_SETTINGS, "Settings", LILAC);
+    lv_obj_add_event_cb(settings, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_SETTINGS);
+    lv_obj_t *done = button(shade, 90, 42, "Done", NULL);
+    lv_obj_align(done, LV_ALIGN_TOP_MID, 0, 245);
+    lv_obj_set_style_bg_color(done, lv_color_hex(PANEL), 0);
+    lv_obj_add_event_cb(done, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_HOME);
+
+    lv_obj_t *page = pages[PAGE_SETTINGS];
+    build_header(page, "Settings", PAGE_SHADE);
+    lv_obj_t *manual = menu_row(page, 115, LV_SYMBOL_LIST, "Manual control", TEAL);
+    lv_obj_add_event_cb(manual, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_MANUAL);
+    lv_obj_t *network = menu_row(page, 189, LV_SYMBOL_WIFI, "Wi-Fi", LILAC);
+    lv_obj_add_event_cb(network, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_WIFI);
+
+    static const screen_action_t setup = {.kind = SCREEN_SETUP_WIFI};
+    page = pages[PAGE_WIFI];
+    build_header(page, "Wi-Fi", PAGE_SETTINGS);
+    wifi_status = text_label(page, "", &lv_font_montserrat_16, TEXT);
+    lv_obj_set_width(wifi_status, 220);
+    lv_obj_set_style_text_align(wifi_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(wifi_status, LV_LABEL_LONG_WRAP);
+    lv_obj_align(wifi_status, LV_ALIGN_TOP_MID, 0, 117);
+    wifi_setup = button(page, 170, 48, "Set up Wi-Fi", NULL);
+    lv_obj_set_style_bg_color(wifi_setup, lv_color_hex(PANEL), 0);
+    lv_obj_align(wifi_setup, LV_ALIGN_TOP_MID, 0, 215);
+    lv_obj_add_event_cb(wifi_setup, command_clicked, LV_EVENT_CLICKED, (void *)&setup);
 }
 
 esp_err_t screen_init(bool touch_ready)
 {
-    esp_err_t err = screen_port_init(touch_ready);
-    if (err != ESP_OK) {
-        return err;
-    }
+    const esp_err_t err = screen_port_init(touch_ready);
+    if (err != ESP_OK) return err;
     lv_obj_t *root = lv_screen_active();
     lv_obj_remove_style_all(root);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(root, lv_color_hex(BG), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
-    lv_obj_add_event_cb(root, swipe, LV_EVENT_GESTURE, NULL);
-
     for (int i = 0; i < PAGE_COUNT; ++i) {
-        pages[i] = surface(root, LV_PCT(100), LV_PCT(100), 0, BG);
-        lv_obj_set_style_bg_opa(pages[i], LV_OPA_TRANSP, 0);
+        pages[i] = surface(root, SCREEN_SIZE, SCREEN_SIZE, 0, BG);
+        set_hidden(pages[i], i != PAGE_HOME);
     }
-    build_servos(pages[PAGE_SERVOS]);
-    build_voice(pages[PAGE_JARVIS]);
-    build_navigation(root);
-    show_page(PAGE_SERVOS);
+    build_home(pages[PAGE_HOME]);
+    build_settings();
+    build_servos(pages[PAGE_MANUAL]);
     return ESP_OK;
 }
 
-static void show_receiver(const screen_state_t *state)
+static void show_receiver(const manual_control_view_t *state, bool touch_ready)
 {
     uint32_t tint = state->online ? TEAL : AMBER;
-    if (!state->touch_ready) {
+    if (!touch_ready) {
         lv_label_set_text(receiver_status, "Touchscreen unavailable");
         tint = RED;
     } else if (!state->online) {
@@ -392,68 +493,94 @@ static void show_voice(const sugarat_voice_view_t *voice)
 {
     const voice_copy_t *copy = &voice_copy[voice->phase];
     const bool activation = voice->phase == SUGARAT_VOICE_ACTIVATE;
-    if (voice->phase == SUGARAT_VOICE_READY || voice->phase == SUGARAT_VOICE_RETRY) {
+    if (voice->phase == SUGARAT_VOICE_READY) {
         lv_obj_add_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
     } else {
         lv_obj_remove_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
     }
-    const lv_color_t tint = lv_color_hex(copy->tint);
-    lv_obj_set_style_bg_color(voice_dot, tint, 0);
-    lv_obj_set_style_border_color(voice_ring, lv_color_mix(tint, lv_color_hex(BG), LV_OPA_60), 0);
-    lv_obj_set_style_bg_color(voice_core, lv_color_mix(tint, lv_color_hex(PANEL), LV_OPA_30), 0);
-    for (int i = 0; i < 5; ++i) {
+    const lv_color_t tint = lv_color_hex(voice->speaking ? LILAC : copy->tint);
+    lv_obj_set_style_bg_color(voice_core, lv_color_mix(tint, lv_color_hex(BG), LV_OPA_20), 0);
+    lv_obj_set_style_arc_color(voice_orbit[0], tint, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(voice_orbit[1], lv_color_mix(tint, lv_color_hex(EDGE), LV_OPA_50), LV_PART_INDICATOR);
+    for (int i = 0; i < WAVE_BARS; ++i) {
         lv_obj_set_style_bg_color(waveform[i], tint, 0);
     }
     lv_obj_set_style_text_font(voice_title, activation ? &lv_font_montserrat_40 : &lv_font_montserrat_24, 0);
+    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, activation ? 232 : 247);
     lv_label_set_text(voice_title, activation ? voice->activation_code : copy->title);
-    lv_label_set_text(voice_detail, copy->detail);
+    lv_label_set_text(voice_detail, voice->phase == SUGARAT_VOICE_IN_CALL && voice->speaking
+                                   ? "Jarvis is speaking" : copy->detail);
     set_hidden(voice_end, !voice->can_end);
-
-    const char *shortcut = voice->can_end ? "Voice call" : activation ? "Activate Jarvis" :
-                           voice->phase == SUGARAT_VOICE_SETUP ? "Set up Wi-Fi" : NULL;
-    if (shortcut) {
-        lv_label_set_text(lv_obj_get_child(quick_voice, 0), shortcut);
-    }
-    set_hidden(quick_voice, shortcut == NULL);
-    lv_obj_align(light_button, LV_ALIGN_TOP_MID, shortcut ? -60 : 0, 306);
 }
 
-void screen_update(const screen_state_t *state)
+static void animate_wave(const sugarat_voice_view_t *voice)
 {
-    const bool enabled = state->online && !state->pending && state->touch_ready;
-    if (!has_state || state->online != displayed.online || state->pending != displayed.pending ||
-        state->touch_ready != displayed.touch_ready || state->receiver_channel != displayed.receiver_channel ||
-        state->position != displayed.position ||
-        state->moving != displayed.moving) {
-        show_receiver(state);
+    const uint32_t tick = lv_tick_get();
+    if (tick - wave_updated < 90) return;
+    wave_updated = tick;
+    const unsigned cycle = tick / 90;
+    for (int i = 0; i < WAVE_BARS; ++i) {
+        const int offset = i - WAVE_BARS / 2;
+        const unsigned distance = (unsigned)(offset < 0 ? -offset : offset);
+        const unsigned step = (cycle + i * 3) % 14;
+        const unsigned pulse = step < 7 ? step : 14 - step;
+        unsigned height = 6 + (5 - distance) * pulse / 4;
+        if (voice->phase == SUGARAT_VOICE_IN_CALL) {
+            height += ((unsigned)voice->level * (5 - distance) * (pulse + 3)) / 80;
+        }
+        if (lv_obj_get_height(waveform[i]) != (int32_t)height) lv_obj_set_height(waveform[i], height);
+    }
+}
+
+static void update_manual(const screen_state_t *state)
+{
+    const manual_control_view_t *view = &state->manual;
+    const manual_control_view_t *previous = &displayed.manual;
+    const bool touch_changed = state->touch_ready != displayed.touch_ready;
+    const bool enabled = view->online && !view->pending && state->touch_ready;
+    if (!has_state || view->online != previous->online || view->pending != previous->pending || touch_changed ||
+        view->receiver_channel != previous->receiver_channel || view->position != previous->position ||
+        view->moving != previous->moving) {
+        show_receiver(view, state->touch_ready);
         for (int i = 0; i < 2; ++i) {
-            if (state->online && state->position == i) {
-                lv_obj_add_state(targets[i], LV_STATE_CHECKED);
-            } else {
-                lv_obj_remove_state(targets[i], LV_STATE_CHECKED);
-            }
+            if (view->online && view->position == i) lv_obj_add_state(targets[i], LV_STATE_CHECKED);
+            else lv_obj_remove_state(targets[i], LV_STATE_CHECKED);
             mark_enabled(targets[i], enabled);
         }
     }
-    if (!has_state || state->angle_limit_deg != displayed.angle_limit_deg) {
-        lv_label_set_text_fmt(angle_caption, "B angle (0-%u°)", (unsigned)state->angle_limit_deg);
-        lv_slider_set_range(angle.slider, 0, state->angle_limit_deg / SERVO_ANGLE_INCREMENT);
+    if (!has_state || view->angle_limit_deg != previous->angle_limit_deg) {
+        lv_label_set_text_fmt(angle_caption, "B angle (0-%u°)", (unsigned)view->angle_limit_deg);
+        lv_slider_set_range(angle.slider, 0, view->angle_limit_deg / SERVO_ANGLE_INCREMENT);
     }
-    if (!has_state || state->light != displayed.light || state->online != displayed.online ||
-        state->pending != displayed.pending || state->touch_ready != displayed.touch_ready) {
-        const bool known = state->online && state->light != SERVO_LIGHT_UNKNOWN;
-        const bool on = known && state->light == SERVO_LIGHT_ON;
+    if (!has_state || view->light != previous->light || view->online != previous->online ||
+        view->pending != previous->pending || touch_changed) {
+        const bool known = view->online && view->light != SERVO_LIGHT_UNKNOWN;
+        const bool on = known && view->light == SERVO_LIGHT_ON;
         lv_label_set_text(light_label, known ? (on ? "Light on" : "Light off") : "Light");
         lv_obj_set_style_bg_color(light_button, lv_color_hex(on ? AMBER : PANEL), 0);
         lv_obj_set_style_text_color(light_label, lv_color_hex(on ? INK : TEXT), 0);
         mark_enabled(light_button, enabled && known);
     }
-    sync_adjustment(&angle, state->angle_deg / SERVO_ANGLE_INCREMENT, enabled, state->pending);
-    sync_adjustment(&speed, (state->speed - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT, enabled, state->pending);
+    sync_adjustment(&angle, view->angle_deg / SERVO_ANGLE_INCREMENT, enabled, view->pending);
+    sync_adjustment(&speed, (view->speed - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT, enabled, view->pending);
+}
 
+void screen_update(const screen_state_t *state)
+{
+    update_manual(state);
     if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
+        state->voice.speaking != displayed.voice.speaking ||
         strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {
         show_voice(&state->voice);
+    }
+    if (active_page == PAGE_HOME) animate_wave(&state->voice);
+    if (!has_state || state->wifi_connected != displayed.wifi_connected ||
+        state->wifi_setup_active != displayed.wifi_setup_active ||
+        state->voice.can_end != displayed.voice.can_end || state->voice.phase != displayed.voice.phase) {
+        const bool call_active = state->voice.can_end || state->voice.phase == SUGARAT_VOICE_OPENING;
+        lv_label_set_text(wifi_status, state->wifi_setup_active ? "Join Sugarat-Jarvis on your phone" :
+                          call_active ? "Voice call active" : state->wifi_connected ? "Connected" : "Disconnected");
+        mark_enabled(wifi_setup, !state->wifi_setup_active && !call_active);
     }
     displayed = *state;
     has_state = true;
@@ -465,4 +592,9 @@ screen_action_t screen_poll(void)
     const screen_action_t selected = action;
     action = (screen_action_t){0};
     return selected;
+}
+
+bool screen_manual_is_open(void)
+{
+    return active_page == PAGE_MANUAL;
 }

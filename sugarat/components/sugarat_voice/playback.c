@@ -5,13 +5,14 @@
 
 #include "agent_link.h"
 #include "audio.h"
-#include "esp_heap_caps.h"
+#include "audio_meter.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "turn_timing.h"
 
 enum {
     PLAYBACK_FRAMES = 132,
@@ -24,6 +25,7 @@ enum {
     PREBUFFER_SLOT_LIMIT = PLAYBACK_FRAMES * 2 / 3,
     PA_DRAIN_MS = SUGARAT_SPEAKER_DMA_MS + 40,
     ECHO_GUARD_MS = 220,
+    METER_HOLD_MS = 150,
     DRAIN_REPORTS = SUGARAT_SPEAKER_DMA_DESCRIPTORS + 2,
     REPORT_PLAYBACK_GAP_MS = 150,
 };
@@ -75,11 +77,15 @@ typedef struct {
 static const char *TAG = "jarvis_speaker";
 static QueueHandle_t queue;
 static StaticQueue_t queue_control;
-static uint8_t *storage;
+static EXT_RAM_BSS_ATTR playback_frame_t storage[PLAYBACK_FRAMES + 1];
+static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t playback_stack[4096];
+static StaticTask_t playback_tcb;
 static TaskHandle_t worker;
 static atomic_bool accepting;
 static atomic_uint generation;
 static atomic_uint echo_until;
+static atomic_uint meter_level;
+static atomic_uint meter_until;
 static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static playback_stats_t reply;
 static unsigned reply_sequence;
@@ -94,6 +100,12 @@ bool voice_playback_echo_guard(void)
 {
     const uint32_t until = atomic_load(&echo_until);
     return until != 0 && (int32_t)(until - now_ms()) > 0;
+}
+
+unsigned voice_playback_level(void)
+{
+    const uint32_t until = atomic_load(&meter_until);
+    return until != 0 && (int32_t)(until - now_ms()) > 0 ? atomic_load(&meter_level) : 0;
 }
 
 static size_t playback_buffer_level(void *context)
@@ -122,6 +134,7 @@ void voice_playback_end(void *context)
     const unsigned current = atomic_load(&generation);
     reply = (playback_stats_t){0};
     portEXIT_CRITICAL(&stats_lock);
+    voice_timing_reply_end();
     if (stats.id) {
         const playback_frame_t end = {.generation = current, .reply_id = stats.id, .delivery = stats.delivery};
         if (!stats.enqueued_samples || xQueueSend(queue, &end, 0) != pdTRUE) {
@@ -136,11 +149,13 @@ void voice_playback_end(void *context)
 void voice_playback_reset(void *context)
 {
     (void)context;
+    atomic_store(&meter_until, 0);
     portENTER_CRITICAL(&stats_lock);
     atomic_fetch_add(&generation, 1);
     const playback_stats_t stats = reply;
     reply = (playback_stats_t){0};
     portEXIT_CRITICAL(&stats_lock);
+    voice_timing_reply_end();
     if (queue) {
         xQueueReset(queue);
     }
@@ -175,7 +190,8 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         portEXIT_CRITICAL(&stats_lock);
         return;
     }
-    if (!reply.id) {
+    const bool first_pcm = !reply.id;
+    if (first_pcm) {
         reply.id = ++reply_sequence;
         reply.first_audio_us = arrival_us;
     }
@@ -186,6 +202,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     reply.delivery.received_samples += samples;
     playback_frame_t frame = {.generation = current, .reply_id = reply.id};
     portEXIT_CRITICAL(&stats_lock);
+    if (first_pcm) voice_timing_first_pcm(frame.reply_id);
 
     size_t remaining = samples;
     while (remaining) {
@@ -353,7 +370,13 @@ static void play_audio(void *context)
             ESP_LOGW(TAG, "Speaker write: %s", esp_err_to_name(err));
             sugarat_speaker_enable(false);
         } else {
+            const unsigned level = voice_audio_level(frame.pcm, frame.count);
+            if (level) {
+                atomic_store(&meter_level, level);
+                atomic_store(&meter_until, now_ms() + METER_HOLD_MS);
+            }
             last_write_us = esp_timer_get_time();
+            if (progress.submitted_samples == 0) voice_timing_speaker_start(frame.reply_id, last_write_us);
             const sugarat_speaker_dma_t dma = sugarat_speaker_dma();
             if (progress.last_write_us) {
                 const unsigned gap_ms = (unsigned)((last_write_us - progress.last_write_us) / 1000);
@@ -374,12 +397,11 @@ static void play_audio(void *context)
 
 esp_err_t voice_playback_start(void)
 {
-    storage = heap_caps_malloc((PLAYBACK_FRAMES + 1) * sizeof(playback_frame_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (storage) {
-        queue = xQueueCreateStatic(PLAYBACK_FRAMES + 1, sizeof(playback_frame_t), storage, &queue_control);
+    queue = xQueueCreateStatic(PLAYBACK_FRAMES + 1, sizeof(playback_frame_t), (uint8_t *)storage, &queue_control);
+    if (queue) {
+        worker = xTaskCreateStatic(play_audio, TAG, sizeof(playback_stack), NULL, 6, playback_stack, &playback_tcb);
     }
-    if (!queue || xTaskCreateWithCaps(play_audio, TAG, 4096, NULL, 6, &worker,
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+    if (!worker) {
         voice_playback_stop();
         return ESP_ERR_NO_MEM;
     }
@@ -395,13 +417,11 @@ esp_err_t voice_playback_start(void)
 void voice_playback_stop(void)
 {
     if (worker) {
-        vTaskDeleteWithCaps(worker);
+        vTaskDelete(worker);
         worker = NULL;
     }
     if (queue) {
         vQueueDelete(queue);
         queue = NULL;
     }
-    heap_caps_free(storage);
-    storage = NULL;
 }

@@ -12,7 +12,9 @@ public:
     using Reallocator = void* (*)(void*, size_t);
     MessageBuffer(size_t initial, size_t maximum, Reallocator resize)
         : initial_(initial), maximum_(maximum), resize_(resize) { Reserve(initial); }
-    ~MessageBuffer() { if (data_) resize_(data_, 0); }
+    MessageBuffer(uint8_t* storage, size_t bytes)
+        : initial_(bytes), maximum_(bytes), resize_(nullptr), data_(storage), capacity_(bytes) {}
+    ~MessageBuffer() { if (data_ && resize_) resize_(data_, 0); }
     MessageBuffer(const MessageBuffer&) = delete;
     MessageBuffer& operator=(const MessageBuffer&) = delete;
     bool Reserve(size_t bytes) {

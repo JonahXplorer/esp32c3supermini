@@ -30,6 +30,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -66,6 +67,12 @@
 #if CONFIG_IDF_TARGET_ESP32S3
 #include "lwip/dns.h"
 #include "lwip/tcpip.h"
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY && CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+#define AGENT_LINK_STATIC_VOICE_PSRAM 1
+#else
+#define AGENT_LINK_STATIC_VOICE_PSRAM 0
 #endif
 
 namespace {
@@ -112,11 +119,13 @@ using VoiceTls = esp_tls_t*;
 using VoiceTls = esp_transport_handle_t;
 #endif
 
+#if !AGENT_LINK_STATIC_VOICE_PSRAM
 void* ResizeMessage(void* data, size_t bytes) {
     if (!bytes) { free(data); return nullptr; }
     void* next = heap_caps_realloc(data, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return next ? next : realloc(data, bytes);
 }
+#endif
 
 struct Grant {
     char url[512];
@@ -167,6 +176,31 @@ struct EncodedTx {
     uint32_t turn;
     uint8_t data[1275];
 };
+
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+// The single realtime worker owns these buffers. It closes the previous Call
+// and waits for the codec workers before reusing any of the call storage.
+constexpr size_t kRxRingBytes = 2 * (kMessageBytes + sizeof(Rx) + 32);
+EXT_RAM_BSS_ATTR static uint8_t s_ws_message[kMessageBytes];
+EXT_RAM_BSS_ATTR static TxScratch s_ws_scratch;
+EXT_RAM_BSS_ATTR static uint8_t s_grant_storage[sizeof(Grant)];
+EXT_RAM_BSS_ATTR static Tx s_tx_storage[kTxDepth];
+EXT_RAM_BSS_ATTR alignas(4) static uint8_t s_rx_storage[kRxRingBytes];
+static StaticQueue_t s_grant_queue, s_tx_queue;
+static StaticRingbuffer_t s_rx_control;
+#if CONFIG_AGENT_LINK_REALTIME_OPUS
+EXT_RAM_BSS_ATTR static EncodedTx s_encoded_storage[kEncodedDepth];
+EXT_RAM_BSS_ATTR static int16_t s_decoded_pcm[kDecodePcmBytes / sizeof(int16_t)];
+static StaticQueue_t s_encoded_control;
+#endif
+
+// These workers sleep between calls. A reconnect hands them a new Call only
+// after the old one reports completion, so their static stacks stay reusable.
+bool DispatchAudioWorker(TaskHandle_t task, void* call) {
+    static_assert(sizeof(uintptr_t) == sizeof(uint32_t), "Task notification must hold a Call pointer");
+    return task && xTaskNotify(task, reinterpret_cast<uintptr_t>(call), eSetValueWithoutOverwrite) == pdPASS;
+}
+#endif
 
 struct WssAddress {
     char host[128];
@@ -224,6 +258,7 @@ bool                      s_tx_caps = false;
 agent_stream_t            s_input = AGENT_STREAM_KIND_COUNT;
 cloud_realtime_callbacks_t s_cb = {};
 agent_link_platform_user_transcript_cb_t s_user_transcript = nullptr;
+agent_link_platform_voice_timing_cb_t s_voice_timing = nullptr;
 
 // Diagnostics for the continuous uplink. Only counters and timings are retained.
 std::atomic<uint32_t> s_tx_sent_frames{0};
@@ -602,8 +637,19 @@ struct WsSender {
     int64_t first_wait_at = 0;
 #if CONFIG_IDF_TARGET_ESP32S3
     int64_t last_data_received_ms = 0;
+    int64_t last_pump_at = 0;
     bool wait_extension_logged = false;
     unsigned peak_uplink_queue_ms = 0;
+    struct {
+        int first_tls_wait = 0;
+        int last_tls_wait = 0;
+        int first_writable = -1;
+        int64_t first_loop_gap_us = 0;
+        int64_t max_loop_gap_us = 0;
+        unsigned want_read = 0;
+        unsigned want_write = 0;
+        bool start_logged = false;
+    } write_wait;
 #endif
 #endif
 };
@@ -625,7 +671,31 @@ bool TlsWouldBlock(int result) {
     return result == ESP_TLS_ERR_SSL_WANT_READ || result == ESP_TLS_ERR_SSL_WANT_WRITE;
 }
 
+#if CONFIG_IDF_TARGET_ESP32S3
+const char* TlsWaitName(int result) {
+    if (result == ESP_TLS_ERR_SSL_WANT_READ) return "WANT_READ";
+    if (result == ESP_TLS_ERR_SSL_WANT_WRITE) return "WANT_WRITE";
+    return "none";
+}
+
+void LogWriteWaitStart(WsSender& sender, int64_t now_us) {
+    auto& wait = sender.write_wait;
+    // Remember the first sample, but avoid logging routine brief backpressure.
+    if (!sender.first_wait_at || wait.start_logged || now_us - sender.first_wait_at < kReportAudioGapUs) return;
+    wait.start_logged = true;
+    ESP_LOGI(TAG, "Voice TLS write stalled: tls_wait=%s socket_writable=%d loop_gap_us=%lld",
+             TlsWaitName(wait.first_tls_wait), wait.first_writable, static_cast<long long>(wait.first_loop_gap_us));
+}
+#endif
+
 bool PumpWire(WsSender& sender) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    const int64_t pump_at = esp_timer_get_time();
+    const int64_t loop_gap_us = sender.last_pump_at ? pump_at - sender.last_pump_at : 0;
+    sender.last_pump_at = pump_at;
+    if (sender.first_wait_at)
+        sender.write_wait.max_loop_gap_us = std::max(sender.write_wait.max_loop_gap_us, loop_gap_us);
+#endif
     if (!sender.pending.Busy()) return true;
     std::unique_lock<std::mutex> capture_lock(s_mutex, std::defer_lock);
     if (sender.audio_turn) {
@@ -643,9 +713,10 @@ bool PumpWire(WsSender& sender) {
         }
     }
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    using agentlink::realtime::PendingWrite;
-    int64_t stall_limit_ms = PendingWrite::kStallMs;
 #if CONFIG_IDF_TARGET_ESP32S3
+    constexpr int64_t kNoDownlinkStallMs = 5000;
+    constexpr int64_t kActiveDownlinkStallMs = 6000;
+    int64_t stall_limit_ms = kNoDownlinkStallMs;
     if (sender.first_wait_at) {
         const unsigned queued_ms = (uxQueueMessagesWaiting(s_tx) + s_encoded_pending.load()) * 20;
         sender.peak_uplink_queue_ms = std::max(sender.peak_uplink_queue_ms, queued_ms);
@@ -654,15 +725,20 @@ bool PumpWire(WsSender& sender) {
                            sender.last_data_received_ms >= sender.first_wait_at / 1000 &&
                            now_ms - sender.last_data_received_ms <= 1000;
     if (receiving) {
-        stall_limit_ms = 6000;
-        if (!sender.wait_extension_logged && sender.pending.StalledMs(now_ms) >= PendingWrite::kStallMs) {
+        stall_limit_ms = kActiveDownlinkStallMs;
+        if (!sender.wait_extension_logged && sender.pending.StalledMs(now_ms) >= kNoDownlinkStallMs) {
             sender.wait_extension_logged = true;
             ESP_LOGI(TAG, "Voice TLS write waiting: downlink active, limit_ms=%lld",
                      static_cast<long long>(stall_limit_ms));
         }
     }
+#else
+    constexpr int64_t stall_limit_ms = agentlink::realtime::PendingWrite::kStallMs;
 #endif
     const auto timed_out = [&](int64_t at_ms) {
+#if CONFIG_IDF_TARGET_ESP32S3
+        LogWriteWaitStart(sender, esp_timer_get_time());
+#endif
         ESP_LOGW(TAG, "voice TLS write expired: no_progress_ms=%lld age_ms=%lld limit_ms=%lld pending=%u offset=%u rx_while_waiting=%u",
                  static_cast<long long>(sender.pending.StalledMs(at_ms)),
                  static_cast<long long>(sender.pending.AgeMs(at_ms)), static_cast<long long>(stall_limit_ms),
@@ -670,9 +746,14 @@ bool PumpWire(WsSender& sender) {
                  static_cast<unsigned>(sender.pending.Offset()),
                  sender.first_wait_at ? static_cast<unsigned>(s_rx_bytes.load() - sender.receive_at_first_wait) : 0);
 #if CONFIG_IDF_TARGET_ESP32S3
-        ESP_LOGW(TAG, "Voice TLS write backlog: peak_uplink_ms=%u downlink_pending_bytes=%u microphone=%s",
+        const auto& wait = sender.write_wait;
+        const int writable = PollWritable(sender.tls);
+        ESP_LOGW(TAG, "Voice TLS write backlog: peak_uplink_ms=%u downlink_pending_bytes=%u microphone=%s "
+                      "tls_wait=%s want_read=%u want_write=%u socket_writable=%d loop_gap_us=%lld max_loop_gap_us=%lld",
                  sender.peak_uplink_queue_ms, static_cast<unsigned>(s_downlink_bytes.load()),
-                 (s_capture_turn.load() & 1) ? "on" : "off");
+                 (s_capture_turn.load() & 1) ? "on" : "off", TlsWaitName(wait.last_tls_wait),
+                 wait.want_read, wait.want_write, writable, static_cast<long long>(loop_gap_us),
+                 static_cast<long long>(std::max(wait.max_loop_gap_us, loop_gap_us)));
 #endif
         LogTransportFailure(sender.tls, "write progress timeout", 0, 0);
         return false;
@@ -696,11 +777,26 @@ bool PumpWire(WsSender& sender) {
         if (!sender.first_wait_at) {
             sender.first_wait_at = esp_timer_get_time();
             sender.receive_at_first_wait = s_rx_bytes.load();
+#if CONFIG_IDF_TARGET_ESP32S3
+            sender.write_wait.first_tls_wait = sent;
+            sender.write_wait.first_writable = writable;
+            sender.write_wait.first_loop_gap_us = loop_gap_us;
+            sender.write_wait.max_loop_gap_us = loop_gap_us;
+#endif
         }
+#if CONFIG_IDF_TARGET_ESP32S3
+        sender.write_wait.last_tls_wait = sent;
+        if (sent == ESP_TLS_ERR_SSL_WANT_READ) ++sender.write_wait.want_read;
+        else ++sender.write_wait.want_write;
+#endif
     }
     if (sent > 0 && static_cast<size_t>(sent) < remaining) s_tx_partial.fetch_add(1);
     if (sent > 0 && writable == 0) s_tx_select0_accepted.fetch_add(1);
-    const int64_t finished_ms = esp_timer_get_time() / 1000;
+    const int64_t finished_us = esp_timer_get_time();
+    const int64_t finished_ms = finished_us / 1000;
+#if CONFIG_IDF_TARGET_ESP32S3
+    LogWriteWaitStart(sender, finished_us);
+#endif
     if (!sender.pending.Advance(sent, waiting, finished_ms, stall_limit_ms)) {
         if (waiting && sender.pending.Expired(finished_ms, stall_limit_ms)) return timed_out(finished_ms);
         LogTransportFailure(sender.tls, "write", sent, errno);
@@ -709,11 +805,16 @@ bool PumpWire(WsSender& sender) {
     if (!sender.pending.Busy()) {
         const uint32_t waited_rx = s_rx_bytes.load() - sender.receive_at_first_wait;
 #if CONFIG_IDF_TARGET_ESP32S3
-        if (sender.first_wait_at && esp_timer_get_time() - sender.first_wait_at >= kReportAudioGapUs) {
-            ESP_LOGI(TAG, "Voice TLS write resumed: wait_ms=%u rx_while_waiting=%u peak_uplink_ms=%u",
-                     static_cast<unsigned>((esp_timer_get_time() - sender.first_wait_at) / 1000),
-                     static_cast<unsigned>(waited_rx), sender.peak_uplink_queue_ms);
+        const auto& wait = sender.write_wait;
+        if (wait.start_logged) {
+            ESP_LOGI(TAG, "Voice TLS write resumed: wait_ms=%u rx_while_waiting=%u peak_uplink_ms=%u "
+                          "tls_wait=%s want_read=%u want_write=%u socket_writable=%d loop_gap_us=%lld max_loop_gap_us=%lld",
+                     static_cast<unsigned>((finished_us - sender.first_wait_at) / 1000),
+                     static_cast<unsigned>(waited_rx), sender.peak_uplink_queue_ms, TlsWaitName(wait.last_tls_wait),
+                     wait.want_read, wait.want_write, writable, static_cast<long long>(loop_gap_us),
+                     static_cast<long long>(wait.max_loop_gap_us));
         }
+        sender.write_wait = {};
         sender.peak_uplink_queue_ms = 0;
 #else
         if (sender.first_wait_at && waited_rx && esp_timer_get_time() - sender.first_wait_at >= kReportAudioGapUs) {
@@ -856,7 +957,13 @@ public:
         }
         s_encoded_pending.store(0);
 #if CONFIG_IDF_TARGET_ESP32S3
-        if (rx_ring_) vRingbufferDeleteWithCaps(rx_ring_);
+        if (rx_ring_) {
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+            vRingbufferDelete(rx_ring_);
+#else
+            vRingbufferDeleteWithCaps(rx_ring_);
+#endif
+        }
 #else
         if (rx_queue_) {
             Rx packet;
@@ -870,7 +977,9 @@ public:
         if (decoder_) esp_opus_dec_close(decoder_);
         if (encoder_) esp_opus_enc_close(encoder_);
 #endif
+#if !AGENT_LINK_STATIC_VOICE_PSRAM
         free(decode_pcm_);
+#endif
         free(silence_);
     }
 
@@ -904,7 +1013,11 @@ public:
         // A no-split ring needs just over twice the largest item to guarantee
         // it can accept that item at any position. Reserve it once in PSRAM.
         constexpr size_t rx_ring_bytes = 2 * (kMessageBytes + sizeof(Rx) + 32);
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        rx_ring_ = xRingbufferCreateStatic(kRxRingBytes, RINGBUF_TYPE_NOSPLIT, s_rx_storage, &s_rx_control);
+#else
         rx_ring_ = xRingbufferCreateWithCaps(rx_ring_bytes, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
         if (!rx_ring_) return false;
         ESP_LOGI(TAG, "Resident WSS downlink buffer: %uB PSRAM", static_cast<unsigned>(rx_ring_bytes));
 #else
@@ -918,6 +1031,14 @@ public:
 #else
         constexpr unsigned stack_bytes = 8192;
 #endif
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        EXT_RAM_BSS_ATTR alignas(16) static StackType_t media_stack[stack_bytes];
+        static StaticTask_t media_tcb;
+        static const TaskHandle_t media = xTaskCreateStatic(&MediaEntry, "agentlink_audio", sizeof(media_stack),
+                                                             nullptr, 5, media_stack, &media_tcb);
+        media_started_ = DispatchAudioWorker(media, this);
+        media_caps_ = true;
+#else
         media_caps_ = true;
         media_started_ = xTaskCreateWithCaps(&MediaEntry, "agentlink_audio", stack_bytes, this, 5,
                                            nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
@@ -925,6 +1046,7 @@ public:
             media_caps_ = false;
             media_started_ = xTaskCreate(&MediaEntry, "agentlink_audio", stack_bytes, this, 5, nullptr) == pdPASS;
         }
+#endif
         if (!media_started_)
             ESP_LOGE(TAG, "could not start downlink audio worker (%uB stack, internal free=%u largest=%u)",
                      stack_bytes,
@@ -1126,9 +1248,13 @@ public:
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
         if (audio_.output_opus && !decoder_) {
             if (!decode_pcm_) {
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+                decode_pcm_ = s_decoded_pcm;
+#else
                 decode_pcm_ = static_cast<int16_t*>(heap_caps_malloc(kDecodePcmBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
                 if (!decode_pcm_) decode_pcm_ = static_cast<int16_t*>(malloc(kDecodePcmBytes));
                 if (!decode_pcm_) return false;
+#endif
             }
             esp_opus_dec_cfg_t config = {};
             config.sample_rate = 16000;
@@ -1167,6 +1293,7 @@ public:
     }
 
     void ResetAudio() {
+        first_audio_reported_ = false;
         if (SharedCodec()) {
             if (!EndReply()) running_.store(false);
         } else ResetDecoder();
@@ -1229,6 +1356,10 @@ public:
     bool Audio(uint8_t* data, size_t bytes) {
         if (!s_ready || s_mute || !bytes) return true;
         const int64_t now = received_at_;
+        if (s_voice_timing && !first_audio_reported_) {
+            first_audio_reported_ = true;
+            s_voice_timing(AGENT_LINK_VOICE_FIRST_AUDIO, now);
+        }
         if (last_audio_) {
             const int64_t gap_us = now - last_audio_;
             if (gap_us > max_gap_) max_gap_ = gap_us;
@@ -1383,6 +1514,7 @@ public:
             // Keep receiving control/session events while the microphone and playback are off.
         } else if (strcmp(event, "response.audio.done") == 0) {
             ++reply_ends_;
+            first_audio_reported_ = false;
 #if !CONFIG_IDF_TARGET_ESP32C3
             ESP_LOGI(TAG, "WSS audio done: reply=%u packets=%u pcm_ms=%u max_gap_ms=%u max_decode_us=%u max_pacing_ms=%u",
                      replies_, packets_, static_cast<unsigned>(samples_ / 16), static_cast<unsigned>(max_gap_ / 1000),
@@ -1403,6 +1535,9 @@ public:
                 s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
         } else if (strcmp(event, "response.started") == 0) {
             ++replies_;
+            first_audio_reported_ = false;
+            if (s_voice_timing && s_ready && !s_mute)
+                s_voice_timing(AGENT_LINK_VOICE_RESPONSE_STARTED, received_at_);
             ESP_LOGD(TAG, "reply started #%u", replies_);
             if (SharedCodec()) keep = BeginReply();
             else ResetDecoder();
@@ -1427,10 +1562,11 @@ public:
             if (cJSON_IsString(text)) {
                 if (s_cb.text) s_cb.text(text->valuestring);
                 const cJSON* role = cJSON_GetObjectItemCaseSensitive(json, "role");
-                if (s_user_transcript && conversation_id_ && conversation_id_[0] && s_ready &&
-                    Current(epoch_) && strcmp(event, "transcript.final") == 0 &&
-                    cJSON_IsString(role) && strcmp(role->valuestring, "user") == 0)
-                    s_user_transcript(text->valuestring);
+                if (s_ready && Current(epoch_) && strcmp(event, "transcript.final") == 0 &&
+                    cJSON_IsString(role) && strcmp(role->valuestring, "user") == 0) {
+                    if (s_voice_timing && !s_mute) s_voice_timing(AGENT_LINK_VOICE_USER_FINAL, received_at_);
+                    if (s_user_transcript && conversation_id_ && conversation_id_[0]) s_user_transcript(text->valuestring);
+                }
             }
         } else if (strcmp(event, "error") == 0 || strcmp(event, "session.error") == 0 ||
                    strcmp(event, "session.ended") == 0) {
@@ -1592,7 +1728,18 @@ private:
 #endif
     agentlink::realtime::OpusBatchGate batch_gate_{kOpusBatchFrames};
     agentlink::realtime::WriteStall write_stall_;
-    static void MediaEntry(void* context) { static_cast<Call*>(context)->MediaLoop(); }
+    static void MediaEntry(void* context) {
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        (void)context;
+        for (;;) {
+            uint32_t value = 0;
+            if (xTaskNotifyWait(0, UINT32_MAX, &value, portMAX_DELAY) == pdTRUE)
+                reinterpret_cast<Call*>(static_cast<uintptr_t>(value))->MediaLoop();
+        }
+#else
+        static_cast<Call*>(context)->MediaLoop();
+#endif
+    }
 
     void MediaLoop() {
         Rx packet;
@@ -1629,10 +1776,14 @@ private:
             s_media_stack.store(uxTaskGetStackHighWaterMark(nullptr));
             if (!handled) running_.store(false);
         }
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        media_done_.store(true);
+#else
         const bool caps = media_caps_;
         media_done_.store(true);
         if (caps) vTaskDeleteWithCaps(nullptr);
         else vTaskDelete(nullptr);
+#endif
     }
 
     size_t AudioJson(TxScratch* scratch, const uint8_t* data, size_t bytes) {
@@ -1695,9 +1846,14 @@ private:
         if (encoder_started_) return true;
 #endif
         if (!encoded_queue_) {
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+            encoded_queue_ = xQueueCreateStatic(kEncodedDepth, sizeof(EncodedTx),
+                                               reinterpret_cast<uint8_t*>(s_encoded_storage), &s_encoded_control);
+#else
             encoded_queue_ = xQueueCreateWithCaps(kEncodedDepth, sizeof(EncodedTx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             encoded_queue_caps_ = encoded_queue_ != nullptr;
             if (!encoded_queue_) encoded_queue_ = xQueueCreate(kEncodedDepth, sizeof(EncodedTx));
+#endif
         }
         if (!encoded_queue_) return false;
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -1709,6 +1865,14 @@ private:
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
         return opened;
 #else
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        EXT_RAM_BSS_ATTR alignas(16) static StackType_t encoder_stack[40960];
+        static StaticTask_t encoder_tcb;
+        static const TaskHandle_t encoder = xTaskCreateStatic(&EncoderEntry, "agentlink_encode", sizeof(encoder_stack),
+                                                               nullptr, 5, encoder_stack, &encoder_tcb);
+        encoder_started_ = DispatchAudioWorker(encoder, this);
+        encoder_caps_ = true;
+#else
         encoder_caps_ = true;
         encoder_started_ = xTaskCreateWithCaps(&EncoderEntry, "agentlink_encode", 40960, this, 5,
                                                nullptr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
@@ -1716,6 +1880,7 @@ private:
             encoder_caps_ = false;
             encoder_started_ = xTaskCreate(&EncoderEntry, "agentlink_encode", 40960, this, 5, nullptr) == pdPASS;
         }
+#endif
         if (!encoder_started_) ESP_LOGE(TAG, "could not start microphone Opus worker");
         else ESP_LOGD(TAG, "Opus encoder stack=%s; internal free=%u largest=%u",
                       encoder_caps_ ? "PSRAM" : "internal",
@@ -1725,7 +1890,18 @@ private:
 #endif
     }
 
-    static void EncoderEntry(void* context) { static_cast<Call*>(context)->EncoderLoop(); }
+    static void EncoderEntry(void* context) {
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        (void)context;
+        for (;;) {
+            uint32_t value = 0;
+            if (xTaskNotifyWait(0, UINT32_MAX, &value, portMAX_DELAY) == pdTRUE)
+                reinterpret_cast<Call*>(static_cast<uintptr_t>(value))->EncoderLoop();
+        }
+#else
+        static_cast<Call*>(context)->EncoderLoop();
+#endif
+    }
 
     bool QueueEncoded(const EncodedTx& packet) {
         while (Healthy() && Current(epoch_)) {
@@ -1869,10 +2045,14 @@ private:
             ESP_LOGW(TAG, "microphone Opus worker stopped after a codec error");
             running_.store(false);
         }
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+        encoder_done_.store(true);
+#else
         const bool caps = encoder_caps_;
         encoder_done_.store(true);
         if (caps) vTaskDeleteWithCaps(nullptr);
         else vTaskDelete(nullptr);
+#endif
     }
 #endif
 
@@ -1904,6 +2084,7 @@ private:
     const char* conversation_id_ = nullptr;
     const int64_t created_at_;
     int64_t received_at_ = 0;
+    bool first_audio_reported_ = false;
     size_t samples_ = 0, encoded_bytes_ = 0;
     unsigned packets_ = 0;
     int64_t last_audio_ = 0, max_gap_ = 0;
@@ -2084,13 +2265,27 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
 #if CONFIG_IDF_TARGET_ESP32S3
     ReportDmaHeap("before_wss");
 #endif
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+    agentlink::realtime::MessageBuffer message(s_ws_message, sizeof(s_ws_message));
+    auto* scratch = &s_ws_scratch;
+#else
     agentlink::realtime::MessageBuffer message(kMessageInitialBytes, kMessageBytes, ResizeMessage);
-    std::unique_ptr<TxScratch, decltype(&free)> scratch(
+    std::unique_ptr<TxScratch, decltype(&free)> scratch_owner(
         static_cast<TxScratch*>(heap_caps_malloc(sizeof(TxScratch), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)), &free);
-    if (!scratch) scratch.reset(static_cast<TxScratch*>(malloc(sizeof(TxScratch))));
+    if (!scratch_owner) scratch_owner.reset(static_cast<TxScratch*>(malloc(sizeof(TxScratch))));
+    auto* scratch = scratch_owner.get();
+#endif
     // Keep metadata off the shared stack: the codec needs most of its depth.
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+    EXT_RAM_BSS_ATTR alignas(Call) static uint8_t call_storage[sizeof(Call)];
+    std::unique_ptr<Call, void (*)(Call*)> owner(
+        new (call_storage) Call(grant.epoch, grant.audio, grant.platform, grant.token,
+                                grant.platform ? grant.session_id : nullptr),
+        [](Call* call) { call->~Call(); });
+#else
     std::unique_ptr<Call> owner(new (std::nothrow) Call(grant.epoch, grant.audio, grant.platform, grant.token,
                                                       grant.platform ? grant.session_id : nullptr));
+#endif
     if (!message.Data() || !scratch || !owner) return false;
     NativeWss connection;
     size_t trailing = 0;
@@ -2131,7 +2326,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     if (!Current(grant.epoch) || !call.Prepare() || !call.Start()) return false;
     WsSender sender{connection.tls, scratch->wire, sizeof scratch->wire};
 #if CONFIG_IDF_TARGET_ESP32C3
-    call.BindNetwork(&sender, scratch.get());
+    call.BindNetwork(&sender, scratch);
 #endif
     char hello[sizeof Grant::token * 2 + 128];
     size_t n = snprintf(hello, sizeof hello, "{\"type\":\"session.connect\",\"connect_token\":\"");
@@ -2215,7 +2410,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
         if (!PumpControl(sender, pong, pong_size, &pong_pending, &last_ping, now)) {
             retryable = true; break;
         }
-        if (hello_sent && !call.FlushTx(sender, scratch.get())) { retryable = call.TransportFailed(); break; }
+        if (hello_sent && !call.FlushTx(sender, scratch)) { retryable = call.TransportFailed(); break; }
         if ((!s_ready && now - connected_at > kReadyTimeoutUs) || now - last_rx > 45000000) {
             ESP_LOGW(TAG, "voice session timed out"); retryable = true; break;
         }
@@ -2677,7 +2872,8 @@ void Worker(void*) {
             if (retryable) hint = "Voice network failed. Tap Connect to retry";
             if (s_cb.state) s_cb.state(false, retry ? "Voice interrupted. Reconnecting..." : hint);
             if (grant.platform && (granted || (grant.url[0] && grant.token[0])))
-                cloud_platform_end_grant(grant.agent_id, grant.session_id);
+                cloud_platform_end_grant(grant.agent_id, grant.session_id,
+                                         retryable ? CloudGrantCleanup::kBeforeRetry : CloudGrantCleanup::kNormal);
 #if CONFIG_AGENT_LINK_REALTIME_DIRECT
             if (grant.direct && granted) EndDirectSession();
 #endif
@@ -2703,12 +2899,23 @@ void Worker(void*) {
     s_wss_ticket.session.reset();
 #endif
     s_task.store(nullptr, std::memory_order_release);
+#if !AGENT_LINK_STATIC_VOICE_PSRAM
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM
     vTaskDeleteWithCaps(nullptr);
 #else
     vTaskDelete(nullptr);
 #endif
+#endif
 }
+
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+void ResidentWorker(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        Worker(nullptr);
+    }
+}
+#endif
 }  // namespace
 
 namespace {
@@ -2720,13 +2927,23 @@ bool StartWorker() {
 #else
     constexpr unsigned stack_bytes = 12288;
 #endif
-#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+    EXT_RAM_BSS_ATTR alignas(16) static StackType_t realtime_stack[stack_bytes];
+    static StaticTask_t realtime_tcb;
+    static const TaskHandle_t worker = xTaskCreateStatic(&ResidentWorker, "agentlink_rt", sizeof(realtime_stack),
+                                                          nullptr, 5, realtime_stack, &realtime_tcb);
+    if (!worker) return false;
+    task = worker;
+#elif CONFIG_IDF_TARGET_ESP32S3 && CONFIG_SPIRAM
     if (xTaskCreateWithCaps(&Worker, "agentlink_rt", stack_bytes, nullptr, 5, &task,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) return false;
 #else
     if (xTaskCreate(&Worker, "agentlink_rt", stack_bytes, nullptr, 5, &task) != pdPASS) return false;
 #endif
     s_task.store(task, std::memory_order_release);
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+    xTaskNotifyGive(task);
+#endif
 #if CONFIG_IDF_TARGET_ESP32C3
     ESP_LOGD(TAG, "resident voice task ready: stack=%uB, internal free=%u largest=%u",
              stack_bytes,
@@ -2754,6 +2971,14 @@ esp_err_t QueueGrant(Grant* grant) {
 esp_err_t cloud_realtime_start(void) {
     std::lock_guard<std::mutex> lock(s_mutex);
     if (s_grants) return ESP_OK;
+#if AGENT_LINK_STATIC_VOICE_PSRAM
+    s_grants = xQueueCreateStatic(1, sizeof(Grant), s_grant_storage, &s_grant_queue);
+    s_tx = xQueueCreateStatic(kTxDepth, sizeof(Tx), reinterpret_cast<uint8_t*>(s_tx_storage), &s_tx_queue);
+    if (!s_grants || !s_tx) return ESP_ERR_NO_MEM;
+    ESP_LOGI(TAG, "Static PSRAM WSS: message=%uB receive=%uB uplink=%uB scratch=%uB",
+             static_cast<unsigned>(sizeof(s_ws_message)), static_cast<unsigned>(sizeof(s_rx_storage)),
+             static_cast<unsigned>(sizeof(s_tx_storage)), static_cast<unsigned>(sizeof(s_ws_scratch)));
+#else
     s_grants = xQueueCreateWithCaps(1, sizeof(Grant), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_grants_caps = s_grants != nullptr;
     if (!s_grants) s_grants = xQueueCreate(1, sizeof(Grant));
@@ -2772,6 +2997,7 @@ esp_err_t cloud_realtime_start(void) {
              s_tx_caps ? "PSRAM" : "internal", s_grants_caps ? "PSRAM" : "internal",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+#endif
     s_run.store(true, std::memory_order_release);
 #if CONFIG_IDF_TARGET_ESP32C3
     // Reserve the only large stack at SDK startup, before HTTPS fragments RAM.
@@ -2882,6 +3108,10 @@ void cloud_realtime_set_callbacks(const cloud_realtime_callbacks_t* callbacks) {
 
 extern "C" void agent_link_platform_set_user_transcript_callback(agent_link_platform_user_transcript_cb_t callback) {
     s_user_transcript = callback;
+}
+
+extern "C" void agent_link_platform_set_voice_timing_callback(agent_link_platform_voice_timing_cb_t callback) {
+    s_voice_timing = callback;
 }
 
 bool cloud_realtime_ready(void) { return s_ready.load(); }

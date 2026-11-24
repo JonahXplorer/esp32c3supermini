@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 typedef enum {
@@ -9,6 +10,7 @@ typedef enum {
     SUGARAT_VOICE_JOINING,
     SUGARAT_VOICE_ACTIVATE,
     SUGARAT_VOICE_BIND_AGENT,
+    SUGARAT_VOICE_PREPARING,
     SUGARAT_VOICE_READY,
     SUGARAT_VOICE_OPENING,
     SUGARAT_VOICE_IN_CALL,
@@ -22,6 +24,8 @@ typedef struct {
     sugarat_voice_phase_t phase;
     char activation_code[7];
     bool can_end;
+    bool speaking;
+    uint8_t level;
 } sugarat_voice_view_t;
 
 esp_err_t sugarat_voice_start(void);

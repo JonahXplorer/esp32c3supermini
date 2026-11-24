@@ -15,7 +15,13 @@ typedef struct {
     bool online;
     bool pending;
     bool moving;
+} manual_control_view_t;
+
+typedef struct {
+    manual_control_view_t manual;
     bool touch_ready;
+    bool wifi_connected;
+    bool wifi_setup_active;
     sugarat_voice_view_t voice;
 } screen_state_t;
 
@@ -27,6 +33,7 @@ typedef enum {
     SCREEN_SET_LIGHT,
     SCREEN_START_CALL,
     SCREEN_END_CALL,
+    SCREEN_SETUP_WIFI,
 } screen_action_kind_t;
 
 typedef struct {
@@ -37,3 +44,4 @@ typedef struct {
 esp_err_t screen_init(bool touch_ready);
 void screen_update(const screen_state_t *state);
 screen_action_t screen_poll(void);
+bool screen_manual_is_open(void);

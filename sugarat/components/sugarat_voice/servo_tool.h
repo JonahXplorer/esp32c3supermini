@@ -8,7 +8,6 @@ typedef struct {
     uint32_t id;
     int64_t deadline_us;
     uint8_t position;
-    bool from_transcript;
 } servo_tool_request_t;
 
 esp_err_t servo_tool_init(void);

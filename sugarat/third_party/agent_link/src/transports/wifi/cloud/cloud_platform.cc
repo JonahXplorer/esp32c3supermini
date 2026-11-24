@@ -40,8 +40,10 @@ char s_bound_key[CLOUD_AUTH_KEY_MAX] = {};
 
 // Keep one platform HTTPS connection for the voice path on S3. Tool uploads use
 // separate clients so they never hold the grant's connection lock.
-enum class HttpConnection { kOneShot, kVoice };
+enum class HttpConnection { kOneShot, kVoice, kVoiceReuseOnly };
 constexpr int64_t kVoiceIdleUs = 45 * 1000000LL;
+constexpr int kPlatformHttpTimeoutMs = 12000;
+constexpr int kGrantCleanupTimeoutMs = 1200;
 std::mutex s_voice_http_mutex;
 esp_http_client_handle_t s_voice_http = nullptr;
 int64_t s_voice_idle_until = 0;
@@ -176,28 +178,44 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     char url[800];
     const int url_len = snprintf(url, sizeof url, "%s%s", s_base, path);
     if (url_len <= 0 || url_len >= static_cast<int>(sizeof url)) return ESP_ERR_INVALID_SIZE;
+    const bool reuse_only = connection == HttpConnection::kVoiceReuseOnly;
+#if CONFIG_IDF_TARGET_ESP32S3
+    const bool keep_voice = connection != HttpConnection::kOneShot;
+#else
+    const bool keep_voice = false;
+#endif
+    std::unique_lock<std::mutex> voice_lock(s_voice_http_mutex, std::defer_lock);
+    if (keep_voice) {
+        if (reuse_only) {
+            if (!voice_lock.try_lock()) {
+                ESP_LOGI(TAG, "%s: skipped before retry (HTTPS client busy)", operation);
+                return ESP_ERR_TIMEOUT;
+            }
+        } else {
+            voice_lock.lock();
+        }
+        const bool idle = s_voice_http_generation == network_generation && VoiceSocketIdle() &&
+                          esp_http_client_get_state(s_voice_http) == HTTP_STATE_CONNECTED;
+        if (!idle) {
+            if (reuse_only) {
+                ESP_LOGI(TAG, "%s: skipped before retry (no reusable HTTPS connection)", operation);
+                return ESP_ERR_INVALID_STATE;
+            }
+            CloseVoiceHttp();
+        }
+    }
+    if (network_generation != wifi_cloud_network_generation() || !wifi_cloud_requests_allowed()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     auto* buffer = static_cast<char*>(heap_caps_calloc(capacity, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!buffer) buffer = static_cast<char*>(calloc(capacity, 1));
     if (!buffer) return ESP_ERR_NO_MEM;
-#if CONFIG_IDF_TARGET_ESP32S3
-    const bool keep_voice = connection == HttpConnection::kVoice;
-#else
-    const bool keep_voice = false;
-    (void)connection;
-#endif
-    std::unique_lock<std::mutex> voice_lock(s_voice_http_mutex, std::defer_lock);
-    if (keep_voice) voice_lock.lock();
-    if (keep_voice && (s_voice_http_generation != network_generation || !VoiceSocketIdle())) CloseVoiceHttp();
-    if (network_generation != wifi_cloud_network_generation() || !wifi_cloud_requests_allowed()) {
-        free(buffer);
-        return ESP_ERR_INVALID_STATE;
-    }
 
     Response response{buffer, capacity, 0, false};
     esp_http_client_config_t config = {};
     config.url = url;
     config.method = method;
-    config.timeout_ms = 12000;
+    config.timeout_ms = reuse_only ? kGrantCleanupTimeoutMs : kPlatformHttpTimeoutMs;
     config.crt_bundle_attach = esp_crt_bundle_attach;
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_MBEDTLS_SSL_PROTO_TLS1_3
     // Keep the platform control APIs on their existing TLS profile while
@@ -225,6 +243,8 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
         result = esp_http_client_set_url(client, url);
         if (result == ESP_OK) result = esp_http_client_set_method(client, method);
         if (result == ESP_OK) result = esp_http_client_set_user_data(client, &response);
+        // A grant using this same socket restores the normal timeout.
+        if (result == ESP_OK) result = esp_http_client_set_timeout_ms(client, config.timeout_ms);
     }
     if (result == ESP_OK) result = esp_http_client_set_header(client, "X-Device-Auth-Key", device_key);
     if (result == ESP_OK && body) {
@@ -737,13 +757,21 @@ esp_err_t cloud_platform_grant(int agent_id, const char* session_id, bool refres
     return result;
 }
 
-void cloud_platform_end_grant(int agent_id, const char* session_id) {
+void cloud_platform_end_grant(int agent_id, const char* session_id, CloudGrantCleanup cleanup) {
     if (agent_id <= 0 || !SafeId(session_id)) return;
     char path[192];
     snprintf(path, sizeof path, "/api/agents/%d/actions/realtime_voice/realtime-grant/%s",
              agent_id, session_id);
     cJSON* root = nullptr;
+#if CONFIG_IDF_TARGET_ESP32S3
+    // The next grant handles HTTP 409 via refresh if the old reservation survives.
+    const HttpConnection connection = cleanup == CloudGrantCleanup::kBeforeRetry
+                                    ? HttpConnection::kVoiceReuseOnly : HttpConnection::kVoice;
+#else
+    (void)cleanup;
+    const HttpConnection connection = HttpConnection::kVoice;
+#endif
     (void)Exchange("end voice grant", HTTP_METHOD_DELETE, path, nullptr, kSmallBytes, &root,
-                   nullptr, HttpConnection::kVoice);
+                   nullptr, connection);
     cJSON_Delete(root);
 }

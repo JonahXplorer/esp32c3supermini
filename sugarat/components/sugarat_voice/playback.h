@@ -12,3 +12,4 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context);
 void voice_playback_end(void *context);
 void voice_playback_reset(void *context);
 bool voice_playback_echo_guard(void);
+unsigned voice_playback_level(void);

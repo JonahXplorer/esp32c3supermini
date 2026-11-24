@@ -1,2 +1,2 @@
-idf_component_register(SRCS "wake_word.c" "voice.c" "playback.c" "servo_tool.c" INCLUDE_DIRS "."
+idf_component_register(SRCS "wake_word.c" "voice.c" "playback.c" "servo_tool.c" "turn_timing.c" INCLUDE_DIRS "."
                        PRIV_REQUIRES agent_link cjson esp_event esp_timer esp_wifi sugarat_board)

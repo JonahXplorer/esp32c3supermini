@@ -3,7 +3,7 @@
 #include <string.h>
 #include "audio.h"
 #include "esp_afe_sr_models.h"
-#include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_wn_models.h"
 #include "model_path.h"
@@ -13,7 +13,8 @@ static const float JARVIS_THRESHOLD = 0.50f;
 static srmodel_list_t *models;
 static const esp_afe_sr_iface_t *afe;
 static esp_afe_sr_data_t *detector;
-static int16_t *input;
+// The single-mic 16 kHz Jarvis model feeds 512 samples; allow up to 64 ms.
+static EXT_RAM_BSS_ATTR int16_t input[1024];
 static size_t feed_samples;
 static size_t fetch_samples;
 static size_t filled;
@@ -54,26 +55,20 @@ esp_err_t wake_word_init(void)
     }
     const int feed = afe->get_feed_chunksize(detector);
     const int fetch = afe->get_fetch_chunksize(detector);
-    if (feed <= 0 || fetch <= 0 || afe->get_samp_rate(detector) != SUGARAT_SAMPLE_RATE ||
+    if (feed <= 0 || (size_t)feed > sizeof(input) / sizeof(input[0]) ||
+        fetch <= 0 || afe->get_samp_rate(detector) != SUGARAT_SAMPLE_RATE ||
         afe->get_feed_channel_num(detector) != 1 || afe->get_fetch_channel_num(detector) != 1) {
         wake_word_deinit();
         return ESP_ERR_NOT_SUPPORTED;
     }
     feed_samples = feed;
     fetch_samples = fetch;
-    input = heap_caps_malloc(feed_samples * sizeof(*input), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!input) {
-        wake_word_deinit();
-        return ESP_ERR_NO_MEM;
-    }
     ESP_LOGI(TAG, "Jarvis AFE ready (%s, 16 kHz mono, feed %d, fetch %d)", name, feed, fetch);
     return ESP_OK;
 }
 
 void wake_word_deinit(void)
 {
-    heap_caps_free(input);
-    input = NULL;
     if (detector) {
         afe->destroy(detector);
         detector = NULL;

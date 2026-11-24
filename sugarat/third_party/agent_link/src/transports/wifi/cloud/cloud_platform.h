@@ -17,4 +17,6 @@ esp_err_t cloud_platform_grant(int agent_id, const char* session_id, bool refres
                                int64_t* expires_us = nullptr,
                                const agentlink::realtime::AudioFormat* previous_audio = nullptr,
                                int* business_code = nullptr);
-void cloud_platform_end_grant(int agent_id, const char* session_id);
+enum class CloudGrantCleanup { kNormal, kBeforeRetry };
+void cloud_platform_end_grant(int agent_id, const char* session_id,
+                              CloudGrantCleanup cleanup = CloudGrantCleanup::kNormal);
