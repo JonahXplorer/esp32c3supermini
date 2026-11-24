@@ -52,7 +52,7 @@ extern "C" void agent_transport_wifi_set_platform(const agent_platform_t*) {}
 extern "C" void agent_transport_wifi_set_status(void (*)(const agent_link_status_t*)) {}
 extern "C" esp_err_t agent_transport_wifi_forget(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" void agent_transport_wifi_set_audio(void (*)(const uint8_t*, size_t), void (*)(void),
-                                               void (*)(void), void (*)(const char*)) {}
+                                               void (*)(agent_audio_reset_reason_t, uint32_t), void (*)(const char*)) {}
 extern "C" esp_err_t agent_transport_wifi_request_realtime(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" esp_err_t agent_transport_wifi_end_realtime(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" bool agent_transport_wifi_realtime_running(void) { return false; }

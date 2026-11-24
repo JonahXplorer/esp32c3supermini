@@ -3,6 +3,7 @@
 #include "cloud_limits.h"
 #include "cloud_log.h"
 #include "cloud_memory.h"
+#include "cloud_realtime.h"
 #include "wifi_cloud_recovery.h"
 
 #include <cctype>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <mutex>
 
 #include "cJSON.h"
@@ -382,17 +384,28 @@ bool BoundAgent(int id) {
 struct ToolRegistration {
     int agent_id;
     char session_id[80];
-    char name[65];
+    cJSON* names;
     char* json;
 };
 ToolRegistration s_registration{};
 std::mutex s_registration_mutex;
+using ToolJson = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 
-const cJSON* FindTool(const cJSON* tools, const char* name) {
+void ClearToolRegistration() {
+    cJSON_Delete(s_registration.names);
+    cJSON_free(s_registration.json);
+    s_registration = {};
+}
+
+const cJSON* FindTool(const cJSON* tools, const char* name, int* index = nullptr) {
     if (!cJSON_IsArray(tools)) return nullptr;
-    for (const cJSON* item = tools->child; item; item = item->next) {
+    int i = 0;
+    for (const cJSON* item = tools->child; item; item = item->next, ++i) {
         const char* item_name = String(item, "name");
-        if (item_name && strcmp(item_name, name) == 0) return item;
+        if (item_name && strcmp(item_name, name) == 0) {
+            if (index) *index = i;
+            return item;
+        }
     }
     return nullptr;
 }
@@ -457,14 +470,20 @@ esp_err_t PutToolRegistration(const ToolRegistration& registration, const char* 
     const char* returned_id = String(data, "session_id");
     const bool same_session = (!returned_id || strcmp(returned_id, registration.session_id) == 0) &&
         ValidToolTopics(down, up, sn, registration.session_id) && cloud_tools_topics_match(down, up);
-    const cJSON* installed = FindTool(Field(data, "tools"), registration.name);
+    const cJSON* tools = Field(data, "tools");
+    int required = 0, installed = 0;
+    for (const cJSON* name = registration.names->child; name; name = name->next) {
+        ++required;
+        if (FindTool(tools, name->string)) ++installed;
+        else ESP_LOGW(TAG, "voice tool missing from registration: %s", name->string);
+    }
     const bool active = BoundAgent(registration.agent_id) && cJSON_IsTrue(Field(data, "connected"));
     const cJSON* generation = Field(data, "generation");
-    ESP_LOGI(TAG, "%s: agent=%d tool=%s active=%d session_match=%d generation=%d",
-             stage, registration.agent_id, installed ? registration.name : "missing", active, same_session,
+    ESP_LOGI(TAG, "%s: agent=%d tools=%d/%d active=%d session_match=%d generation=%d",
+             stage, registration.agent_id, installed, required, active, same_session,
              cJSON_IsNumber(generation) ? generation->valueint : -1);
     cJSON_Delete(response);
-    return active && same_session && installed ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+    return active && same_session && installed == required ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 bool EncodeCursor(const char* value, char* out, size_t capacity) {
     constexpr char hex[] = "0123456789ABCDEF";
@@ -483,8 +502,7 @@ bool EncodeCursor(const char* value, char* out, size_t capacity) {
 void cloud_platform_drop_tools_on_network_loss() {
     std::lock_guard<std::mutex> guard(s_registration_mutex);
     agent_link_platform_detach_tool();
-    cJSON_free(s_registration.json);
-    s_registration = {};
+    ClearToolRegistration();
 }
 
 extern "C" esp_err_t agent_link_platform_conversations(int agent_id, size_t offset,
@@ -523,7 +541,9 @@ extern "C" esp_err_t agent_link_platform_conversations(int agent_id, size_t offs
             if (*count >= capacity) continue;
             auto& entry = entries[(*count)++];
             Copy(entry.id, sizeof entry.id, id);
-            Copy(entry.name, sizeof entry.name, String(row, "name"));
+            const char* name = String(row, "name");
+            if (!name || !name[0]) name = String(row, "title");
+            Copy(entry.name, sizeof entry.name, name);
             Copy(entry.created_at, sizeof entry.created_at, String(row, "created_at"));
         }
         const bool more = cJSON_IsTrue(Field(data, "has_more"));
@@ -579,6 +599,10 @@ extern "C" esp_err_t agent_link_platform_delete_conversation(int agent_id,
     return result;
 }
 
+extern "C" esp_err_t agent_link_platform_wait_realtime_idle(uint32_t timeout_ms) {
+    return cloud_realtime_wait_idle(timeout_ms);
+}
+
 extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* session_id,
                                                        const char* definition_json) {
     if (agent_id <= 0 || !SafeId(session_id) || !definition_json) return ESP_ERR_INVALID_ARG;
@@ -588,67 +612,61 @@ extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* s
     if (!SafeId(sn)) return ESP_ERR_INVALID_STATE;
     char path[192];
     snprintf(path, sizeof path, "/api/agents/%d/conversations/%s/tools", agent_id, session_id);
-    cJSON* status = nullptr;
-    esp_err_t err = Exchange("get session tools", HTTP_METHOD_GET, path, nullptr, kListBytes, &status, nullptr);
+    cJSON* response = nullptr;
+    esp_err_t err = Exchange("get session tools", HTTP_METHOD_GET, path, nullptr, kListBytes, &response, nullptr);
     if (err != ESP_OK) return err;
-    const cJSON* data = Data(status);
+    ToolJson status{response, cJSON_Delete};
+    const cJSON* data = Data(status.get());
     const bool active = cJSON_IsTrue(Field(data, "connected"));
     const cJSON* current = Field(data, "tools");
-    if (!cJSON_IsArray(current)) {
-        cJSON_Delete(status);
-        return ESP_ERR_INVALID_RESPONSE;
+    if (!cJSON_IsArray(current)) return ESP_ERR_INVALID_RESPONSE;
+
+    ToolJson definitions{cJSON_Parse(definition_json), cJSON_Delete};
+    const cJSON* first = cJSON_IsArray(definitions.get()) ? definitions->child : definitions.get();
+    if (!cJSON_IsObject(first)) return ESP_ERR_INVALID_ARG;
+    ToolJson tools{cJSON_Duplicate(current, true), cJSON_Delete};
+    ToolJson names{cJSON_CreateObject(), cJSON_Delete};
+    if (!tools || !names) return ESP_ERR_NO_MEM;
+    bool matches_existing = false;
+    for (const cJSON* definition = first; definition; definition = definition->next) {
+        const char* name = String(definition, "name");
+        if (!name || !*name || strlen(name) > 64 || !cJSON_IsObject(Field(definition, "parameters")) ||
+            cJSON_HasObjectItem(names.get(), name)) return ESP_ERR_INVALID_ARG;
+        int index = 0;
+        const bool replace = FindTool(current, name, &index) != nullptr;
+        if (definition == first) matches_existing = replace;
+        ToolJson copy{cJSON_Duplicate(definition, true), cJSON_Delete};
+        if (!copy || !cJSON_AddTrueToObject(names.get(), name)) return ESP_ERR_NO_MEM;
+        const bool inserted = replace ? cJSON_ReplaceItemInArray(tools.get(), index, copy.get())
+                                      : cJSON_AddItemToArray(tools.get(), copy.get());
+        if (!inserted) return ESP_ERR_NO_MEM;
+        copy.release();
     }
-    cJSON* definition = cJSON_Parse(definition_json);
-    const char* name = String(definition, "name");
-    if (!name || !*name || strlen(name) >= sizeof(ToolRegistration::name) ||
-        !cJSON_IsObject(Field(definition, "parameters"))) {
-        cJSON_Delete(definition);
-        cJSON_Delete(status);
-        return ESP_ERR_INVALID_ARG;
-    }
-    int index = 0;
-    const cJSON* item = current->child;
-    for (; item; item = item->next, ++index) {
-        const char* item_name = String(item, "name");
-        if (item_name && strcmp(item_name, name) == 0) break;
-    }
-    if (!BoundAgent(agent_id)) {
-        cJSON_Delete(definition);
-        cJSON_Delete(status);
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (active && (!item ||
+    if (!BoundAgent(agent_id)) return ESP_ERR_INVALID_STATE;
+    // Allow an existing device tool channel to add a missing companion tool during a firmware upgrade.
+    if (active && (!matches_existing ||
         !ValidToolTopics(String(data, "down_topic"), String(data, "up_topic"), sn, session_id))) {
         ESP_LOGW(TAG, "existing session tool channel reserved (registered tools=%d, requested tool present=%d)",
-                 cJSON_GetArraySize(current), item != nullptr);
-        cJSON_Delete(definition);
-        cJSON_Delete(status);
+                 cJSON_GetArraySize(current), matches_existing);
         return ESP_ERR_NOT_ALLOWED;
     }
-    ToolRegistration registration{.agent_id = agent_id};
+    ToolRegistration registration{.agent_id = agent_id, .names = names.get()};
     Copy(registration.session_id, sizeof registration.session_id, session_id);
-    Copy(registration.name, sizeof registration.name, name);
-    const bool replace = item != nullptr;
-    cJSON* tools = cJSON_Duplicate(current, true);
-    cJSON_Delete(status);
-    const bool inserted = tools && (replace ? cJSON_ReplaceItemInArray(tools, index, definition)
-                                            : cJSON_AddItemToArray(tools, definition));
-    if (!inserted) cJSON_Delete(definition);
-    cJSON* body = cJSON_CreateObject();
-    const bool owns_tools = inserted && cJSON_AddItemToObject(body, "tools", tools);
-    if (!owns_tools) cJSON_Delete(tools);
-    if (!owns_tools) {
-        cJSON_Delete(body);
-        return ESP_ERR_NO_MEM;
-    }
+    ToolJson body{cJSON_CreateObject(), cJSON_Delete};
+    if (!body || !cJSON_AddItemToObject(body.get(), "tools", tools.get())) return ESP_ERR_NO_MEM;
+    tools.release();
+    definitions.reset();
+    status.reset();
     cJSON* credentials = nullptr;
     const char* mqtt_client_id = nullptr;
     err = FetchToolCredentials(path, &credentials);
     if (err == ESP_OK) err = StartToolClient(credentials, sn, session_id, &mqtt_client_id);
     char* json = nullptr;
-    if (err == ESP_OK && cJSON_AddStringToObject(body, "mqtt_client_id", mqtt_client_id)) json = cJSON_PrintUnformatted(body);
+    if (err == ESP_OK && cJSON_AddStringToObject(body.get(), "mqtt_client_id", mqtt_client_id)) {
+        json = cJSON_PrintUnformatted(body.get());
+    }
     cJSON_Delete(credentials);
-    cJSON_Delete(body);
+    body.reset();
     if (err != ESP_OK) return err;
     if (!json) {
         agent_link_platform_detach_tool();
@@ -658,8 +676,9 @@ extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* s
     registration.json = json;
     err = PutToolRegistration(registration, "mount voice tool");
     if (err == ESP_OK) {
-        cJSON_free(s_registration.json);
+        ClearToolRegistration();
         s_registration = registration;
+        names.release();
         cloud_tools_enable();
     } else {
         cJSON_free(json);

@@ -236,7 +236,7 @@ void agent_transport_wifi_set_conn(void (*cb)(bool connected));
  */
 void agent_transport_wifi_set_stream_recv(void (*cb)(agent_stream_t type, const uint8_t* data, size_t len));
 void agent_transport_wifi_set_audio(void (*pcm)(const uint8_t*, size_t), void (*end)(void),
-                                  void (*reset)(void), void (*text)(const char*));
+                                  void (*reset)(agent_audio_reset_reason_t, uint32_t), void (*text)(const char*));
 esp_err_t agent_transport_wifi_request_realtime(void);
 esp_err_t agent_transport_wifi_end_realtime(void);
 bool agent_transport_wifi_realtime_running(void);

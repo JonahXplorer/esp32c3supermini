@@ -8,6 +8,7 @@
 #include "agent_link_platform.h"
 #include "cJSON.h"
 #include "cloud_clock.h"
+#include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -27,9 +28,9 @@ int64_t s_renew_at_us = 0;
 
 struct RecentReply {
     char request_id[64];
-    char data[384];
+    char data[640];
 };
-RecentReply s_recent[8]{};  // MQTT QoS 1 can redeliver an already executed command.
+EXT_RAM_BSS_ATTR RecentReply s_recent[8]{};  // MQTT QoS 1 can redeliver an already executed command.
 unsigned s_next = 0;
 
 const char* String(const cJSON* item, const char* name) {
@@ -38,8 +39,11 @@ const char* String(const cJSON* item, const char* name) {
 }
 
 void Send(const char* topic, const char* json) {
-    if (esp_mqtt_client_enqueue(s_client, topic, json, static_cast<int>(strlen(json)), 1, 0, true) < 0) {
+    const int id = esp_mqtt_client_enqueue(s_client, topic, json, static_cast<int>(strlen(json)), 1, 0, true);
+    if (id < 0) {
         ESP_LOGW(TAG, "could not queue device tool response");
+    } else {
+        ESP_LOGI(TAG, "device tool response queued (mqtt_id=%d)", id);
     }
 }
 
@@ -126,6 +130,9 @@ void OnEvent(void*, esp_event_base_t, int32_t id, void* data) {
             break;
         case MQTT_EVENT_DISCONNECTED:
             if (s_subscribed.exchange(false)) ESP_LOGW(TAG, "tool MQTT connection lost");
+            break;
+        case MQTT_EVENT_PUBLISHED:
+            ESP_LOGI(TAG, "broker acknowledged device tool response (mqtt_id=%d)", ev->msg_id);
             break;
         case MQTT_EVENT_ERROR:
             if (ev->error_handle && ev->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {

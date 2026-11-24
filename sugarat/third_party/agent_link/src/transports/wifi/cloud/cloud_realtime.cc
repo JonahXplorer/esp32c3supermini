@@ -8,6 +8,7 @@
 #include "realtime_ws_frame.h"
 #include "realtime_ws_stream.h"
 #include "realtime_ws_upgrade.h"
+#include "realtime_voice_trace.h"
 #include "audio_downlink.h"
 #include "agent_link_platform.h"
 #include "cloud_platform.h"
@@ -178,6 +179,9 @@ struct EncodedTx {
     uint16_t bytes;
     uint32_t turn;
     uint8_t data[1275];
+#if CONFIG_IDF_TARGET_ESP32S3
+    int speech = -1;
+#endif
 };
 
 #if AGENT_LINK_STATIC_VOICE_PSRAM
@@ -251,6 +255,8 @@ std::atomic<bool>          s_mute{false};
 std::atomic<bool>          s_continuous{false};
 std::atomic<uint32_t>      s_epoch{0};
 std::atomic<uint32_t>      s_reset{0};
+portMUX_TYPE               s_audio_reset_lock = portMUX_INITIALIZER_UNLOCKED;
+agent_audio_reset_reason_t s_audio_reset_reason = AGENT_AUDIO_RESET_UNKNOWN;
 // Odd while S3 platform microphone input is open. The value also tags queued PCM and Opus.
 std::atomic<uint32_t>      s_capture_turn{0};
 std::mutex                s_mutex;
@@ -262,6 +268,10 @@ agent_stream_t            s_input = AGENT_STREAM_KIND_COUNT;
 cloud_realtime_callbacks_t s_cb = {};
 agent_link_platform_user_transcript_cb_t s_user_transcript = nullptr;
 agent_link_platform_voice_timing_cb_t s_voice_timing = nullptr;
+#if CONFIG_IDF_TARGET_ESP32S3
+agent_link_platform_voice_detector_t s_voice_detector = nullptr;
+agent_link_platform_voice_trace_cb_t s_voice_trace = nullptr;
+#endif
 
 // Diagnostics for the continuous uplink. Only counters and timings are retained.
 std::atomic<uint32_t> s_tx_sent_frames{0};
@@ -281,6 +291,41 @@ uint32_t s_diag_dropped_frames = 0;
 uint32_t s_diag_prev_sent_frames = 0;
 uint32_t s_diag_prev_sent_messages = 0;
 uint32_t s_diag_prev_tx_bytes = 0, s_diag_prev_rx_bytes = 0, s_diag_prev_samples = 0;
+
+#if CONFIG_IDF_TARGET_ESP32S3
+int DetectVoiceFrame(const uint8_t* pcm, size_t bytes) {
+    return s_voice_trace && s_voice_detector && (s_capture_turn.load() & 1)
+        ? s_voice_detector(pcm, bytes) : -1;
+}
+
+void TraceCloudVoice(agent_link_platform_voice_trace_kind_t kind, int64_t at,
+                     const char* event, const char* text = nullptr) {
+    const uint32_t stream = s_capture_turn.load();
+    if (!s_voice_trace || !s_ready || s_mute || !(stream & 1)) return;
+    const agent_link_platform_voice_trace_t trace{
+        .kind = kind, .at_us = at, .stream = stream,
+        .last_frame = s_tx_sent_frames.load(), .event = event, .text = text,
+    };
+    s_voice_trace(&trace);
+}
+
+void TraceCloudControl(const char* event, const cJSON* json, int64_t at) {
+    if (!s_voice_trace || !event[0] || s_mute || !(s_capture_turn.load() & 1)) return;
+    const bool partial = !strcmp(event, "transcript.partial");
+    if (partial || !strcmp(event, "transcript.final")) {
+        const auto* role = cJSON_GetObjectItemCaseSensitive(json, "role");
+        const auto* text = cJSON_GetObjectItemCaseSensitive(json, "text");
+        if (cJSON_IsString(role) && !strcmp(role->valuestring, "user") && cJSON_IsString(text))
+            TraceCloudVoice(partial ? AGENT_LINK_VOICE_TRACE_PARTIAL : AGENT_LINK_VOICE_TRACE_FINAL,
+                            at, event, text->valuestring);
+    } else if (!strcmp(event, "response.started")) {
+        TraceCloudVoice(AGENT_LINK_VOICE_TRACE_RESPONSE_START, at, event);
+    } else if (strncmp(event, "response.", 9) && strncmp(event, "session.", 8) &&
+               strncmp(event, "task.", 5) && strcmp(event, "error")) {
+        TraceCloudVoice(agentlink::realtime::CloudVoiceEvent(event, json), at, event);
+    }
+}
+#endif
 
 void SetWorkerPhase(uint32_t phase) {
     s_worker_phase_since_ms.store(static_cast<uint32_t>(esp_timer_get_time() / 1000));
@@ -639,6 +684,7 @@ struct WsSender {
     uint32_t receive_at_first_wait = 0;
     int64_t first_wait_at = 0;
 #if CONFIG_IDF_TARGET_ESP32S3
+    agentlink::realtime::VoiceFrameCounts voice_counts;
     int64_t last_data_received_ms = 0;
     int64_t last_pump_at = 0;
     bool wait_extension_logged = false;
@@ -851,6 +897,18 @@ bool PumpWire(WsSender& sender) {
             s_tx_write_calls.fetch_add(1);
             s_tx_send_ms.fetch_add(elapsed);
             if (elapsed > s_tx_send_max_ms.load()) s_tx_send_max_ms.store(elapsed);
+#if CONFIG_IDF_TARGET_ESP32S3
+            if (s_voice_trace && (sender.audio_turn & 1)) {
+                const agent_link_platform_voice_trace_t trace{
+                    .kind = AGENT_LINK_VOICE_TRACE_UPLINK, .at_us = finished_us, .stream = sender.audio_turn,
+                    .last_frame = previously_sent + sender.audio_frames, .frames = sender.audio_frames,
+                    .classified_frames = sender.voice_counts.classified, .speech_frames = sender.voice_counts.speech,
+                };
+                // Serial logging must not hold up microphone queue writes.
+                if (capture_lock.owns_lock()) capture_lock.unlock();
+                s_voice_trace(&trace);
+            }
+#endif
         }
         sender.audio_frames = sender.audio_messages = 0;
         sender.audio_bytes = 0;
@@ -940,15 +998,42 @@ bool Send(WsSender& ws, const char* json) {
     });
 }
 
-bool IsInterruption(const uint8_t* data, size_t bytes) {
+uint32_t AdvanceAudioReset(agent_audio_reset_reason_t reason) {
+    portENTER_CRITICAL(&s_audio_reset_lock);
+    s_audio_reset_reason = reason;
+    const uint32_t seq = s_reset.fetch_add(1) + 1;
+    portEXIT_CRITICAL(&s_audio_reset_lock);
+    return seq;
+}
+
+void CheckResponseInterruption(const uint8_t* data, size_t bytes, [[maybe_unused]] int64_t received_at,
+                               [[maybe_unused]] const char* connect_token) {
     constexpr char event_name[] = "response.interrupted";
-    if (std::search(data, data + bytes, event_name, event_name + sizeof event_name - 1) == data + bytes)
-        return false;
+    if (std::search(data, data + bytes, event_name, event_name + sizeof event_name - 1) == data + bytes) return;
     cJSON* json = cJSON_ParseWithLength(reinterpret_cast<const char*>(data), bytes);
-    const cJSON* type = cJSON_GetObjectItemCaseSensitive(json, "type");
+    const auto* type = cJSON_GetObjectItemCaseSensitive(json, "type");
     const bool interrupted = cJSON_IsString(type) && strcmp(type->valuestring, event_name) == 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+    char reason[96]{};
+    if (interrupted && s_voice_trace) {
+        const auto* field = agentlink::realtime::EndField(json, "reason", "cause");
+        agentlink::realtime::SafeEndField(reason, sizeof reason, cJSON_IsString(field) ? field->valuestring : nullptr,
+                                         cloud_cred_auth_key(), connect_token);
+    }
+#endif
     cJSON_Delete(json);
-    return interrupted;
+    if (!interrupted) return;
+    [[maybe_unused]] const uint32_t seq = AdvanceAudioReset(AGENT_AUDIO_RESET_REMOTE_INTERRUPT);
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (s_voice_trace) {
+        const agent_link_platform_voice_trace_t trace{
+            .kind = AGENT_LINK_VOICE_TRACE_RESPONSE_INTERRUPTED, .at_us = received_at,
+            .stream = s_capture_turn.load(), .last_frame = s_tx_sent_frames.load(),
+            .event = event_name, .text = reason, .reset_seq = seq,
+        };
+        s_voice_trace(&trace);
+    }
+#endif
 }
 
 void ResetInputLocked() {
@@ -1317,8 +1402,11 @@ public:
             if (!EndReply()) running_.store(false);
         } else ResetDecoder();
         play_due_ = 0;
+        portENTER_CRITICAL(&s_audio_reset_lock);
         reset_ = s_reset.load();
-        if (s_cb.audio_reset) s_cb.audio_reset();
+        const auto reason = s_audio_reset_reason;
+        portEXIT_CRITICAL(&s_audio_reset_lock);
+        if (s_cb.audio_reset) s_cb.audio_reset(reason, reset_);
     }
 
     void Pcm(const uint8_t* data, size_t bytes) {
@@ -1375,9 +1463,12 @@ public:
     bool Audio(uint8_t* data, size_t bytes) {
         if (!s_ready || s_mute || !bytes) return true;
         const int64_t now = received_at_;
-        if (s_voice_timing && !first_audio_reported_) {
+        if (!first_audio_reported_) {
             first_audio_reported_ = true;
-            s_voice_timing(AGENT_LINK_VOICE_FIRST_AUDIO, now);
+            if (s_voice_timing) s_voice_timing(AGENT_LINK_VOICE_FIRST_AUDIO, now);
+#if CONFIG_IDF_TARGET_ESP32S3
+            TraceCloudVoice(AGENT_LINK_VOICE_TRACE_FIRST_AUDIO, now, "response.audio.delta");
+#endif
         }
         if (last_audio_) {
             const int64_t gap_us = now - last_audio_;
@@ -1442,6 +1533,9 @@ public:
         if (!json) return false;
         const cJSON* type = cJSON_GetObjectItemCaseSensitive(json, "type");
         const char* event = cJSON_IsString(type) ? type->valuestring : "";
+#if CONFIG_IDF_TARGET_ESP32S3
+        TraceCloudControl(event, json, received_at_);
+#endif
         bool keep = true;
         if (strcmp(event, "session.ready") == 0) {
             if (conversation_id_ && conversation_id_[0]) {
@@ -1654,6 +1748,7 @@ public:
             if (encoded_packet_.kind == TxKind::kPcm) {
                 size_t wire_bytes = 0, json_bytes = 0;
                 unsigned frames = 0;
+                agentlink::realtime::VoiceFrameCounts voice_counts;
                 const unsigned limit = continuous_ ? kOpusBatchFrames : 1;
                 while (frames < limit && Current(epoch_) &&
                        xQueuePeek(encoded_queue_, &encoded_packet_, 0) == pdTRUE &&
@@ -1666,13 +1761,16 @@ public:
                         break;  // Leave the next complete packet queued.
                     }
                     if (xQueueReceive(encoded_queue_, &encoded_packet_, 0) != pdTRUE) return false;
+#if CONFIG_IDF_TARGET_ESP32S3
+                    voice_counts.Add(encoded_packet_.speech);
+#endif
                     s_encoded_pending.fetch_sub(1);
                     wire_bytes += added;
                     json_bytes += json_size;
                     ++frames;
                 }
                 batch_gate_.Reset();
-                return !Current(epoch_) || WriteAudio(ws, wire_bytes, json_bytes, frames, frames);
+                return !Current(epoch_) || WriteAudio(ws, wire_bytes, json_bytes, frames, frames, voice_counts);
             }
             if (xQueueReceive(encoded_queue_, &encoded_packet_, 0) != pdTRUE) return true;
             s_encoded_pending.fetch_sub(1);
@@ -1698,18 +1796,25 @@ public:
             if (packet.kind == TxKind::kPcm) {
                 size_t pcm_bytes = packet.bytes;
                 unsigned pcm_packets = 1;
+                agentlink::realtime::VoiceFrameCounts voice_counts;
+#if CONFIG_IDF_TARGET_ESP32S3
+                voice_counts.Add(DetectVoiceFrame(packet.data, packet.bytes));
+#endif
                 memcpy(scratch->pcm, packet.data, pcm_bytes);
                 if (continuous_) {
                     Tx next;
                     while (pcm_packets < kUplinkBatchPackets && Current(epoch_) &&
                            xQueuePeek(s_tx, &next, 0) == pdTRUE && next.kind == TxKind::kPcm) {
                         if (xQueueReceive(s_tx, &next, 0) != pdTRUE) break;
+#if CONFIG_IDF_TARGET_ESP32S3
+                        voice_counts.Add(DetectVoiceFrame(next.data, next.bytes));
+#endif
                         memcpy(scratch->pcm + pcm_bytes, next.data, next.bytes);
                         pcm_bytes += next.bytes;
                         ++pcm_packets;
                     }
                 }
-                if (!SendAudio(ws, scratch, scratch->pcm, pcm_bytes, pcm_packets)) return false;
+                if (!SendAudio(ws, scratch, scratch->pcm, pcm_bytes, pcm_packets, voice_counts)) return false;
             } else {
                 if (!Send(ws, packet.kind == TxKind::kStart
                         ? "{\"type\":\"input_audio.activity\",\"kind\":\"start\"}"
@@ -1817,19 +1922,22 @@ private:
     }
 
     bool SendAudio(WsSender& ws, TxScratch* scratch, const uint8_t* data,
-                   size_t bytes, unsigned pcm_packets) {
+                   size_t bytes, unsigned pcm_packets, agentlink::realtime::VoiceFrameCounts voice_counts) {
         const size_t json_size = AudioJson(scratch, data, bytes);
         if (!json_size) return false;
         const size_t wire_size = AppendFrame(ws, 0, scratch->json, json_size);
-        return wire_size && WriteAudio(ws, wire_size, json_size, pcm_packets, 1);
+        return wire_size && WriteAudio(ws, wire_size, json_size, pcm_packets, 1, voice_counts);
     }
 
     bool WriteAudio(WsSender& ws, size_t wire_bytes, size_t json_bytes,
-                    unsigned pcm_packets, unsigned messages) {
+                    unsigned pcm_packets, unsigned messages, [[maybe_unused]] agentlink::realtime::VoiceFrameCounts voice_counts) {
 #if AGENT_LINK_NATIVE_WSS
         if (!WriteWire(ws, wire_bytes)) { transport_failed_ = true; return false; }
         ws.audio_frames = pcm_packets; ws.audio_messages = messages; ws.audio_bytes = json_bytes;
         ws.audio_turn = CanPauseInput() ? s_capture_turn.load() : 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+        ws.voice_counts = voice_counts;
+#endif
         return true;
 #else
         SetWorkerPhase(1);
@@ -1940,6 +2048,9 @@ private:
     }
 
     bool Encode(const uint8_t* pcm, EncodedTx* packet) {
+#if CONFIG_IDF_TARGET_ESP32S3
+        packet->speech = DetectVoiceFrame(pcm, kMicBytes);
+#endif
         if (SharedCodec() && replying_) {
             // Preserve endpointing cadence while the application is half-duplex.
             // Reusing a valid encoded silence packet needs no live encoder state.
@@ -2397,7 +2508,8 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             const auto result = assembler.Append(opcode, first, end, fin, payload, count);
             if (result == agentlink::realtime::Message::kError) return false;
             if (result == agentlink::realtime::Message::kComplete) {
-                if (assembler.Opcode() == 1 && IsInterruption(message.Data(), assembler.Size())) s_reset.fetch_add(1);
+                if (assembler.Opcode() == 1)
+                    CheckResponseInterruption(message.Data(), assembler.Size(), last_rx, grant.token);
                 pending_at = last_rx;
 #if CONFIG_IDF_TARGET_ESP32S3
                 sender.last_data_received_ms = pending_at / 1000;
@@ -2709,8 +2821,8 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                     if (result == agentlink::realtime::Message::kComplete) {
                         call.RecordWsMessage();
                         // Cancel queued speech before an interruption waits behind paced audio.
-                        if (assembler.Opcode() == WS_TRANSPORT_OPCODES_TEXT && IsInterruption(message.Data(), assembler.Size()))
-                            s_reset.fetch_add(1);
+                        if (assembler.Opcode() == WS_TRANSPORT_OPCODES_TEXT)
+                            CheckResponseInterruption(message.Data(), assembler.Size(), esp_timer_get_time(), grant.token);
                         pending = true;
                         pending_at = esp_timer_get_time();
                         pending_reset = s_reset.load();
@@ -2884,7 +2996,11 @@ void Worker(void*) {
             if (granted && Current(grant.epoch)) retryable = ConnectOnce(grant, recovery);
             s_ready.store(false);
             ResetInput();
-            if (s_cb.audio_reset) s_cb.audio_reset();
+            if (s_cb.audio_reset) {
+                const auto reason = !Current(grant.epoch) ? AGENT_AUDIO_RESET_CONNECTION_CANCELLED :
+                                    retryable ? AGENT_AUDIO_RESET_CONNECTION_LOST : AGENT_AUDIO_RESET_CONNECTION_ENDED;
+                s_cb.audio_reset(reason, 0);
+            }
             // Notify applications before cleanup/backoff so the mic stops while offline.
             const bool retry = grant.platform && retryable && recovery.CanRetry() && Current(grant.epoch);
             SetRecovering(grant.epoch, retry);
@@ -3133,6 +3249,14 @@ extern "C" void agent_link_platform_set_voice_timing_callback(agent_link_platfor
     s_voice_timing = callback;
 }
 
+extern "C" void agent_link_platform_set_voice_trace([[maybe_unused]] agent_link_platform_voice_detector_t detector,
+                                                     [[maybe_unused]] agent_link_platform_voice_trace_cb_t callback) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    s_voice_detector = detector;
+    s_voice_trace = callback;
+#endif
+}
+
 bool cloud_realtime_ready(void) { return s_ready.load(); }
 bool cloud_realtime_recovering(void) { return s_recovering.load(); }
 
@@ -3194,7 +3318,7 @@ esp_err_t cloud_realtime_stream_start(agent_stream_t type) {
         return ESP_OK;
     }
     if (uxQueueSpacesAvailable(s_tx) < 3) return ESP_ERR_NO_MEM;
-    const uint32_t turn = s_reset.fetch_add(1) + 1;
+    const uint32_t turn = AdvanceAudioReset(AGENT_AUDIO_RESET_INPUT_START);
     const Tx start = {TxKind::kStart, 0, turn, {}};
     if (xQueueSend(s_tx, &start, 0) != pdTRUE) return ESP_ERR_NO_MEM;
     s_input = type;
@@ -3241,7 +3365,7 @@ esp_err_t cloud_realtime_stream_end(agent_stream_t type, bool complete) {
     if (s_continuous) {
         s_mute.store(true);
         ResetInputLocked();
-        s_reset.fetch_add(1);
+        AdvanceAudioReset(AGENT_AUDIO_RESET_INPUT_CLOSED);
         ESP_LOGI(TAG, "Resident voice microphone: off; audio_frames=%u",
                  static_cast<unsigned>(s_tx_sent_frames.load()));
         return ESP_OK;

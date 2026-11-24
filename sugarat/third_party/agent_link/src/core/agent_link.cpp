@@ -783,8 +783,10 @@ void OnTransportAudioEnd() {
     if (s_have_out && s_out.on_audio_end) s_out.on_audio_end(s_out.ctx);
 }
 
-void OnTransportAudioReset() {
-    if (s_have_out && s_out.on_audio_reset) s_out.on_audio_reset(s_out.ctx);
+void OnTransportAudioReset(agent_audio_reset_reason_t reason, uint32_t reset_seq) {
+    if (!s_have_out) return;
+    if (s_out.on_audio_reset_with_reason) s_out.on_audio_reset_with_reason(reason, reset_seq, s_out.ctx);
+    else if (s_out.on_audio_reset) s_out.on_audio_reset(s_out.ctx);
 }
 
 void OnTransportText(const char* utf8) {

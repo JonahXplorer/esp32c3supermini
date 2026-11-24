@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "agent_link.h"
 #include "agent_link_stream.h"
 
 #ifdef __cplusplus
@@ -18,7 +19,7 @@ typedef struct {
     void (*pcm)(const uint8_t* data, size_t bytes);
     void (*text)(const char* utf8);
     void (*audio_end)(void);
-    void (*audio_reset)(void);
+    void (*audio_reset)(agent_audio_reset_reason_t reason, uint32_t reset_seq);
     void (*finished)(void);
 } cloud_realtime_callbacks_t;
 

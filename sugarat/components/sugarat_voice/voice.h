@@ -18,6 +18,7 @@ typedef enum {
     SUGARAT_VOICE_ENDING,
     SUGARAT_VOICE_ERROR,
     SUGARAT_VOICE_RETRY,
+    SUGARAT_VOICE_NO_SESSION,
 } sugarat_voice_phase_t;
 
 typedef struct {
@@ -26,6 +27,8 @@ typedef struct {
     bool can_end;
     bool speaking;
     uint8_t level;
+    int agent_id;
+    char conversation_id[80];
 } sugarat_voice_view_t;
 
 esp_err_t sugarat_voice_start(void);

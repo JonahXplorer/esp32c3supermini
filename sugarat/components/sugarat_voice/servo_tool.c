@@ -15,15 +15,24 @@
 enum { ACK_TIMEOUT_MS = 5500, TOOL_WINDOW_MS = 15000, MAX_RECENT_COMMANDS = 16 };
 
 static const char *TAG = "servo_tool";
-static const char *ACTION = "set_servo_power";
-static const char DEFINITION[] =
-    "{\"name\":\"set_servo_power\","
-    "\"description\":\"控制 Sugarat 上由两只舵机联动的开合机构。舵机、面具、面罩都指同一个机构。"
-    "用户要求开、打开、开启或掀开时调用本工具，传 power=true 到 B 点。要求关、关闭、关上或合上时传 power=false 到 A 点。"
-    "例如打开面罩、关闭面具、把面具掀开、把面罩合上。仅在用户明确要求实际开合时调用。"
-    "收到工具成功回执后再确认，moving=true 表示仍在转动。\","
+#define SET_POWER "set_servo_power"
+#define GET_STATUS "get_servo_status"
+static const char DEFINITIONS[] =
+    "[{\"name\":\"" SET_POWER "\","
+    "\"description\":\"控制用户现实中的钢铁侠面罩。面罩、面具、脸甲、头盔面板、舵机、visor 和 faceplate 指同一个开合机构。"
+    "用户明确要求实际开合时调用。打开、掀开、升起、抬起对应 power=true，目标 B 点。关上、合上、放下、降下对应 power=false，目标 A 点。"
+    "例如把脸甲抬起来、能帮我把面罩放下来吗。上一句明确在说面罩时，打开它和合上也可执行。"
+    "闲聊、引用、否定、询问如何操作或仅问状态时不调用。对象或方向不清时先问一句。"
+    "等 C3 工具回执再汇报。executed=true 且 moving=true 时说正在打开或关闭。要确认到位、用户说没动或开合失败时，调用 " GET_STATUS "，不要自行重发开合。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"power\":{\"type\":\"boolean\","
-    "\"description\":\"true 打开舵机、面具或面罩到 B 点，false 关闭到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15}";
+    "\"description\":\"布尔值。true 抬起并打开面罩到 B 点，false 放下并关闭面罩到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15},"
+    "{\"name\":\"" GET_STATUS "\","
+    "\"description\":\"只读查询用户的钢铁侠面罩、面具、脸甲、头盔面板或舵机。用户问现在开着吗、关好了没、到位了吗、刚才为什么没动或 MQTT 指令有没有发到设备时调用。"
+    "实时询问 C3，不改变位置。state 为 open=已到 B、closed=已到 A、opening=去 B、closing=去 A、unknown=未收到 C3 状态。"
+    "last_command 是设备最近一次语音开合，age_ms 表示距今多久。mqtt_received 表示 MQTT 开合请求已送达 Sugarat。"
+    "esp_now_queued 表示已交给无线驱动，c3_ack 表示 C3 已回执。mqtt_received=false 只能说明设备没看到该开合的 MQTT 请求。"
+    "C3 的状态来自舵机控制输出。无回执就如实说明无法确认，禁止凭历史记录声称已经到位。\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false},\"timeout\":15}]";
 
 typedef enum { SOURCE_TRANSCRIPT = 1, SOURCE_MQTT = 2 } command_source_t;
 
@@ -34,13 +43,15 @@ typedef struct {
     uint8_t sources;
     bool dispatched;
     bool complete;
-    esp_err_t error;
-    bool moving;
+    bool esp_now_queued;
+    bool c3_ack;
+    servo_tool_state_t state;
 } servo_command_t;
 
 static StaticSemaphore_t completion_control;
 static SemaphoreHandle_t completion;
 static servo_command_t commands[MAX_RECENT_COMMANDS];
+static servo_command_t last_action;
 static uint32_t sequence;
 static uint32_t call;
 static portMUX_TYPE command_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -104,7 +115,8 @@ static const char *source_name(command_source_t source)
 
 // The two transports do not carry a shared utterance ID. Merge opposite
 // sources by target within the same call and platform tool timeout.
-static esp_err_t request_position(uint8_t position, command_source_t source, servo_tool_request_t *request)
+static esp_err_t request_command(servo_tool_operation_t operation, uint8_t position, command_source_t source,
+                                 servo_tool_request_t *request)
 {
     const int64_t now = esp_timer_get_time();
     servo_command_t *match = NULL, *latest = NULL, *free_slot = NULL;
@@ -119,7 +131,8 @@ static esp_err_t request_position(uint8_t position, command_source_t source, ser
             if (!free_slot) free_slot = entry;
             continue;
         }
-        if (entry->call != call || entry->match_until_us <= now) continue;
+        if (operation != SERVO_TOOL_SET_POSITION || entry->request.operation != SERVO_TOOL_SET_POSITION ||
+            entry->call != call || entry->match_until_us <= now) continue;
         if (!latest || entry->request.id > latest->request.id) latest = entry;
         const bool other_source = source == SOURCE_TRANSCRIPT ? entry->sources == SOURCE_MQTT
                                                                : (entry->sources & SOURCE_TRANSCRIPT) != 0;
@@ -134,21 +147,28 @@ static esp_err_t request_position(uint8_t position, command_source_t source, ser
     if (match) {
         match->sources |= source;
         *request = match->request;
+        if (last_action.request.id == request->id) last_action = *match;
     } else if (free_slot) {
         *free_slot = (servo_command_t){
-            .request = {.id = ++sequence, .deadline_us = now + ACK_TIMEOUT_MS * 1000, .position = position},
+            .request = {.id = ++sequence, .deadline_us = now + ACK_TIMEOUT_MS * 1000,
+                        .operation = operation, .position = position},
             .match_until_us = now + TOOL_WINDOW_MS * 1000,
             .call = call,
             .sources = source,
         };
         *request = free_slot->request;
+        if (operation == SERVO_TOOL_SET_POSITION) last_action = *free_slot;
     }
     portEXIT_CRITICAL(&command_lock);
     if (!match && !free_slot) return ESP_ERR_NO_MEM;
 
-    ESP_LOGI(TAG, "Voice target %c %s (source=%s, id=%lu)", 'A' + position,
-             match ? "joined existing ESP-NOW command" : "queued for ESP-NOW", source_name(source),
-             (unsigned long)request->id);
+    if (operation == SERVO_TOOL_GET_STATUS) {
+        ESP_LOGI(TAG, "C3 state query requested via MQTT (id=%lu)", (unsigned long)request->id);
+    } else {
+        ESP_LOGI(TAG, "Voice target %c %s (source=%s, id=%lu)", 'A' + position,
+                 match ? "joined existing ESP-NOW command" : "queued for ESP-NOW", source_name(source),
+                 (unsigned long)request->id);
+    }
     return ESP_OK;
 }
 
@@ -163,7 +183,7 @@ static void on_user_transcript(const char *text)
     }
 
     servo_tool_request_t request;
-    const esp_err_t err = request_position(open ? 1 : 0, SOURCE_TRANSCRIPT, &request);
+    const esp_err_t err = request_command(SERVO_TOOL_SET_POSITION, open ? 1 : 0, SOURCE_TRANSCRIPT, &request);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "Transcript servo command rejected: %s", esp_err_to_name(err));
     }
@@ -185,52 +205,106 @@ static servo_command_t *find_command(uint32_t id)
     return NULL;
 }
 
-static esp_err_t await_confirmation(const servo_tool_request_t *request, bool *moving)
+static servo_command_t await_confirmation(const servo_tool_request_t *request)
 {
     for (;;) {
-        esp_err_t error = ESP_ERR_TIMEOUT;
         portENTER_CRITICAL(&command_lock);
         const servo_command_t *entry = find_command(request->id);
-        const bool done = entry && entry->complete;
-        if (done) {
-            error = entry->error;
-            *moving = entry->moving;
-        }
+        const servo_command_t status = entry ? *entry : (servo_command_t){.request = *request};
         portEXIT_CRITICAL(&command_lock);
         const int64_t remaining_us = request->deadline_us - esp_timer_get_time();
-        if (done || !entry || remaining_us <= 0) return error;
+        if (status.complete || !entry || remaining_us <= 0) return status;
         const TickType_t ticks = pdMS_TO_TICKS((remaining_us + 999) / 1000);
         (void)xSemaphoreTake(completion, ticks ? ticks : 1);
     }
 }
 
-static esp_err_t set_power(const char *action, const cJSON *params, cJSON *result, void *context)
+static const char *position_name(uint8_t position)
 {
-    (void)context;
-    if (strcmp(action, ACTION) != 0) return ESP_ERR_NOT_SUPPORTED;
+    return position ? "B" : "A";
+}
+
+static void add_delivery(cJSON *result, const servo_command_t *command)
+{
+    cJSON_AddNumberToObject(result, "command_id", command->request.id);
+    cJSON_AddBoolToObject(result, "mqtt_received", (command->sources & SOURCE_MQTT) != 0);
+    cJSON_AddBoolToObject(result, "esp_now_queued", command->esp_now_queued);
+    cJSON_AddBoolToObject(result, "c3_ack", command->c3_ack);
+}
+
+static esp_err_t set_power(const cJSON *params, cJSON *result)
+{
     const cJSON *power = cJSON_GetObjectItemCaseSensitive(params, "power");
     if (!cJSON_IsBool(power)) return ESP_ERR_INVALID_ARG;
     const bool enabled = cJSON_IsTrue(power);
     servo_tool_request_t request;
-    esp_err_t err = request_position(enabled ? 1 : 0, SOURCE_MQTT, &request);
+    const esp_err_t err = request_command(SERVO_TOOL_SET_POSITION, enabled ? 1 : 0, SOURCE_MQTT, &request);
     if (err != ESP_OK) return err;
 
-    bool moving = false;
-    err = await_confirmation(&request, &moving);
-    if (err == ESP_OK) {
-        cJSON_AddBoolToObject(result, "executed", true);
+    const servo_command_t command = await_confirmation(&request);
+    const bool executed = command.c3_ack && command.state.target == request.position;
+    add_delivery(result, &command);
+    cJSON_AddBoolToObject(result, "executed", executed);
+    if (executed) {
         cJSON_AddBoolToObject(result, "power", enabled);
-        cJSON_AddStringToObject(result, "position", enabled ? "B" : "A");
-        cJSON_AddBoolToObject(result, "moving", moving);
+        cJSON_AddStringToObject(result, "position", position_name(command.state.target));
+        cJSON_AddBoolToObject(result, "moving", command.state.moving);
     }
-    return err;
+    if (!command.c3_ack) return ESP_ERR_TIMEOUT;
+    return executed ? ESP_OK : ESP_FAIL;
+}
+
+static const char *delivery_status(const servo_command_t *command, int64_t now)
+{
+    if (command->c3_ack) return command->state.target == command->request.position ? "confirmed" : "target_mismatch";
+    if (!command->complete && now < command->request.deadline_us) return "pending";
+    return command->esp_now_queued ? "no_c3_ack" : "esp_now_not_queued";
+}
+
+static esp_err_t get_status(cJSON *result)
+{
+    servo_tool_request_t request;
+    const esp_err_t err = request_command(SERVO_TOOL_GET_STATUS, 0, SOURCE_MQTT, &request);
+    if (err != ESP_OK) return err;
+    const servo_command_t query = await_confirmation(&request);
+    add_delivery(result, &query);
+    const char *state = "unknown";
+    if (query.c3_ack) {
+        static const char *const states[2][2] = {{"closed", "closing"}, {"open", "opening"}};
+        state = states[query.state.target][query.state.moving];
+        cJSON_AddStringToObject(result, "target_position", position_name(query.state.target));
+        cJSON_AddBoolToObject(result, "moving", query.state.moving);
+    }
+    cJSON_AddStringToObject(result, "state", state);
+
+    portENTER_CRITICAL(&command_lock);
+    const servo_command_t last = last_action;
+    portEXIT_CRITICAL(&command_lock);
+    if (last.request.id) {
+        cJSON *command = cJSON_AddObjectToObject(result, "last_command");
+        if (!command) return ESP_ERR_NO_MEM;
+        const int64_t now = esp_timer_get_time();
+        add_delivery(command, &last);
+        cJSON_AddStringToObject(command, "target_position", position_name(last.request.position));
+        cJSON_AddStringToObject(command, "status", delivery_status(&last, now));
+        cJSON_AddNumberToObject(command, "age_ms", (now - last.request.deadline_us) / 1000 + ACK_TIMEOUT_MS);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t handle_tool(const char *action, const cJSON *params, cJSON *result, void *context)
+{
+    (void)context;
+    if (strcmp(action, SET_POWER) == 0) return set_power(params, result);
+    if (strcmp(action, GET_STATUS) == 0) return get_status(result);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t servo_tool_init(void)
 {
     completion = xSemaphoreCreateBinaryStatic(&completion_control);
     if (!completion) return ESP_ERR_NO_MEM;
-    agent_link_platform_set_tool_callback(set_power, NULL);
+    agent_link_platform_set_tool_callback(handle_tool, NULL);
     agent_link_platform_set_user_transcript_callback(on_user_transcript);
     return ESP_OK;
 }
@@ -238,8 +312,8 @@ esp_err_t servo_tool_init(void)
 esp_err_t servo_tool_attach(int agent_id, const char *session_id)
 {
     if (!completion) return ESP_ERR_INVALID_STATE;
-    const esp_err_t err = agent_link_platform_attach_tool(agent_id, session_id, DEFINITION);
-    ESP_LOGI(TAG, "Session power tool: %s", esp_err_to_name(err));
+    const esp_err_t err = agent_link_platform_attach_tool(agent_id, session_id, DEFINITIONS);
+    ESP_LOGI(TAG, "Session servo tools: %s", esp_err_to_name(err));
     return err;
 }
 
@@ -262,25 +336,41 @@ bool servo_tool_receive(servo_tool_request_t *request)
     return next != NULL;
 }
 
-void servo_tool_complete(const servo_tool_request_t *request, esp_err_t error, bool moving)
+void servo_tool_radio_queued(const servo_tool_request_t *request)
+{
+    portENTER_CRITICAL(&command_lock);
+    servo_command_t *entry = find_command(request->id);
+    if (entry && !entry->esp_now_queued) {
+        entry->esp_now_queued = true;
+        if (last_action.request.id == request->id) last_action = *entry;
+    }
+    portEXIT_CRITICAL(&command_lock);
+}
+
+void servo_tool_complete(const servo_tool_request_t *request, const servo_tool_state_t *state)
 {
     portENTER_CRITICAL(&command_lock);
     servo_command_t *entry = find_command(request->id);
     const bool notify = entry && !entry->complete;
     if (notify) {
-        entry->error = error;
-        entry->moving = moving;
+        if (state) {
+            entry->c3_ack = true;
+            entry->state = *state;
+        }
         entry->complete = true;
+        if (last_action.request.id == request->id) last_action = *entry;
     }
     portEXIT_CRITICAL(&command_lock);
     if (!notify) return;
 
     xSemaphoreGive(completion);
-    if (error == ESP_OK) {
-        ESP_LOGI(TAG, "C3 confirmed voice target %c (id=%lu, moving=%u)",
-                 'A' + request->position, (unsigned long)request->id, (unsigned)moving);
+    if (!state) {
+        ESP_LOGW(TAG, "No C3 reply for voice %s (id=%lu)",
+                 request->operation == SERVO_TOOL_GET_STATUS ? "state query" : "position command",
+                 (unsigned long)request->id);
     } else {
-        ESP_LOGW(TAG, "ESP-NOW voice target %c failed (id=%lu): %s",
-                 'A' + request->position, (unsigned long)request->id, esp_err_to_name(error));
+        ESP_LOGI(TAG, "C3 voice %s reply (id=%lu, target=%c, moving=%u)",
+                 request->operation == SERVO_TOOL_GET_STATUS ? "state query" : "position command",
+                 (unsigned long)request->id, 'A' + state->target, (unsigned)state->moving);
     }
 }

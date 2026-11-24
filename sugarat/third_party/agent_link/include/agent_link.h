@@ -41,6 +41,16 @@ typedef struct {
 esp_err_t agent_link_command_reply(const agent_command_request_t* request, uint16_t error,
                                    const uint8_t* data, size_t len);
 
+typedef enum {
+    AGENT_AUDIO_RESET_UNKNOWN,
+    AGENT_AUDIO_RESET_REMOTE_INTERRUPT,
+    AGENT_AUDIO_RESET_INPUT_START,
+    AGENT_AUDIO_RESET_INPUT_CLOSED,
+    AGENT_AUDIO_RESET_CONNECTION_LOST,
+    AGENT_AUDIO_RESET_CONNECTION_ENDED,
+    AGENT_AUDIO_RESET_CONNECTION_CANCELLED,
+} agent_audio_reset_reason_t;
+
 /**
  * @brief Agent → Device output callbacks
  *
@@ -155,6 +165,12 @@ typedef struct {
      */
     bool (*on_command_request)(const agent_command_request_t* request,
                                const uint8_t* payload, size_t len, void* ctx);
+
+    /** Optional Wi-Fi audio reset callback with origin, used in place of on_audio_reset.
+     * reset_seq correlates a media interruption with its playback reset. It is zero for
+     * connection-wide resets that are not tied to a media generation.
+     */
+    void (*on_audio_reset_with_reason)(agent_audio_reset_reason_t reason, uint32_t reset_seq, void* ctx);
 } agent_output_cb_t;
 
 /**

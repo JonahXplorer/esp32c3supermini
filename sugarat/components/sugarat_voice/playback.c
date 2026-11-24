@@ -13,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "turn_timing.h"
+#include "voice_trace.h"
 
 enum {
     PLAYBACK_FRAMES = 132,
@@ -74,6 +75,12 @@ typedef struct {
     unsigned generation;
 } playback_report_t;
 
+typedef struct {
+    uint32_t enqueued_samples;
+    uint32_t processed_samples;
+    unsigned last_i2s_reply;
+} playback_queue_stats_t;
+
 static const char *TAG = "jarvis_speaker";
 static QueueHandle_t queue;
 static StaticQueue_t queue_control;
@@ -88,6 +95,8 @@ static atomic_uint meter_level;
 static atomic_uint meter_until;
 static portMUX_TYPE stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static playback_stats_t reply;
+// Track PCM across reply-end markers. Those clear reply statistics while PCM may remain queued.
+static playback_queue_stats_t queue_stats;
 static unsigned reply_sequence;
 static int64_t jitter_until_us;
 
@@ -146,16 +155,27 @@ void voice_playback_end(void *context)
     }
 }
 
-void voice_playback_reset(void *context)
+static unsigned pending_pcm_ms(const playback_queue_stats_t *stats)
 {
-    (void)context;
+    // Producer and consumer snapshots can straddle a queue operation. This is
+    // PCM not yet handled by the I2S writer, excluding the hardware DMA tail.
+    const int32_t samples = (int32_t)(stats->enqueued_samples - stats->processed_samples);
+    return samples > 0 ? (unsigned)samples / (SUGARAT_SAMPLE_RATE / 1000) : 0;
+}
+
+static void reset_playback(const char *reason, uint32_t reset_seq)
+{
+    const int64_t cleared_us = esp_timer_get_time();
     atomic_store(&meter_until, 0);
     portENTER_CRITICAL(&stats_lock);
     atomic_fetch_add(&generation, 1);
     const playback_stats_t stats = reply;
+    const playback_queue_stats_t queued = queue_stats;
     reply = (playback_stats_t){0};
+    queue_stats = (playback_queue_stats_t){0};
     portEXIT_CRITICAL(&stats_lock);
     voice_timing_reply_end();
+    const unsigned slots = queue ? uxQueueMessagesWaiting(queue) : 0;
     if (queue) {
         xQueueReset(queue);
     }
@@ -165,14 +185,34 @@ void voice_playback_reset(void *context)
     if (worker) {
         xTaskNotify(worker, 0, eNoAction);
     }
+    if (queue) {
+        voice_trace_playback_reset(cleared_us, reason, reset_seq, stats.id, queued.last_i2s_reply,
+                                   pending_pcm_ms(&queued), slots);
+    }
 }
 
-void voice_playback_accept(bool enabled)
+void voice_playback_reset(agent_audio_reset_reason_t reason, uint32_t reset_seq, void *context)
+{
+    (void)context;
+    const char *name;
+    switch (reason) {
+        case AGENT_AUDIO_RESET_REMOTE_INTERRUPT: name = "cloud_interrupt"; break;
+        case AGENT_AUDIO_RESET_INPUT_START: name = "input_started"; break;
+        case AGENT_AUDIO_RESET_INPUT_CLOSED: name = "input_closed"; break;
+        case AGENT_AUDIO_RESET_CONNECTION_LOST: name = "connection_lost"; break;
+        case AGENT_AUDIO_RESET_CONNECTION_ENDED: name = "connection_ended"; break;
+        case AGENT_AUDIO_RESET_CONNECTION_CANCELLED: name = "connection_cancelled"; break;
+        default: name = "unknown_transport_reset"; break;
+    }
+    reset_playback(name, reset_seq);
+}
+
+void voice_playback_accept(bool enabled, const char *reset_reason)
 {
     atomic_store(&accepting, enabled);
     if (!enabled) {
         sugarat_speaker_enable(false);
-        voice_playback_reset(NULL);
+        reset_playback(reset_reason, 0);
     }
 }
 
@@ -221,6 +261,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         remaining -= frame.count;
     }
     portENTER_CRITICAL(&stats_lock);
+    if (current == atomic_load(&generation)) queue_stats.enqueued_samples += samples - remaining;
     if (reply.id == frame.reply_id) {
         reply.enqueued_samples += samples - remaining;
         reply.delivery.dropped_samples += remaining;
@@ -363,6 +404,10 @@ static void play_audio(void *context)
             continue;
         }
         portENTER_CRITICAL(&stats_lock);
+        if (frame.generation == atomic_load(&generation)) {
+            queue_stats.processed_samples += frame.count;
+            if (err == ESP_OK) queue_stats.last_i2s_reply = frame.reply_id;
+        }
         if (reply.id == frame.reply_id) reply.consumed_samples += frame.count;
         portEXIT_CRITICAL(&stats_lock);
         if (err != ESP_OK) {
@@ -421,7 +466,16 @@ void voice_playback_stop(void)
         worker = NULL;
     }
     if (queue) {
+        const int64_t cleared_us = esp_timer_get_time();
+        const unsigned slots = uxQueueMessagesWaiting(queue);
+        portENTER_CRITICAL(&stats_lock);
+        const unsigned incoming_reply = reply.id;
+        const playback_queue_stats_t queued = queue_stats;
+        queue_stats = (playback_queue_stats_t){0};
+        portEXIT_CRITICAL(&stats_lock);
         vQueueDelete(queue);
         queue = NULL;
+        voice_trace_playback_reset(cleared_us, "speaker_stop", 0, incoming_reply, queued.last_i2s_reply,
+                                   pending_pcm_ms(&queued), slots);
     }
 }

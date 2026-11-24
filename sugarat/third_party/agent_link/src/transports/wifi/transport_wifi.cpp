@@ -95,7 +95,7 @@ std::atomic<bool> s_platform_voice{false};
 char s_voice_hint[112] = {};
 void (*s_pcm)(const uint8_t*, size_t) = nullptr;
 void (*s_audio_end)(void) = nullptr;
-void (*s_audio_reset)(void) = nullptr;
+void (*s_audio_reset)(agent_audio_reset_reason_t, uint32_t) = nullptr;
 void (*s_text)(const char*) = nullptr;
 
 // Last status from the session, kept so portal changes can be re-reported without waiting for it.
@@ -767,9 +767,9 @@ void OnRealtimeEnd() {
     std::lock_guard<std::recursive_mutex> lk(s_core_mtx);
     if (s_audio_end) s_audio_end();
 }
-void OnRealtimeReset() {
+void OnRealtimeReset(agent_audio_reset_reason_t reason, uint32_t reset_seq) {
     std::lock_guard<std::recursive_mutex> lk(s_core_mtx);
-    if (s_audio_reset) s_audio_reset();
+    if (s_audio_reset) s_audio_reset(reason, reset_seq);
 }
 void OnRealtimeFinished() {
     s_realtime_wanted.store(false);
@@ -1063,7 +1063,7 @@ extern "C" void agent_transport_wifi_set_status(void (*cb)(const agent_link_stat
 
 extern "C" esp_err_t agent_transport_wifi_forget(void) { return cloud_session_forget(); }
 extern "C" void agent_transport_wifi_set_audio(void (*pcm)(const uint8_t*, size_t), void (*end)(void),
-                                               void (*reset)(void), void (*text)(const char*)) {
+                                               void (*reset)(agent_audio_reset_reason_t, uint32_t), void (*text)(const char*)) {
     s_pcm = pcm; s_audio_end = end; s_audio_reset = reset; s_text = text;
 }
 
@@ -1113,7 +1113,7 @@ extern "C" esp_err_t agent_transport_wifi_end_realtime(void) {
     s_realtime_wanted.store(false);
     s_platform_voice.store(false);
     cloud_realtime_cancel();
-    OnRealtimeReset();
+    OnRealtimeReset(AGENT_AUDIO_RESET_CONNECTION_CANCELLED, 0);
     OnRealtimeState(false, "Connected to the platform");
     return ESP_OK;
 }
@@ -1161,7 +1161,7 @@ extern "C" void agent_transport_wifi_set_platform(const agent_platform_t*) {}
 extern "C" void agent_transport_wifi_set_status(void (*)(const agent_link_status_t*)) {}
 extern "C" esp_err_t agent_transport_wifi_forget(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" void agent_transport_wifi_set_audio(void (*)(const uint8_t*, size_t), void (*)(void),
-                                               void (*)(void), void (*)(const char*)) {}
+                                               void (*)(agent_audio_reset_reason_t, uint32_t), void (*)(const char*)) {}
 extern "C" esp_err_t agent_transport_wifi_request_realtime(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" esp_err_t agent_transport_wifi_end_realtime(void) { return ESP_ERR_NOT_SUPPORTED; }
 extern "C" bool agent_transport_wifi_realtime_running(void) { return false; }

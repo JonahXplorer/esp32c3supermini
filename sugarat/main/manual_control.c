@@ -96,7 +96,8 @@ static void read_state(manual_control_view_t *view, int64_t now)
     const bool confirmed = radio.pending.type && radio.pending.sequence == reply.sequence;
     if (confirmed) {
         if (radio.pending_tool) {
-            servo_tool_complete(&radio.tool, reply.position == radio.pending.position ? ESP_OK : ESP_FAIL, reply.moving != 0);
+            const servo_tool_state_t state = {.target = reply.position, .moving = reply.moving != 0};
+            servo_tool_complete(&radio.tool, &state);
             radio.pending_tool = false;
         }
         radio.pending.type = 0;
@@ -126,6 +127,7 @@ static void send_pending(const int64_t now)
     const bool timed_out = radio.pending_tool ? now >= radio.tool.deadline_us : radio.attempts >= MAX_TOUCH_SENDS;
     if (!timed_out) {
         const esp_err_t err = servo_radio_send(radio.pending);
+        if (radio.pending_tool && err == ESP_OK) servo_tool_radio_queued(&radio.tool);
         if (radio.attempts == 0 && err != ESP_OK) ESP_LOGW(TAG, "ESP-NOW command send: %s", esp_err_to_name(err));
         ++radio.attempts;
         radio.next_retry = now + RETRY_US;
@@ -133,7 +135,7 @@ static void send_pending(const int64_t now)
     }
     ESP_LOGW(TAG, "C3 did not acknowledge command %u", (unsigned)radio.pending.type);
     if (radio.pending_tool) {
-        servo_tool_complete(&radio.tool, ESP_ERR_TIMEOUT, false);
+        servo_tool_complete(&radio.tool, NULL);
         radio.pending_tool = false;
     }
     radio.pending.type = 0;
@@ -156,9 +158,12 @@ void manual_control_update(bool visible, bool call_active, screen_action_t actio
     }
     if (!radio.pending.type && servo_tool_receive(&radio.tool)) {
         if (now >= radio.tool.deadline_us) {
-            servo_tool_complete(&radio.tool, ESP_ERR_TIMEOUT, false);
+            servo_tool_complete(&radio.tool, NULL);
         } else {
-            radio.pending = (servo_message_t){.type = SERVO_SET_POSITION, .position = radio.tool.position};
+            radio.pending = (servo_message_t){
+                .type = radio.tool.operation == SERVO_TOOL_GET_STATUS ? SERVO_QUERY : SERVO_SET_POSITION,
+                .position = radio.tool.position,
+            };
             radio.pending_tool = true;
             started = true;
         }
@@ -192,7 +197,7 @@ void manual_control_update(bool visible, bool call_active, screen_action_t actio
         if (radio.ready) {
             send_pending(now);
         } else if (radio.pending_tool && now >= radio.tool.deadline_us) {
-            servo_tool_complete(&radio.tool, ESP_ERR_TIMEOUT, false);
+            servo_tool_complete(&radio.tool, NULL);
             radio.pending.type = 0;
             radio.pending_tool = false;
         }
