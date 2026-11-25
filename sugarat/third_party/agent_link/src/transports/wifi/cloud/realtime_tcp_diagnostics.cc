@@ -30,6 +30,10 @@ struct TcpSnapshot : tcpip_api_call_data {
     unsigned persist_probes;
     int rto_ms;
     unsigned state;
+    uint32_t recv_next;
+    unsigned recv_window;
+    unsigned advertised_window;
+    unsigned out_of_order;
 };
 
 unsigned SegmentBytes(const tcp_seg* segment) {
@@ -60,7 +64,18 @@ err_t ReadTcpSnapshot(tcpip_api_call_data* request) {
     sample.persist_probes = pcb->persist_probe;
     sample.rto_ms = pcb->rto * TCP_SLOW_INTERVAL;
     sample.state = pcb->state;
+    sample.recv_next = pcb->rcv_nxt;
+    sample.recv_window = pcb->rcv_wnd;
+    sample.advertised_window = pcb->rcv_ann_wnd;
+#if TCP_QUEUE_OOSEQ
+    sample.out_of_order = SegmentBytes(pcb->ooseq);
+#endif
     return ERR_OK;
+}
+
+err_t SampleTcp(esp_tls_t* tls, TcpSnapshot& sample) {
+    if (esp_tls_get_conn_sockfd(tls, &sample.fd) != ESP_OK || sample.fd < 0) return ERR_CONN;
+    return tcpip_api_call(&ReadTcpSnapshot, &sample);
 }
 
 }  // namespace
@@ -72,8 +87,7 @@ void LogTcpStall(esp_tls_t* tls, TcpStallPhase phase, TcpStallStart& start) {
 
     TcpSnapshot sample{};
     const int64_t requested_us = esp_timer_get_time();
-    const bool have_fd = esp_tls_get_conn_sockfd(tls, &sample.fd) == ESP_OK && sample.fd >= 0;
-    const err_t err = have_fd ? tcpip_api_call(&ReadTcpSnapshot, &sample) : static_cast<err_t>(ERR_CONN);
+    const err_t err = SampleTcp(tls, sample);
     const auto sample_ms = static_cast<unsigned>((esp_timer_get_time() - requested_us) / 1000);
     if (err != ERR_OK) {
         ESP_LOGW(kTag, "Voice TCP write stall: phase=%s sample=unavailable lwip_err=%d sample_ms=%u",
@@ -94,6 +108,31 @@ void LogTcpStall(esp_tls_t* tls, TcpStallPhase phase, TcpStallStart& start) {
              sample.send_free, static_cast<unsigned>(TCP_SND_BUF),
              sample.queue_pbufs, static_cast<unsigned>(TCP_SND_QUEUELEN),
              sample.unsent, sample.unacked, sample_ms);
+}
+
+void LogTcpReadGap(esp_tls_t* tls, TcpReadGapPhase phase, TcpReadGapStart& start, unsigned gap_ms) {
+    const bool at_start = phase == TcpReadGapPhase::kStart;
+    const char* label = at_start ? "start" : phase == TcpReadGapPhase::kResume ? "resume" : "closed";
+    if (at_start) start = {};
+
+    TcpSnapshot sample{};
+    const int64_t requested_us = esp_timer_get_time();
+    const err_t err = SampleTcp(tls, sample);
+    const auto sample_ms = static_cast<unsigned>((esp_timer_get_time() - requested_us) / 1000);
+    const auto at_ms = static_cast<long long>(requested_us / 1000);
+    if (err != ERR_OK) {
+        ESP_LOGI(kTag, "Voice TCP read gap: phase=%s at_ms=%lld gap_ms=%u sample=unavailable lwip_err=%d sample_ms=%u",
+                 label, at_ms, gap_ms, static_cast<int>(err), sample_ms);
+        return;
+    }
+
+    if (at_start) start = {sample.recv_next, true};
+    const int64_t progressed = start.sampled ? static_cast<uint32_t>(sample.recv_next - start.next) : -1LL;
+    ESP_LOGI(kTag, "Voice TCP read gap: phase=%s at_ms=%lld gap_ms=%u fd=%d state=%u rcv_next=%lu advanced_bytes=%lld "
+                  "recv_wnd=%u announce_wnd=%u out_of_order_bytes=%u sample_ms=%u",
+             label, at_ms, gap_ms, sample.fd, sample.state, static_cast<unsigned long>(sample.recv_next),
+             static_cast<long long>(progressed), sample.recv_window, sample.advertised_window,
+             sample.out_of_order, sample_ms);
 }
 
 }  // namespace agentlink::realtime

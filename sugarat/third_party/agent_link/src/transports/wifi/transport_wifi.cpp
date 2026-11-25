@@ -636,6 +636,7 @@ void Compose(const agent_cloud_status_t& c, agent_link_status_t* out) {
             }
         } else {
             say(AGENT_LINK_PHASE_CONNECTING, "Joining WiFi", "");
+            out->connect_stage = AGENT_LINK_CONNECT_WIFI_JOIN;
             snprintf(out->hint, sizeof out->hint, "%s. Attempt %u",
                      left ? (s_waiting_ip ? "Waiting for IP" : reason) : "Waiting to retry saved WiFi",
                      s_join_attempt.load());
@@ -698,6 +699,7 @@ void Compose(const agent_cloud_status_t& c, agent_link_status_t* out) {
         if (c.api_code < 0) {
             // No response (socket or TLS failure); the session is retrying.
             say(AGENT_LINK_PHASE_CONNECTING, "Reconnecting", "Cannot reach the platform - retrying");
+            out->connect_stage = AGENT_LINK_CONNECT_PLATFORM_RETRY;
         } else if (c.api_code == 401) {
             say(AGENT_LINK_PHASE_BLOCKED, "Platform error",
                 "The platform gateway is refusing device requests");

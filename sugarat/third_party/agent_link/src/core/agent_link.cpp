@@ -504,7 +504,7 @@ void SetLinkState(agent_state_t state) {
 // Compared field by field: the struct is built in several places and its padding may differ.
 bool SameStatus(const agent_link_status_t& a, const agent_link_status_t& b) {
     return a.phase == b.phase && a.transport == b.transport && a.detail == b.detail &&
-           a.expires_s == b.expires_s && strcmp(a.title, b.title) == 0 &&
+           a.connect_stage == b.connect_stage && a.expires_s == b.expires_s && strcmp(a.title, b.title) == 0 &&
            strcmp(a.hint, b.hint) == 0 && strcmp(a.code, b.code) == 0;
 }
 

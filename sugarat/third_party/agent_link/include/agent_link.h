@@ -238,6 +238,13 @@ typedef enum {
     AGENT_LINK_PHASE_READY,       ///< Ready for the selected backend's supported features
 } agent_link_phase_t;
 
+/** @brief Display detail for the shared AGENT_LINK_PHASE_CONNECTING phase. */
+typedef enum {
+    AGENT_LINK_CONNECT_GENERIC = 0,
+    AGENT_LINK_CONNECT_WIFI_JOIN,
+    AGENT_LINK_CONNECT_PLATFORM_RETRY,
+} agent_link_connect_stage_t;
+
 /**
  * @brief Link status with display text.
  *
@@ -252,6 +259,7 @@ typedef struct {
     char                   code[8];     ///< PAIRING only: the code to display
     uint32_t               expires_s;   ///< PAIRING only: seconds until the code expires
     int                    detail;      ///< Transport-specific reason code (WiFi: platform code), or 0
+    agent_link_connect_stage_t connect_stage; ///< CONNECTING only: stage for display
 } agent_link_status_t;
 
 /**

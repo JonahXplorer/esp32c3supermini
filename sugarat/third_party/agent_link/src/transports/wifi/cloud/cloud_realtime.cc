@@ -86,6 +86,8 @@ using namespace agentlink::cloud_limits;
 constexpr const char* TAG = "agent_link.realtime";
 #if CONFIG_IDF_TARGET_ESP32S3
 constexpr uint32_t kDmaCaps = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+constexpr long kSocketReadWaitUs = 10000;
+constexpr int64_t kTcpReadGapUs = 500000;
 
 void ReportDmaHeap(const char* phase) {
     multi_heap_info_t info{};
@@ -166,12 +168,26 @@ struct TxScratch {
     uint8_t read[kReadBytes];
 };
 
+#if CONFIG_IDF_TARGET_ESP32S3
+struct DownlinkReadTiming {
+    int64_t read_started_us;
+    int64_t message_ready_us;
+    unsigned read_attempts;
+    uint32_t read_bytes;
+    unsigned delivery_waits;
+    unsigned socket_wakeups;
+};
+#endif
+
 struct Rx {
     unsigned opcode;
     size_t bytes;
     uint8_t* data;
     int64_t received_at;
     uint32_t reset;
+#if CONFIG_IDF_TARGET_ESP32S3
+    DownlinkReadTiming timing;
+#endif
 };
 
 struct EncodedTx {
@@ -722,6 +738,16 @@ bool TlsWouldBlock(int result) {
 }
 
 #if CONFIG_IDF_TARGET_ESP32S3
+int WaitForVoiceSocket(int socket, int tls_result) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(socket, &fds);
+    timeval timeout{0, kSocketReadWaitUs};
+    if (tls_result == ESP_TLS_ERR_SSL_WANT_WRITE)
+        return lwip_select(socket + 1, nullptr, &fds, nullptr, &timeout);
+    return lwip_select(socket + 1, &fds, nullptr, nullptr, &timeout);
+}
+
 const char* TlsWaitName(int result) {
     if (result == ESP_TLS_ERR_SSL_WANT_READ) return "WANT_READ";
     if (result == ESP_TLS_ERR_SSL_WANT_WRITE) return "WANT_WRITE";
@@ -1177,6 +1203,9 @@ public:
 
     bool Healthy() const { return running_.load(); }
     bool TransportFailed() const { return transport_failed_; }
+#if CONFIG_IDF_TARGET_ESP32S3
+    bool ReceivingReply() const { return receiving_reply_.load(); }
+#endif
     bool CanPauseInput() const {
 #if CONFIG_IDF_TARGET_ESP32S3
         return continuous_;
@@ -1311,7 +1340,11 @@ public:
 #endif
 
     // A busy queue pauses reads, while the network loop continues to send microphone audio.
-    bool Deliver(unsigned opcode, const uint8_t* data, size_t bytes, int64_t received_at, uint32_t reset) {
+    bool Deliver(unsigned opcode, const uint8_t* data, size_t bytes, int64_t received_at, uint32_t reset
+#if CONFIG_IDF_TARGET_ESP32S3
+                 , const DownlinkReadTiming& timing
+#endif
+    ) {
 #if CONFIG_IDF_TARGET_ESP32C3
         received_at_ = received_at;
         if (reset != s_reset.load()) return true;
@@ -1324,7 +1357,7 @@ public:
         void* item = nullptr;
         if (xRingbufferSendAcquire(rx_ring_, &item, sizeof(Rx) + bytes, 0) != pdTRUE) return false;
         auto* payload = static_cast<uint8_t*>(item) + sizeof(Rx);
-        const Rx packet{opcode, bytes, payload, received_at, reset};
+        const Rx packet{opcode, bytes, payload, received_at, reset, timing};
         memcpy(item, &packet, sizeof packet);
         if (bytes) memcpy(payload, data, bytes);
         s_downlink_bytes.fetch_add(bytes);
@@ -1398,6 +1431,9 @@ public:
 
     void ResetAudio() {
         first_audio_reported_ = false;
+#if CONFIG_IDF_TARGET_ESP32S3
+        receiving_reply_.store(false);
+#endif
         if (SharedCodec()) {
             if (!EndReply()) running_.store(false);
         } else ResetDecoder();
@@ -1451,8 +1487,16 @@ public:
         if (!Healthy() || !Current(epoch_) || s_mute || reset_ != s_reset) return;
         const int64_t before_sink = esp_timer_get_time();
         if (before_sink - entered > max_pacing_) max_pacing_ = before_sink - entered;
-        if (s_cb.pcm) s_cb.pcm(reinterpret_cast<const uint8_t*>(pcm), samples * 2);
+        if (s_cb.pcm) {
+            s_cb.pcm(reinterpret_cast<const uint8_t*>(pcm), samples * 2);
+        }
         const int64_t now = esp_timer_get_time();
+#if CONFIG_IDF_TARGET_ESP32S3
+        if (s_cb.pcm) {
+            if (!pcm_sink_started_us_) pcm_sink_started_us_ = before_sink;
+            pcm_sink_finished_us_ = now;
+        }
+#endif
         if (now - before_sink > max_sink_) max_sink_ = now - before_sink;
         if (play_due_ < now) play_due_ = now;
         play_due_ += duration;
@@ -1460,20 +1504,49 @@ public:
         s_decoded_samples.fetch_add(samples);
     }
 
+#if CONFIG_IDF_TARGET_ESP32S3
+    void TraceDownlinkAudio(int64_t gap_us, int64_t dispatch_us, size_t previous_samples) {
+        const DownlinkReadTiming previous = last_audio_rx_timing_;
+        last_audio_rx_timing_ = rx_timing_;
+        const bool gap = gap_us >= kReportAudioGapUs;
+        const bool first = packets_ == 1;
+        const bool sample = dispatch_us - last_downlink_trace_us_ >= 1000000;
+        if (!first && !gap && !sample) return;
+        last_downlink_trace_us_ = dispatch_us;
+        const auto ms = [](int64_t us) { return us ? static_cast<long long>(us / 1000) : -1LL; };
+        ESP_LOGI(TAG, "WSS audio %s: reply=%u packet=%u gap_ms=%lld read_start_ms=%lld read_end_ms=%lld "
+                      "message_ready_ms=%lld dispatch_ms=%lld pcm_callback_start_ms=%lld pcm_callback_end_ms=%lld "
+                      "pcm_samples=%u read_attempts=%u read_bytes=%u delivery_waits=%u socket_wakeups=%u",
+                 first ? "first" : gap ? "gap" : "sample", replies_, packets_, static_cast<long long>(gap_us / 1000),
+                 ms(rx_timing_.read_started_us), ms(received_at_), ms(rx_timing_.message_ready_us),
+                 static_cast<long long>((dispatch_us - rx_timing_.message_ready_us) / 1000),
+                 ms(pcm_sink_started_us_), ms(pcm_sink_finished_us_),
+                 static_cast<unsigned>(samples_ - previous_samples), rx_timing_.read_attempts - previous.read_attempts,
+                 rx_timing_.read_bytes - previous.read_bytes, rx_timing_.delivery_waits - previous.delivery_waits,
+                 rx_timing_.socket_wakeups - previous.socket_wakeups);
+    }
+#endif
+
     bool Audio(uint8_t* data, size_t bytes) {
         if (!s_ready || s_mute || !bytes) return true;
         const int64_t now = received_at_;
+#if CONFIG_IDF_TARGET_ESP32S3
+        const int64_t dispatch_us = esp_timer_get_time();
+        const size_t previous_samples = samples_;
+        pcm_sink_started_us_ = pcm_sink_finished_us_ = 0;
+#endif
         if (!first_audio_reported_) {
             first_audio_reported_ = true;
             if (s_voice_timing) s_voice_timing(AGENT_LINK_VOICE_FIRST_AUDIO, now);
 #if CONFIG_IDF_TARGET_ESP32S3
+            receiving_reply_.store(true);
             TraceCloudVoice(AGENT_LINK_VOICE_TRACE_FIRST_AUDIO, now, "response.audio.delta");
 #endif
         }
-        if (last_audio_) {
-            const int64_t gap_us = now - last_audio_;
+        const int64_t gap_us = last_audio_ ? now - last_audio_ : 0;
+        if (gap_us) {
             if (gap_us > max_gap_) max_gap_ = gap_us;
-#if !CONFIG_IDF_TARGET_ESP32C3
+#if !CONFIG_IDF_TARGET_ESP32C3 && !CONFIG_IDF_TARGET_ESP32S3
             if (gap_us >= kReportAudioGapUs) {
                 ESP_LOGI(TAG, "WSS audio gap: reply=%u start_ms=%u end_ms=%u gap_ms=%u dispatch_ms=%u",
                          replies_, static_cast<unsigned>(last_audio_ / 1000), static_cast<unsigned>(now / 1000),
@@ -1488,6 +1561,9 @@ public:
         if (!audio_.output_opus) {
             if (bytes % 2) return false;
             Pcm(data, bytes);
+#if CONFIG_IDF_TARGET_ESP32S3
+            TraceDownlinkAudio(gap_us, dispatch_us, previous_samples);
+#endif
             return true;
         }
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
@@ -1510,6 +1586,9 @@ public:
             return false;
         }
         Output(decode_pcm_, frame.decoded_size / 2);
+#if CONFIG_IDF_TARGET_ESP32S3
+        TraceDownlinkAudio(gap_us, dispatch_us, previous_samples);
+#endif
         return true;
 #else
         return false;
@@ -1628,6 +1707,9 @@ public:
         } else if (strcmp(event, "response.audio.done") == 0) {
             ++reply_ends_;
             first_audio_reported_ = false;
+#if CONFIG_IDF_TARGET_ESP32S3
+            receiving_reply_.store(false);
+#endif
 #if !CONFIG_IDF_TARGET_ESP32C3
             ESP_LOGI(TAG, "WSS audio done: reply=%u packets=%u pcm_ms=%u max_gap_ms=%u max_decode_us=%u max_pacing_ms=%u",
                      replies_, packets_, static_cast<unsigned>(samples_ / 16), static_cast<unsigned>(max_gap_ / 1000),
@@ -1649,6 +1731,9 @@ public:
         } else if (strcmp(event, "response.started") == 0) {
             ++replies_;
             first_audio_reported_ = false;
+#if CONFIG_IDF_TARGET_ESP32S3
+            receiving_reply_.store(s_ready && !s_mute);
+#endif
             if (s_voice_timing && s_ready && !s_mute)
                 s_voice_timing(AGENT_LINK_VOICE_RESPONSE_STARTED, received_at_);
             ESP_LOGD(TAG, "reply started #%u", replies_);
@@ -1660,6 +1745,9 @@ public:
             if (s_cb.state && s_ready && !s_mute) s_cb.state(true, "Receiving agent reply");
         } else if (strcmp(event, "response.interrupted") == 0) {
             ++interruptions_;
+#if CONFIG_IDF_TARGET_ESP32S3
+            receiving_reply_.store(false);
+#endif
             ESP_LOGD(TAG, "reply interrupted #%u (started=%u, ended=%u)", interruptions_, replies_, reply_ends_);
             if (reset_ != s_reset.load()) ResetAudio();
         } else if (strcmp(event, "task.accepted") == 0) {
@@ -1882,6 +1970,7 @@ private:
             void* item = xRingbufferReceive(rx_ring_, &item_size, wait);
             if (!item) continue;
             memcpy(&packet, item, sizeof packet);
+            rx_timing_ = packet.timing;
 #else
             if (xQueueReceive(rx_queue_, &packet, wait) != pdTRUE) continue;
 #endif
@@ -2203,6 +2292,10 @@ private:
     std::atomic<bool> encoder_done_{false};
 #if CONFIG_IDF_TARGET_ESP32S3
     RingbufHandle_t rx_ring_ = nullptr;
+    std::atomic<bool> receiving_reply_{false};
+    DownlinkReadTiming rx_timing_{}, last_audio_rx_timing_{};
+    int64_t pcm_sink_started_us_ = 0, pcm_sink_finished_us_ = 0;
+    int64_t last_downlink_trace_us_ = 0;
 #else
     QueueHandle_t rx_queue_ = nullptr;
     bool rx_caps_ = false;
@@ -2478,11 +2571,26 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     bool pong_pending = false, retryable = false, pending_message = false;
     uint32_t pending_reset = 0;
     int64_t pending_at = 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+    DownlinkReadTiming pending_timing{};
+    int64_t last_read_started_us = 0;
+    unsigned read_attempts = 0, delivery_waits = 0, socket_wakeups = 0;
+    uint32_t read_bytes = 0;
+    int socket = -1;
+    (void)esp_tls_get_conn_sockfd(connection.tls, &socket);
+    int64_t gap_from_us = 0;
+    agentlink::realtime::TcpReadGapStart gap_start;
+#endif
     const int64_t connected_at = esp_timer_get_time();
     int64_t last_rx = connected_at, last_ping = connected_at, last_yield = connected_at;
     uint32_t observed_tx = s_tx_sent_frames.load();
     auto deliver = [&](unsigned opcode) {
+#if CONFIG_IDF_TARGET_ESP32S3
+        pending_message = !call.Deliver(opcode, message.Data(), assembler.Size(), pending_at, pending_reset, pending_timing);
+        if (pending_message) ++delivery_waits;
+#else
         pending_message = !call.Deliver(opcode, message.Data(), assembler.Size(), pending_at, pending_reset);
+#endif
     };
     auto receive = [&](const uint8_t* data, size_t bytes, size_t* consumed) {
         return reader.Consume(data, bytes, [&](unsigned opcode, bool first, bool end, bool fin,
@@ -2508,6 +2616,10 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             const auto result = assembler.Append(opcode, first, end, fin, payload, count);
             if (result == agentlink::realtime::Message::kError) return false;
             if (result == agentlink::realtime::Message::kComplete) {
+#if CONFIG_IDF_TARGET_ESP32S3
+                pending_timing = {last_read_started_us, esp_timer_get_time(), read_attempts, read_bytes,
+                                  delivery_waits, socket_wakeups};
+#endif
                 if (assembler.Opcode() == 1)
                     CheckResponseInterruption(message.Data(), assembler.Size(), last_rx, grant.token);
                 pending_at = last_rx;
@@ -2551,11 +2663,19 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
             if (rx_offset == rx_size) {
                 SetWorkerPhase(3);
                 errno = 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+                ++read_attempts;
+                const int64_t read_started_us = esp_timer_get_time();
+#endif
                 got = esp_tls_conn_read(connection.tls, scratch->read, sizeof scratch->read);
                 SetWorkerPhase(0);
                 if (got > 0) {
-                    s_rx_bytes.fetch_add(got);
                     last_rx = esp_timer_get_time();
+#if CONFIG_IDF_TARGET_ESP32S3
+                    last_read_started_us = read_started_us;
+                    read_bytes += static_cast<uint32_t>(got);
+#endif
+                    s_rx_bytes.fetch_add(got);
                     rx_offset = 0;
                     rx_size = static_cast<size_t>(got);
                 } else if (!TlsWouldBlock(got)) {
@@ -2574,11 +2694,48 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                              esp_timer_get_time() / 1000))
             ESP_LOGI(TAG, "voice retry budget reset: READY and bidirectional progress stable for 120s");
         observed_tx = sent_frames;
+#if CONFIG_IDF_TARGET_ESP32S3
+        const int64_t received_or_waiting_us = esp_timer_get_time();
+        if (gap_from_us && got > 0) {
+            agentlink::realtime::LogTcpReadGap(connection.tls, agentlink::realtime::TcpReadGapPhase::kResume,
+                                              gap_start, static_cast<unsigned>((last_rx - gap_from_us) / 1000));
+            gap_from_us = 0;
+        } else if (!gap_from_us && TlsWouldBlock(got) && !s_mute && call.ReceivingReply() &&
+                   received_or_waiting_us - last_rx >= kTcpReadGapUs) {
+            gap_from_us = last_rx;
+            agentlink::realtime::LogTcpReadGap(connection.tls, agentlink::realtime::TcpReadGapPhase::kStart,
+                                              gap_start, static_cast<unsigned>((received_or_waiting_us - last_rx) / 1000));
+        }
+        if (socket >= 0 && TlsWouldBlock(got)) {
+            // TLS can still hold decrypted bytes even when the socket is quiet.
+            // Bound the wait so microphone frames also get serviced without incoming data.
+            const bool buffered = got == ESP_TLS_ERR_SSL_WANT_READ && esp_tls_get_bytes_avail(connection.tls) > 0;
+            const int64_t wait_started_us = esp_timer_get_time();
+            const int ready = buffered ? 1 : WaitForVoiceSocket(socket, got);
+            if (ready >= 0) {
+                if (ready > 0 && !buffered) ++socket_wakeups;
+                const int64_t wait_finished_us = esp_timer_get_time();
+                if (ready == 0 || wait_finished_us - wait_started_us >= 1000) {
+                    last_yield = wait_finished_us;
+                } else if (wait_finished_us - last_yield >= kSocketReadWaitUs) {
+                    vTaskDelay(1);
+                    last_yield = esp_timer_get_time();
+                }
+                continue;
+            }
+        }
+#endif
         // Yield even under a burst of replies so I2S and the idle task run.
         if (got <= 0 || esp_timer_get_time() - last_yield >= 10000) {
             vTaskDelay(1); last_yield = esp_timer_get_time();
         }
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (gap_from_us) {
+        agentlink::realtime::LogTcpReadGap(connection.tls, agentlink::realtime::TcpReadGapPhase::kClosed,
+                                          gap_start, static_cast<unsigned>((esp_timer_get_time() - gap_from_us) / 1000));
+    }
+#endif
     call.Stop();
     // Do not append a close/control message behind an incomplete TLS write.
     if (!retryable && !sender.pending.Busy()) {

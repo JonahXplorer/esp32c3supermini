@@ -12,6 +12,7 @@
 #include "audio_meter.h"
 #include "conversations_internal.h"
 #include "esp_attr.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -32,7 +33,8 @@ enum {
     RESIDENT_RETRY_MAX_MS = 30000,
     CONVERSATION_CACHE_MS = 120000,
     CONVERSATION_RETRY_MS = 15000,
-    TOOL_ATTACH_RETRY_MS = 30000,
+    TOOL_RETRY_MS = 5000,
+    TOOL_RETRY_MAX_MS = 30000,
     SESSION_STACK_BYTES = 16 * 1024,
     CONVERSATIONS_STACK_BYTES = 12 * 1024,
     SESSION_STACK_CHECK_MS = 15000,
@@ -441,50 +443,88 @@ static void close_stream(agent_stream_handle_t *stream, const char *reset_reason
     voice_playback_accept(false, reset_reason);
 }
 
+static bool tool_transport_error(esp_err_t err)
+{
+    switch (err) {
+        case ESP_ERR_TIMEOUT:
+        case ESP_ERR_HTTP_CONNECT:
+        case ESP_ERR_HTTP_CONNECTING:
+        case ESP_ERR_HTTP_WRITE_DATA:
+        case ESP_ERR_HTTP_FETCH_HEADER:
+        case ESP_ERR_HTTP_EAGAIN:
+        case ESP_ERR_HTTP_CONNECTION_CLOSED:
+        case ESP_ERR_HTTP_READ_TIMEOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void handle_tools(void *context)
 {
     (void)context;
     tool_job_t route = {0};
-    uint32_t attach_after = 0;
-    uint32_t refresh_after = 0;
+    uint32_t mount_after = 0;
+    uint32_t retry_after = 0;
+    uint32_t retry_delay_ms = TOOL_RETRY_MS;
     uint32_t synced_connection = 0;
+    bool retry = false;
     while (true) {
         tool_job_t job;
         if (xQueueReceive(tool_jobs, &job, portMAX_DELAY) != pdTRUE) continue;
         const voice_mode_t current = atomic_load(&mode);
         if (current == VOICE_BOOT || current == VOICE_FAULT || current == VOICE_MANAGING) continue;
         const conversation_cache_t selected = load_conversation();
-        if (job.agent_id != selected.agent_id || strcmp(job.session_id, selected.latest.id) != 0) continue;
+        if (job.agent_id != selected.agent_id || strcmp(job.session_id, selected.latest.id) != 0 ||
+            job.agent_id != voice_agent_id()) continue;
         if (job.agent_id != route.agent_id || strcmp(job.session_id, route.session_id) != 0) {
             if (route.session_id[0]) agent_link_platform_detach_tool();
             route = job;
-            attach_after = 0;
-            refresh_after = 0;
+            mount_after = 0;
+            retry_after = 0;
+            retry_delay_ms = TOOL_RETRY_MS;
             synced_connection = 0;
+            retry = false;
         }
 
-        const uint32_t connection = voice_connection_ready(agent_link_realtime_running())
-                                  ? job.connection_generation : 0;
+        const bool running = agent_link_realtime_running();
+        const bool ready = voice_connection_ready(running);
+        const uint32_t connection = ready ? job.connection_generation : 0;
+        // The session task submits the latest route on every idle pass. Keep
+        // retries behind voice setup, but still check for a reserved route if WSS never became ready.
+        if (retry && ((running && !ready) || atomic_load(&mode) != VOICE_IDLE || before_deadline(retry_after))) {
+            continue;
+        }
+
         const bool attached = agent_link_platform_tool_ready();
         if (attached) {
-            if (!connection || connection == synced_connection || before_deadline(refresh_after)) continue;
-        } else if (before_deadline(attach_after)) {
+            if (!connection || connection == synced_connection) continue;
+        } else if (!retry && before_deadline(mount_after)) {
             continue;
         }
         const uint32_t started = now_ms();
         const esp_err_t err = attached ? agent_link_platform_refresh_tool(job.agent_id, job.session_id)
                                        : servo_tool_attach(job.agent_id, job.session_id);
-        if (err == ESP_OK) synced_connection = connection;
-        if (attached) {
-            refresh_after = err == ESP_OK ? 0 : now_ms() + TOOL_ATTACH_RETRY_MS;
-        } else {
-            attach_after = now_ms() + TOOL_ATTACH_RETRY_MS;
+        const uint32_t finished = now_ms();
+        if (!attached) {
             portENTER_CRITICAL(&tool_reservation_lock);
             reserved_tool_route = err == ESP_ERR_NOT_ALLOWED ? job : (tool_job_t){0};
             portEXIT_CRITICAL(&tool_reservation_lock);
         }
-        ESP_LOGI(TAG, "Voice stage tool %s: background ms=%lu result=%s", attached ? "hot-update" : "mount",
-                 (unsigned long)(now_ms() - started), esp_err_to_name(err));
+        ESP_LOGI(TAG, "Voice stage tool %s: background ms=%lu result=%s retry=%u", attached ? "hot-update" : "mount",
+                 (unsigned long)(finished - started), esp_err_to_name(err), (unsigned)retry);
+        retry = err != ESP_OK;
+        if (!retry) {
+            synced_connection = connection;
+            if (!attached) mount_after = finished + TOOL_RETRY_MAX_MS;
+            retry_delay_ms = TOOL_RETRY_MS;
+        } else {
+            const uint32_t delay_ms = tool_transport_error(err) ? retry_delay_ms : TOOL_RETRY_MAX_MS;
+            retry_after = finished + delay_ms;
+            retry_delay_ms = delay_ms < TOOL_RETRY_MAX_MS / 2 ? delay_ms * 2 : TOOL_RETRY_MAX_MS;
+            ESP_LOGI(TAG, "Voice tool retry scheduled: delay_ms=%lu (idle, after voice setup)",
+                     (unsigned long)delay_ms);
+        }
     }
 }
 
@@ -749,7 +789,11 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
     } else if (link.phase == AGENT_LINK_PHASE_SETUP) {
         view->phase = SUGARAT_VOICE_SETUP;
     } else if (link.phase == AGENT_LINK_PHASE_CONNECTING) {
-        view->phase = SUGARAT_VOICE_JOINING;
+        switch (link.connect_stage) {
+            case AGENT_LINK_CONNECT_WIFI_JOIN: view->phase = SUGARAT_VOICE_JOINING; break;
+            case AGENT_LINK_CONNECT_PLATFORM_RETRY: view->phase = SUGARAT_VOICE_PLATFORM_RETRYING; break;
+            default: view->phase = SUGARAT_VOICE_PLATFORM_CONNECTING; break;
+        }
     } else if (current == VOICE_IDLE) {
         if (agent_id <= 0) {
             view->phase = SUGARAT_VOICE_BIND_AGENT;

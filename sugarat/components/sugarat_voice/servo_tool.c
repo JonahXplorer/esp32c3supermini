@@ -23,17 +23,19 @@ static const char DEFINITIONS[] =
     "用户明确要求实际开合时必须调用本工具。打开、掀开、升起、抬起对应 power=true，目标 B 点。关上、合上、放下、降下对应 power=false，目标 A 点。"
     "例如把脸甲抬起来、能帮我把面罩放下来吗。上一句明确在说面罩时，打开它和合上也可执行。"
     "闲聊、引用、否定、询问如何操作或仅问状态时不调用。对象或方向不清时先问一句。"
-    "设备可能已通过转写执行，调用本工具会复用同一次动作的回执。先等回执，只有 c3_ack=true 且 executed=true 才确认，moving=true 时说正在开合。"
-    "用户说没动、要检查到位或工具失败时，调用 " GET_STATUS " 查询，无法核实时如实说明。\","
+    "即使设备已按转写词执行，也要调用本工具取得同一次动作的 C3 回执。source=transcript 表示由 Sugarat 本地规则发起。"
+    "只有 c3_ack=true 且 executed=true 才确认，moving=true 时说正在开合。要核对刚才的执行结果，调用 " GET_STATUS " 并传 last_command_only=true。"
+    "用户说没动或要检查当前是否到位时，调用 " GET_STATUS " 查当前状态，无法核实时如实说明。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"power\":{\"type\":\"boolean\","
     "\"description\":\"布尔值。true 抬起并打开面罩到 B 点，false 放下并关闭面罩到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15},"
     "{\"name\":\"" GET_STATUS "\","
     "\"description\":\"只读查询用户的钢铁侠面罩、面具、脸甲、头盔面板或舵机。用户问现在开着吗、关好了没、到位了吗、刚才为什么没动或 MQTT 指令有没有发到设备时调用。"
-    "实时询问 C3，不改变位置。state 为 open=已到 B、closed=已到 A、opening=去 B、closing=去 A、unknown=未收到 C3 状态。"
-    "last_command 是设备最近一次语音开合，age_ms 表示距今多久。mqtt_received 表示 MQTT 开合请求已送达 Sugarat。"
-    "esp_now_queued 表示已交给无线驱动，c3_ack 表示 C3 已回执。mqtt_received=false 只能说明设备没看到该开合的 MQTT 请求。"
-    "C3 的状态来自舵机控制输出。无回执就如实说明无法确认，禁止凭历史记录声称已经到位。\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false},\"timeout\":15}]";
+    "默认实时询问 C3，不改变位置。state 为 open=已到 B、closed=已到 A、opening=去 B、closing=去 A、unknown=未收到 C3 状态。"
+    "要确认设备刚才是否已执行本地转写指令，用 last_command_only=true，等待本次通话最近一次开合的回执，只读返回 last_command，不再发 ESP-NOW。"
+    "last_command.source=transcript 表示本地发起，c3_ack=true 且 executed=true 才表示 C3 确认目标。moving 是回执当时的状态，age_ms 是动作距今时间。"
+    "last_command=null 或没有回执时，如实说明无法确认。查询当前状态时根据实时 C3 结果回答。\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"last_command_only\":{\"type\":\"boolean\","
+    "\"description\":\"true 读取本次通话最近一次开合的原始回执，默认查询当前状态\"}},\"additionalProperties\":false},\"timeout\":15}]";
 
 typedef enum { SOURCE_TRANSCRIPT = 1, SOURCE_MQTT = 2 } command_source_t;
 
@@ -41,6 +43,7 @@ typedef struct {
     servo_tool_request_t request;
     int64_t match_until_us;
     uint32_t call;
+    command_source_t source;
     uint8_t sources;
     bool dispatched;
     bool complete;
@@ -111,7 +114,9 @@ static bool parse_power_command(const char *text, bool *open)
 
 static const char *source_name(command_source_t source)
 {
-    return source == SOURCE_TRANSCRIPT ? "transcript" : "MQTT";
+    if (source == SOURCE_TRANSCRIPT) return "transcript";
+    if (source == SOURCE_MQTT) return "MQTT";
+    return "unknown";
 }
 
 // The two transports do not carry a shared utterance ID. Merge opposite
@@ -161,6 +166,7 @@ static esp_err_t request_command(servo_tool_operation_t operation, uint8_t posit
                         .operation = operation, .position = position},
             .match_until_us = now + TOOL_WINDOW_MS * 1000,
             .call = call,
+            .source = source,
             .sources = source,
         };
         *request = free_slot->request;
@@ -239,6 +245,11 @@ static void add_delivery(cJSON *result, const servo_command_t *command)
     cJSON_AddBoolToObject(result, "c3_ack", command->c3_ack);
 }
 
+static bool target_confirmed(const servo_command_t *command)
+{
+    return command->c3_ack && command->state.target == command->request.position;
+}
+
 static esp_err_t set_power(const cJSON *params, cJSON *result)
 {
     const cJSON *power = cJSON_GetObjectItemCaseSensitive(params, "power");
@@ -249,8 +260,9 @@ static esp_err_t set_power(const cJSON *params, cJSON *result)
     if (err != ESP_OK) return err;
 
     const servo_command_t command = await_confirmation(&request);
-    const bool executed = command.c3_ack && command.state.target == request.position;
+    const bool executed = target_confirmed(&command);
     add_delivery(result, &command);
+    cJSON_AddStringToObject(result, "source", source_name(command.source));
     cJSON_AddBoolToObject(result, "executed", executed);
     if (executed) {
         cJSON_AddBoolToObject(result, "power", enabled);
@@ -263,13 +275,45 @@ static esp_err_t set_power(const cJSON *params, cJSON *result)
 
 static const char *delivery_status(const servo_command_t *command, int64_t now)
 {
-    if (command->c3_ack) return command->state.target == command->request.position ? "confirmed" : "target_mismatch";
+    if (command->c3_ack) return target_confirmed(command) ? "confirmed" : "target_mismatch";
     if (!command->complete && now < command->request.deadline_us) return "pending";
     return command->esp_now_queued ? "no_c3_ack" : "esp_now_not_queued";
 }
 
-static esp_err_t get_status(cJSON *result)
+static esp_err_t add_last_command(cJSON *result, const servo_command_t *last)
 {
+    cJSON *command = cJSON_AddObjectToObject(result, "last_command");
+    if (!command) return ESP_ERR_NO_MEM;
+    const int64_t now = esp_timer_get_time();
+    add_delivery(command, last);
+    cJSON_AddStringToObject(command, "target_position", position_name(last->request.position));
+    cJSON_AddStringToObject(command, "source", source_name(last->source));
+    cJSON_AddStringToObject(command, "status", delivery_status(last, now));
+    cJSON_AddBoolToObject(command, "executed", target_confirmed(last));
+    if (last->c3_ack) cJSON_AddBoolToObject(command, "moving", last->state.moving);
+    cJSON_AddNumberToObject(command, "age_ms", (now - last->request.deadline_us) / 1000 + ACK_TIMEOUT_MS);
+    return ESP_OK;
+}
+
+static esp_err_t get_last_command(cJSON *result)
+{
+    portENTER_CRITICAL(&command_lock);
+    const servo_command_t last = last_action;
+    const bool current_call = last.call == call;
+    portEXIT_CRITICAL(&command_lock);
+    if (!last.request.id || !current_call) {
+        return cJSON_AddNullToObject(result, "last_command") ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    const servo_command_t confirmed = last.complete ? last : await_confirmation(&last.request);
+    return add_last_command(result, &confirmed);
+}
+
+static esp_err_t get_status(const cJSON *params, cJSON *result)
+{
+    const cJSON *last_only = cJSON_GetObjectItemCaseSensitive(params, "last_command_only");
+    if (last_only && !cJSON_IsBool(last_only)) return ESP_ERR_INVALID_ARG;
+    if (cJSON_IsTrue(last_only)) return get_last_command(result);
+
     servo_tool_request_t request;
     const esp_err_t err = request_command(SERVO_TOOL_GET_STATUS, 0, SOURCE_MQTT, &request);
     if (err != ESP_OK) return err;
@@ -287,23 +331,14 @@ static esp_err_t get_status(cJSON *result)
     portENTER_CRITICAL(&command_lock);
     const servo_command_t last = last_action;
     portEXIT_CRITICAL(&command_lock);
-    if (last.request.id) {
-        cJSON *command = cJSON_AddObjectToObject(result, "last_command");
-        if (!command) return ESP_ERR_NO_MEM;
-        const int64_t now = esp_timer_get_time();
-        add_delivery(command, &last);
-        cJSON_AddStringToObject(command, "target_position", position_name(last.request.position));
-        cJSON_AddStringToObject(command, "status", delivery_status(&last, now));
-        cJSON_AddNumberToObject(command, "age_ms", (now - last.request.deadline_us) / 1000 + ACK_TIMEOUT_MS);
-    }
-    return ESP_OK;
+    return last.request.id ? add_last_command(result, &last) : ESP_OK;
 }
 
 static esp_err_t handle_tool(const char *action, const cJSON *params, cJSON *result, void *context)
 {
     (void)context;
     if (strcmp(action, SET_POWER) == 0) return set_power(params, result);
-    if (strcmp(action, GET_STATUS) == 0) return get_status(result);
+    if (strcmp(action, GET_STATUS) == 0) return get_status(params, result);
     return ESP_ERR_NOT_SUPPORTED;
 }
 

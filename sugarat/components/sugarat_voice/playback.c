@@ -16,19 +16,22 @@
 #include "voice_trace.h"
 
 enum {
-    PLAYBACK_FRAMES = 132,
+    PLAYBACK_FRAMES = 360,
     PLAYBACK_CAPACITY_MS = PLAYBACK_FRAMES * SUGARAT_AUDIO_FRAME * 1000 / SUGARAT_SAMPLE_RATE,
     BASE_PREBUFFER_MS = 800,
     JITTER_PREBUFFER_MS = 1600,
+    SLOW_PREBUFFER_MS = 5000,
     JITTER_GAP_MS = 500,
-    JITTER_HOLD_MS = 30000,
-    // Leave room for Agent Link to deliver a decoded chunk even if PCM uses partial slots.
-    PREBUFFER_SLOT_LIMIT = PLAYBACK_FRAMES * 2 / 3,
+    SLOW_GAP_MS = 1000,
+    SLOW_RATE_WINDOW_MS = 1200,
+    // Release partial slots before Agent Link's three-quarter queue high-water mark.
+    PREBUFFER_SLOT_LIMIT = PLAYBACK_FRAMES * 7 / 10,
     PA_DRAIN_MS = SUGARAT_SPEAKER_DMA_MS + 40,
     ECHO_GUARD_MS = 220,
     METER_HOLD_MS = 150,
     DRAIN_REPORTS = SUGARAT_SPEAKER_DMA_DESCRIPTORS + 2,
     REPORT_PLAYBACK_GAP_MS = 150,
+    REPORT_PCM_GAP_MS = 150,
 };
 
 typedef struct {
@@ -53,6 +56,7 @@ typedef struct {
     playback_delivery_t delivery;
     unsigned enqueued_samples;
     unsigned consumed_samples;
+    unsigned prebuffer_ms;
     int64_t first_audio_us;
     int64_t last_audio_us;
 } playback_stats_t;
@@ -98,7 +102,6 @@ static playback_stats_t reply;
 // Track PCM across reply-end markers. Those clear reply statistics while PCM may remain queued.
 static playback_queue_stats_t queue_stats;
 static unsigned reply_sequence;
-static int64_t jitter_until_us;
 
 static uint32_t now_ms(void)
 {
@@ -234,12 +237,23 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     if (first_pcm) {
         reply.id = ++reply_sequence;
         reply.first_audio_us = arrival_us;
+        reply.prebuffer_ms = BASE_PREBUFFER_MS;
     }
-    if (reply.last_audio_us && arrival_us - reply.last_audio_us >= JITTER_GAP_MS * 1000LL) {
-        jitter_until_us = arrival_us + JITTER_HOLD_MS * 1000LL;
-    }
+    const int64_t gap_us = first_pcm ? 0 : arrival_us - reply.last_audio_us;
+    const int64_t span_us = arrival_us - reply.first_audio_us;
+    const unsigned previous_prebuffer_ms = reply.prebuffer_ms;
     reply.last_audio_us = arrival_us;
     reply.delivery.received_samples += samples;
+    const int64_t pcm_us = (int64_t)reply.delivery.received_samples * 1000000 / SUGARAT_SAMPLE_RATE;
+    // An isolated short gap gets a modest reserve. Sustained delivery below 75% of
+    // realtime or a full second between chunks needs more audio before playing.
+    if (gap_us >= SLOW_GAP_MS * 1000LL ||
+        (span_us >= SLOW_RATE_WINDOW_MS * 1000LL && pcm_us * 4 < span_us * 3)) {
+        reply.prebuffer_ms = SLOW_PREBUFFER_MS;
+    } else if (gap_us >= JITTER_GAP_MS * 1000LL && reply.prebuffer_ms < JITTER_PREBUFFER_MS) {
+        reply.prebuffer_ms = JITTER_PREBUFFER_MS;
+    }
+    const unsigned prebuffer_ms = reply.prebuffer_ms;
     playback_frame_t frame = {.generation = current, .reply_id = reply.id};
     portEXIT_CRITICAL(&stats_lock);
     if (first_pcm) voice_timing_first_pcm(frame.reply_id);
@@ -260,6 +274,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         pcm += copied;
         remaining -= frame.count;
     }
+    const int64_t enqueued_ms = remaining != samples ? esp_timer_get_time() / 1000 : -1;
     portENTER_CRITICAL(&stats_lock);
     if (current == atomic_load(&generation)) queue_stats.enqueued_samples += samples - remaining;
     if (reply.id == frame.reply_id) {
@@ -270,6 +285,14 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     portEXIT_CRITICAL(&stats_lock);
     if (remaining != samples) {
         xTaskNotify(worker, 0, eNoAction);
+    }
+    if (first_pcm || gap_us >= REPORT_PCM_GAP_MS * 1000LL ||
+        prebuffer_ms != previous_prebuffer_ms || remaining) {
+        ESP_LOGI(TAG, "PCM enqueue: reply=%u callback_ms=%lld enqueue_ms=%lld gap_ms=%lld "
+                      "accepted_samples=%u dropped_samples=%u received_ms=%lld target_ms=%u",
+                 frame.reply_id, (long long)(arrival_us / 1000), (long long)enqueued_ms,
+                 (long long)(gap_us / 1000), (unsigned)(samples - remaining), (unsigned)remaining,
+                 (long long)(pcm_us / 1000), prebuffer_ms);
     }
 }
 
@@ -290,7 +313,7 @@ static void wait_for_prebuffer(const playback_frame_t *frame, int64_t last_write
         const unsigned samples = reply.enqueued_samples > reply.consumed_samples
                                  ? reply.enqueued_samples - reply.consumed_samples : 0;
         const int64_t first_audio_us = reply.first_audio_us;
-        const unsigned target_ms = rebuffer || now_us < jitter_until_us ? JITTER_PREBUFFER_MS : BASE_PREBUFFER_MS;
+        const unsigned target_ms = reply.prebuffer_ms;
         portEXIT_CRITICAL(&stats_lock);
         if (finished) {
             ESP_LOGI(TAG, "Playback %s: reply=%u trigger=reply_end", rebuffer ? "resumed" : "start", frame->reply_id);
@@ -354,7 +377,9 @@ static bool check_playback_gap(playback_progress_t *progress, int64_t now_us)
     const unsigned empty_ms = empty * SUGARAT_SPEAKER_DMA_SAMPLES * 1000 / SUGARAT_SAMPLE_RATE;
     if (empty_ms > progress->max_empty_ms) progress->max_empty_ms = empty_ms;
     portENTER_CRITICAL(&stats_lock);
-    jitter_until_us = now_us + JITTER_HOLD_MS * 1000LL;
+    if (reply.id == progress->id && reply.prebuffer_ms < JITTER_PREBUFFER_MS) {
+        reply.prebuffer_ms = JITTER_PREBUFFER_MS;
+    }
     portEXIT_CRITICAL(&stats_lock);
     if (gap_ms >= REPORT_PLAYBACK_GAP_MS) {
         ESP_LOGW(TAG, "Playback gap: reply=%u write_gap_ms=%u dma_empty_slots=%u", progress->id, gap_ms, empty);
@@ -454,8 +479,8 @@ esp_err_t voice_playback_start(void)
     agent_link_playback_set_buffer_level_callback(playback_buffer_level, NULL);
     ESP_LOGI(TAG, "Playback buffer: %u ms (%u slots), underrun threshold: %u ms",
              PLAYBACK_CAPACITY_MS, PLAYBACK_FRAMES, SUGARAT_SPEAKER_DMA_MS);
-    ESP_LOGI(TAG, "Playback prebuffer: %u ms, up to %u ms when jitter is detected",
-             BASE_PREBUFFER_MS, JITTER_PREBUFFER_MS);
+    ESP_LOGI(TAG, "Playback prebuffer: normal=%u ms jitter=%u ms slow=%u ms (static PSRAM)",
+             BASE_PREBUFFER_MS, JITTER_PREBUFFER_MS, SLOW_PREBUFFER_MS);
     return ESP_OK;
 }
 
