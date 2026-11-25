@@ -20,10 +20,11 @@ static const char *TAG = "servo_tool";
 static const char DEFINITIONS[] =
     "[{\"name\":\"" SET_POWER "\","
     "\"description\":\"控制用户现实中的钢铁侠面罩。面罩、面具、脸甲、头盔面板、舵机、visor 和 faceplate 指同一个开合机构。"
-    "用户明确要求实际开合时调用。打开、掀开、升起、抬起对应 power=true，目标 B 点。关上、合上、放下、降下对应 power=false，目标 A 点。"
+    "用户明确要求实际开合时必须调用本工具。打开、掀开、升起、抬起对应 power=true，目标 B 点。关上、合上、放下、降下对应 power=false，目标 A 点。"
     "例如把脸甲抬起来、能帮我把面罩放下来吗。上一句明确在说面罩时，打开它和合上也可执行。"
     "闲聊、引用、否定、询问如何操作或仅问状态时不调用。对象或方向不清时先问一句。"
-    "等 C3 工具回执再汇报。executed=true 且 moving=true 时说正在打开或关闭。要确认到位、用户说没动或开合失败时，调用 " GET_STATUS "，不要自行重发开合。\","
+    "设备可能已通过转写执行，调用本工具会复用同一次动作的回执。先等回执，只有 c3_ack=true 且 executed=true 才确认，moving=true 时说正在开合。"
+    "用户说没动、要检查到位或工具失败时，调用 " GET_STATUS " 查询，无法核实时如实说明。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"power\":{\"type\":\"boolean\","
     "\"description\":\"布尔值。true 抬起并打开面罩到 B 点，false 放下并关闭面罩到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15},"
     "{\"name\":\"" GET_STATUS "\","
@@ -78,9 +79,9 @@ static bool parse_power_command(const char *text, bool *open)
 {
     static const char *const wake_punctuation[] = {"，", "。", "：", ",", ".", ":", "！", "!", NULL};
     static const char *const polite_prefixes[] = {"请帮我", "请帮忙", "帮我", "帮忙", "请", NULL};
-    static const char *const targets[] = {"舵机", "面具", "面罩", NULL};
-    static const char *const open_verbs[] = {"打开", "开启", "掀开", "开", NULL};
-    static const char *const close_verbs[] = {"关闭", "关掉", "关上", "合上", "关", NULL};
+    static const char *const targets[] = {"舵机", "面具", "面罩", "脸甲", NULL};
+    static const char *const open_verbs[] = {"抬起来", "抬起", "打开", "开启", "掀开", "开", NULL};
+    static const char *const close_verbs[] = {"放下来", "放下", "关闭", "关掉", "关上", "合上", "关", NULL};
     static const char *const end_punctuation[] = {"。", "！", ".", "!", NULL};
 
     text += strspn(text, " \t\r\n");
@@ -119,6 +120,7 @@ static esp_err_t request_command(servo_tool_operation_t operation, uint8_t posit
                                  servo_tool_request_t *request)
 {
     const int64_t now = esp_timer_get_time();
+    const command_source_t other_source = source == SOURCE_TRANSCRIPT ? SOURCE_MQTT : SOURCE_TRANSCRIPT;
     servo_command_t *match = NULL, *latest = NULL, *free_slot = NULL;
     portENTER_CRITICAL(&command_lock);
     if (source == SOURCE_TRANSCRIPT && !accepting_transcripts) {
@@ -134,16 +136,21 @@ static esp_err_t request_command(servo_tool_operation_t operation, uint8_t posit
         if (operation != SERVO_TOOL_SET_POSITION || entry->request.operation != SERVO_TOOL_SET_POSITION ||
             entry->call != call || entry->match_until_us <= now) continue;
         if (!latest || entry->request.id > latest->request.id) latest = entry;
-        const bool other_source = source == SOURCE_TRANSCRIPT ? entry->sources == SOURCE_MQTT
-                                                               : (entry->sources & SOURCE_TRANSCRIPT) != 0;
-        if (entry->request.position == position && other_source &&
+        if (entry->request.position == position && entry->sources == other_source &&
             (!match || entry->request.id > match->request.id)) {
             match = entry;
         }
     }
-    // A fresh transcript for B after A is a new action, even if an older
-    // MQTT-only B exists. A delayed MQTT for the older B can still use its result.
-    if (source == SOURCE_TRANSCRIPT && latest && latest->request.position != position) match = NULL;
+    if (latest && latest->request.position == position &&
+        (source == SOURCE_TRANSCRIPT || (latest->sources & SOURCE_TRANSCRIPT)) &&
+        (!latest->complete || (latest->c3_ack && latest->state.target == position))) {
+        // Repeated final transcripts or tool calls for the current action share its result.
+        match = latest;
+    } else if (source == SOURCE_TRANSCRIPT && match != latest) {
+        // A new transcript after an intervening target must start a new action.
+        // A first, delayed MQTT counterpart can still join an older transcript.
+        match = NULL;
+    }
     if (match) {
         match->sources |= source;
         *request = match->request;
@@ -176,7 +183,7 @@ static void on_user_transcript(const char *text)
 {
     bool open;
     if (!parse_power_command(text, &open)) {
-        if (strstr(text, "舵机") || strstr(text, "面具") || strstr(text, "面罩")) {
+        if (strstr(text, "舵机") || strstr(text, "面具") || strstr(text, "面罩") || strstr(text, "脸甲")) {
             ESP_LOGI(TAG, "Final user transcript mentions the mechanism without an explicit open/close command");
         }
         return;

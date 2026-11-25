@@ -66,8 +66,7 @@ typedef struct {
 
 typedef struct {
     int agent_id;
-    uint32_t call_started;
-    bool active;
+    uint32_t connection_generation;
     char session_id[sizeof(((agent_link_platform_conversation_t *)0)->id)];
 } tool_job_t;
 
@@ -358,10 +357,10 @@ esp_err_t voice_change_conversation(int agent_id, conversations_action_t action,
     return result;
 }
 
-static void queue_tools(const conversation_cache_t *cache, bool active)
+static void queue_tools(const conversation_cache_t *cache, uint32_t connection_generation)
 {
-    if (!tool_task) return;
-    tool_job_t job = {.agent_id = cache->agent_id, .call_started = atomic_load(&requested_at), .active = active};
+    if (!tool_task || !cache->latest.id[0]) return;
+    tool_job_t job = {.agent_id = cache->agent_id, .connection_generation = connection_generation};
     memcpy(job.session_id, cache->latest.id, sizeof(job.session_id));
     (void)xQueueOverwrite(tool_jobs, &job);
 }
@@ -419,8 +418,13 @@ static esp_err_t request_session(conversation_cache_t *cache, int agent_id)
         if (agent_id == voice_agent_id()) save_conversation(cache);
     }
     if (err == ESP_OK) {
-        err = cache->latest.id[0] ? agent_link_request_realtime_session(agent_id, cache->latest.id)
-                                  : ESP_ERR_NOT_FOUND;
+        if (cache->latest.id[0]) {
+            // Start MQTT setup as soon as we know the conversation. WSS can open in parallel.
+            queue_tools(cache, 0);
+            err = agent_link_request_realtime_session(agent_id, cache->latest.id);
+        } else {
+            err = ESP_ERR_NOT_FOUND;
+        }
     }
     xSemaphoreGive(conversation_lookup);
     return err;
@@ -441,31 +445,40 @@ static void handle_tools(void *context)
 {
     (void)context;
     tool_job_t route = {0};
-    uint32_t retry_after = 0;
+    uint32_t attach_after = 0;
+    uint32_t refresh_after = 0;
+    uint32_t synced_connection = 0;
     while (true) {
         tool_job_t job;
         if (xQueueReceive(tool_jobs, &job, portMAX_DELAY) != pdTRUE) continue;
         const voice_mode_t current = atomic_load(&mode);
-        if (job.active) {
-            if (current != VOICE_ACTIVE || atomic_load(&stop_call) ||
-                job.call_started != atomic_load(&requested_at) || agent_link_state() != AGENT_STATE_READY) continue;
-        } else if (current != VOICE_IDLE) {
-            continue;
-        }
+        if (current == VOICE_BOOT || current == VOICE_FAULT || current == VOICE_MANAGING) continue;
+        const conversation_cache_t selected = load_conversation();
+        if (job.agent_id != selected.agent_id || strcmp(job.session_id, selected.latest.id) != 0) continue;
         if (job.agent_id != route.agent_id || strcmp(job.session_id, route.session_id) != 0) {
             if (route.session_id[0]) agent_link_platform_detach_tool();
             route = job;
-            retry_after = 0;
+            attach_after = 0;
+            refresh_after = 0;
+            synced_connection = 0;
         }
-        if (!job.session_id[0]) continue;
 
+        const uint32_t connection = voice_connection_ready(agent_link_realtime_running())
+                                  ? job.connection_generation : 0;
         const bool attached = agent_link_platform_tool_ready();
-        if ((attached && !job.active) || (!attached && before_deadline(retry_after))) continue;
+        if (attached) {
+            if (!connection || connection == synced_connection || before_deadline(refresh_after)) continue;
+        } else if (before_deadline(attach_after)) {
+            continue;
+        }
         const uint32_t started = now_ms();
         const esp_err_t err = attached ? agent_link_platform_refresh_tool(job.agent_id, job.session_id)
                                        : servo_tool_attach(job.agent_id, job.session_id);
-        if (!attached) {
-            retry_after = now_ms() + TOOL_ATTACH_RETRY_MS;
+        if (err == ESP_OK) synced_connection = connection;
+        if (attached) {
+            refresh_after = err == ESP_OK ? 0 : now_ms() + TOOL_ATTACH_RETRY_MS;
+        } else {
+            attach_after = now_ms() + TOOL_ATTACH_RETRY_MS;
             portENTER_CRITICAL(&tool_reservation_lock);
             reserved_tool_route = err == ESP_ERR_NOT_ALLOWED ? job : (tool_job_t){0};
             portEXIT_CRITICAL(&tool_reservation_lock);
@@ -497,6 +510,7 @@ static void handle_calls(void *context)
     agent_stream_handle_t stream = NULL;
     uint32_t retry_at = 0;
     uint32_t retry_ms = RESIDENT_RETRY_MS;
+    uint32_t connection_generation = 0;
     uint32_t next_stack_check = 0;
     UBaseType_t reported_stack_free = SESSION_STACK_BYTES;
     bool was_ready = false;
@@ -527,6 +541,7 @@ static void handle_calls(void *context)
         const bool ready = voice_connection_ready(running);
         if (ready && !was_ready) {
             retry_ms = RESIDENT_RETRY_MS;
+            ++connection_generation;
             ESP_LOGI(TAG, "Resident voice connected: microphone=%s", stream ? "on" : "off");
         }
         was_ready = ready;
@@ -576,7 +591,7 @@ static void handle_calls(void *context)
                     ESP_LOGI(TAG, "Realtime voice ready: total_ms=%lu resident=yes",
                              (unsigned long)(now_ms() - atomic_load(&requested_at)));
                     atomic_store(&mode, VOICE_ACTIVE);
-                    queue_tools(&resident, true);
+                    queue_tools(&resident, connection_generation);
                 } else if (agent_link_state() == AGENT_STATE_READY) {
                     finish_call(&stream, err);
                 }
@@ -591,9 +606,8 @@ static void handle_calls(void *context)
                     finish_call(&stream, err);
                 }
             }
-        } else if (current == VOICE_IDLE && ready) {
-            queue_tools(&resident, false);
         }
+        if (current == VOICE_IDLE) queue_tools(&resident, ready ? connection_generation : 0);
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(talking ? 10 : 250));
     }
 }
