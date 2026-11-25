@@ -479,8 +479,8 @@ esp_err_t PutToolRegistration(const ToolRegistration& registration, const char* 
     }
     const bool active = BoundAgent(registration.agent_id) && cJSON_IsTrue(Field(data, "connected"));
     const cJSON* generation = Field(data, "generation");
-    ESP_LOGI(TAG, "%s: agent=%d tools=%d/%d active=%d session_match=%d generation=%d",
-             stage, registration.agent_id, installed, required, active, same_session,
+    ESP_LOGI(TAG, "%s: agent=%d session=%s tools=%d/%d active=%d session_match=%d generation=%d",
+             stage, registration.agent_id, registration.session_id, installed, required, active, same_session,
              cJSON_IsNumber(generation) ? generation->valueint : -1);
     cJSON_Delete(response);
     return active && same_session && installed == required ? ESP_OK : ESP_ERR_INVALID_RESPONSE;

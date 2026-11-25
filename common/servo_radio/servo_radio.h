@@ -1,11 +1,13 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
 enum {
     SERVO_RADIO_START_CHANNEL = 6,
+    SERVO_RADIO_MAX_PEERS = 2,
     SERVO_SPEED_MIN = 10,
     SERVO_SPEED_MAX = 50,
     SERVO_SPEED_DEFAULT = 25,
@@ -55,8 +57,11 @@ typedef struct {
 } servo_message_t;
 
 esp_err_t servo_radio_start(const char *peer_mac, servo_radio_mode_t mode);
+esp_err_t servo_radio_start_peers(const char *const peer_macs[], size_t count, servo_radio_mode_t mode);
 esp_err_t servo_radio_attach(const char *peer_mac);
 bool servo_radio_receive(servo_message_t *message);
+bool servo_radio_receive_from(servo_message_t *message, uint8_t *peer_index);
 esp_err_t servo_radio_send(servo_message_t message);
+esp_err_t servo_radio_send_to(uint8_t peer_index, servo_message_t message);
 // Call from the receiving task after handling and replying to any incoming packet.
 void servo_radio_scan_step(void);

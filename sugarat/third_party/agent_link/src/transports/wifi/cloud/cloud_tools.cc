@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mqtt_client.h"
+#include "sdkconfig.h"
 
 namespace {
 constexpr const char* TAG = "agent_link.tools";
@@ -29,6 +30,7 @@ int64_t s_renew_at_us = 0;
 struct RecentReply {
     char request_id[64];
     char data[640];
+    int code;
 };
 EXT_RAM_BSS_ATTR RecentReply s_recent[8]{};  // MQTT QoS 1 can redeliver an already executed command.
 unsigned s_next = 0;
@@ -38,12 +40,48 @@ const char* String(const cJSON* item, const char* name) {
     return cJSON_IsString(field) ? field->valuestring : nullptr;
 }
 
-void Send(const char* topic, const char* json) {
-    const int id = esp_mqtt_client_enqueue(s_client, topic, json, static_cast<int>(strlen(json)), 1, 0, true);
+const char* LogIdentifier(const char* value) {
+    static constexpr char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:[]";
+    return value && strspn(value, chars) == strlen(value) ? value : "<redacted>";
+}
+
+int BrokerPort(const CloudToolCredentials& token, bool wss) {
+#ifdef CONFIG_MQTT_WSS_DEFAULT_PORT
+    constexpr int wss_port = CONFIG_MQTT_WSS_DEFAULT_PORT;
+#else
+    constexpr int wss_port = 443;
+#endif
+#ifdef CONFIG_MQTT_SSL_DEFAULT_PORT
+    constexpr int mqtts_port = CONFIG_MQTT_SSL_DEFAULT_PORT;
+#else
+    constexpr int mqtts_port = 8883;
+#endif
+    if (token.port) return token.port;
+    return wss ? wss_port : mqtts_port;
+}
+
+void LogToolRoute(const CloudToolCredentials& token, bool wss, int port) {
+    static constexpr char path_chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-._~%";
+    const char* path = wss ? (token.path ? token.path : "/") : "-";
+    // WebSocket query strings can carry credentials. Only log the routing path.
+    size_t length = strcspn(path, "?#");
+    if (length > 128 || strspn(path, path_chars) != length) {
+        path = "<redacted>";
+        length = strlen(path);
+    }
+    ESP_LOGI(TAG, "tool MQTT broker: protocol=%s host=%s port=%d ws_path=%.*s",
+             token.protocol, LogIdentifier(token.host), port, static_cast<int>(length), path);
+    ESP_LOGI(TAG, "tool MQTT topics: down=%s up=%s qos=1", s_down, s_up);
+}
+
+void Send(const char* json, const char* request_id, int code, bool cached) {
+    const int id = esp_mqtt_client_enqueue(s_client, s_up, json, static_cast<int>(strlen(json)), 1, 0, true);
     if (id < 0) {
-        ESP_LOGW(TAG, "could not queue device tool response");
+        ESP_LOGW(TAG, "tool MQTT response queue failed: topic=%s reply_to=%s code=%d",
+                 s_up, LogIdentifier(request_id), code);
     } else {
-        ESP_LOGI(TAG, "device tool response queued (mqtt_id=%d)", id);
+        ESP_LOGI(TAG, "tool MQTT response queued: topic=%s reply_to=%s code=%d mqtt_id=%d cached=%u",
+                 s_up, LogIdentifier(request_id), code, id, static_cast<unsigned>(cached));
     }
 }
 
@@ -64,12 +102,15 @@ void Handle(const char* data, size_t size) {
     const char* id = String(request, "msg_id");
     if (!type || strcmp(type, "request") != 0 || !action || !*action || strlen(action) > 64 ||
         !id || !*id || strlen(id) >= sizeof(RecentReply::request_id)) {
+        ESP_LOGW(TAG, "tool MQTT request ignored: invalid envelope on topic=%s", s_down);
         cJSON_Delete(request);
         return;
     }
+    ESP_LOGI(TAG, "tool MQTT request: topic=%s action=%s msg_id=%s",
+             s_down, LogIdentifier(action), LogIdentifier(id));
     for (const auto& prior : s_recent) {
         if (strcmp(id, prior.request_id) == 0) {
-            Send(s_up, prior.data);
+            Send(prior.data, prior.request_id, prior.code, true);
             cJSON_Delete(request);
             return;
         }
@@ -95,7 +136,8 @@ void Handle(const char* data, size_t size) {
     cJSON_AddStringToObject(reply, "action", action);
     cJSON_AddNumberToObject(reply, "timestamp", static_cast<double>(now));
     cJSON_AddStringToObject(reply, "reply_to", id);
-    cJSON_AddNumberToObject(reply, "code", ResultCode(err));
+    const int code = ResultCode(err);
+    cJSON_AddNumberToObject(reply, "code", code);
     cJSON_AddStringToObject(reply, "message", err == ESP_OK ? "success" : esp_err_to_name(err));
     cJSON_AddBoolToObject(result, "ok", err == ESP_OK);
     char* json = cJSON_PrintUnformatted(reply);
@@ -104,8 +146,9 @@ void Handle(const char* data, size_t size) {
             auto& slot = s_recent[s_next++ % (sizeof s_recent / sizeof s_recent[0])];
             snprintf(slot.request_id, sizeof slot.request_id, "%s", id);
             snprintf(slot.data, sizeof slot.data, "%s", json);
+            slot.code = code;
         }
-        Send(s_up, json);
+        Send(json, id, code, false);
         cJSON_free(json);
     }
     cJSON_Delete(reply);
@@ -122,17 +165,18 @@ void OnEvent(void*, esp_event_base_t, int32_t id, void* data) {
         case MQTT_EVENT_SUBSCRIBED:
             if (ev->data_len == 1 && static_cast<uint8_t>(ev->data[0]) < 0x80) {
                 s_subscribed.store(true);
-                ESP_LOGI(TAG, "device tool subscription ready");
+                ESP_LOGI(TAG, "device tool subscription ready: topic=%s qos=%u",
+                         s_down, static_cast<unsigned>(static_cast<uint8_t>(ev->data[0])));
             } else {
                 s_rejected.store(true);
-                ESP_LOGW(TAG, "device tool subscription rejected by broker");
+                ESP_LOGW(TAG, "device tool subscription rejected by broker: topic=%s", s_down);
             }
             break;
         case MQTT_EVENT_DISCONNECTED:
             if (s_subscribed.exchange(false)) ESP_LOGW(TAG, "tool MQTT connection lost");
             break;
         case MQTT_EVENT_PUBLISHED:
-            ESP_LOGI(TAG, "broker acknowledged device tool response (mqtt_id=%d)", ev->msg_id);
+            ESP_LOGI(TAG, "broker acknowledged device tool response: topic=%s mqtt_id=%d", s_up, ev->msg_id);
             break;
         case MQTT_EVENT_ERROR:
             if (ev->error_handle && ev->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
@@ -140,19 +184,21 @@ void OnEvent(void*, esp_event_base_t, int32_t id, void* data) {
                 ESP_LOGW(TAG, "tool MQTT login refused (code=%d)", ev->error_handle->connect_return_code);
             }
             break;
-        case MQTT_EVENT_DATA:
-            if (ev->current_data_offset == 0) {
-                ESP_LOGI(TAG, "tool MQTT received %d bytes (enabled=%d retained=%d)",
-                         ev->total_data_len, s_enabled.load(), ev->retain);
-            }
-            if (s_enabled.load() && s_subscribed.load() && wifi_cloud_requests_allowed() &&
-                !ev->retain && ev->topic && ev->data &&
-                ev->topic_len == static_cast<int>(strlen(s_down)) && !memcmp(ev->topic, s_down, ev->topic_len) &&
-                ev->current_data_offset == 0 && ev->data_len > 0 && ev->data_len == ev->total_data_len) {
-                ESP_LOGI(TAG, "received tool request (%d bytes)", ev->data_len);
+        case MQTT_EVENT_DATA: {
+            if (ev->current_data_offset != 0) break;
+            const bool enabled = s_enabled.load() && s_subscribed.load() && wifi_cloud_requests_allowed();
+            const bool expected_topic = ev->topic && ev->topic_len == static_cast<int>(strlen(s_down)) &&
+                                        memcmp(ev->topic, s_down, ev->topic_len) == 0;
+            const bool complete = ev->data && ev->data_len > 0 && ev->data_len == ev->total_data_len;
+            if (enabled && !ev->retain && expected_topic && complete) {
                 Handle(ev->data, ev->data_len);
+            } else {
+                ESP_LOGW(TAG, "tool MQTT packet ignored: expected_topic=%s match=%u enabled=%u retained=%d complete=%u",
+                         s_down, static_cast<unsigned>(expected_topic), static_cast<unsigned>(enabled),
+                         ev->retain, static_cast<unsigned>(complete));
             }
             break;
+        }
         default: break;
     }
 }
@@ -188,7 +234,8 @@ esp_err_t cloud_tools_start(const CloudToolCredentials& token) {
     esp_mqtt_client_config_t config{};
     config.broker.address.transport = wss ? MQTT_TRANSPORT_OVER_WSS : MQTT_TRANSPORT_OVER_SSL;
     config.broker.address.hostname = token.host;
-    config.broker.address.port = token.port;
+    const int port = BrokerPort(token, wss);
+    config.broker.address.port = port;
     if (wss && token.path) config.broker.address.path = token.path;
     config.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
     config.credentials.client_id = token.client_id;
@@ -199,6 +246,7 @@ esp_err_t cloud_tools_start(const CloudToolCredentials& token) {
     config.network.reconnect_timeout_ms = 5000;
     config.network.timeout_ms = 10000;
     config.task.stack_size = 7 * 1024;
+    LogToolRoute(token, wss, port);
     s_client = esp_mqtt_client_init(&config);
     if (!s_client) return ESP_ERR_NO_MEM;
     esp_err_t err = esp_mqtt_client_register_event(s_client, MQTT_EVENT_ANY, &OnEvent, nullptr);

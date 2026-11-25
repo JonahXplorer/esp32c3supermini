@@ -1,7 +1,6 @@
 #include "servo_tool.h"
 
 #include <string.h>
-#include <strings.h>
 
 #include "agent_link_platform.h"
 #include "cJSON.h"
@@ -10,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "servo_voice_command.h"
 
 // An idle C3 can be scanning for Sugarat when the first voice command arrives.
 enum { ACK_TIMEOUT_MS = 5500, TOOL_WINDOW_MS = 15000, MAX_RECENT_COMMANDS = 16 };
@@ -19,9 +19,10 @@ static const char *TAG = "servo_tool";
 #define GET_STATUS "get_servo_status"
 static const char DEFINITIONS[] =
     "[{\"name\":\"" SET_POWER "\","
-    "\"description\":\"控制用户现实中的钢铁侠面罩。面罩、面具、脸甲、头盔面板、舵机、visor 和 faceplate 指同一个开合机构。"
+    "\"description\":\"控制用户现实中的钢铁侠面罩。面罩、面具、脸甲、头盔面板、舵机、faceplate、visor、mask、helmet 和 servo 指同一个开合机构。"
     "用户明确要求实际开合时必须调用本工具。打开、掀开、升起、抬起对应 power=true，目标 B 点。关上、合上、放下、降下对应 power=false，目标 A 点。"
     "例如把脸甲抬起来、能帮我把面罩放下来吗。上一句明确在说面罩时，打开它和合上也可执行。"
+    "English: open the visor or raise the faceplate to B. Close the mask or lower the faceplate to A. "
     "闲聊、引用、否定、询问如何操作或仅问状态时不调用。对象或方向不清时先问一句。"
     "即使设备已按转写词执行，也要调用本工具取得同一次动作的 C3 回执。source=transcript 表示由 Sugarat 本地规则发起。"
     "只有 c3_ack=true 且 executed=true 才确认，moving=true 时说正在开合。要核对刚才的执行结果，调用 " GET_STATUS " 并传 last_command_only=true。"
@@ -60,57 +61,6 @@ static uint32_t sequence;
 static uint32_t call;
 static portMUX_TYPE command_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool accepting_transcripts;
-
-static bool take_phrase(const char **text, const char *phrase)
-{
-    const size_t length = strlen(phrase);
-    if (strncmp(*text, phrase, length) != 0) return false;
-    *text += length;
-    *text += strspn(*text, " \t\r\n");
-    return true;
-}
-
-static bool take_one_of(const char **text, const char *const *phrases)
-{
-    for (; *phrases; ++phrases) {
-        if (take_phrase(text, *phrases)) return true;
-    }
-    return false;
-}
-
-static bool parse_power_command(const char *text, bool *open)
-{
-    static const char *const wake_punctuation[] = {"，", "。", "：", ",", ".", ":", "！", "!", NULL};
-    static const char *const polite_prefixes[] = {"请帮我", "请帮忙", "帮我", "帮忙", "请", NULL};
-    static const char *const targets[] = {"舵机", "面具", "面罩", "脸甲", NULL};
-    static const char *const open_verbs[] = {"抬起来", "抬起", "打开", "开启", "掀开", "开", NULL};
-    static const char *const close_verbs[] = {"放下来", "放下", "关闭", "关掉", "关上", "合上", "关", NULL};
-    static const char *const end_punctuation[] = {"。", "！", ".", "!", NULL};
-
-    text += strspn(text, " \t\r\n");
-    // The wake-word audio can be transcribed together with the first command.
-    if (strncasecmp(text, "Jarvis", sizeof("Jarvis") - 1) == 0) {
-        text += sizeof("Jarvis") - 1;
-        text += strspn(text, " \t\r\n");
-        (void)take_one_of(&text, wake_punctuation);
-    } else if (take_phrase(&text, "贾维斯")) {
-        (void)take_one_of(&text, wake_punctuation);
-    }
-    (void)take_one_of(&text, polite_prefixes);
-    const bool target_first = take_phrase(&text, "把");
-    if (target_first && !take_one_of(&text, targets)) return false;
-
-    const bool enabled = take_one_of(&text, open_verbs);
-    if (!enabled && !take_one_of(&text, close_verbs)) return false;
-    (void)take_phrase(&text, "一下");
-    if (!target_first && !take_one_of(&text, targets)) return false;
-    (void)take_phrase(&text, "一下");
-    (void)take_phrase(&text, "吧");
-    while (take_one_of(&text, end_punctuation)) {}
-    if (*text != '\0') return false;
-    *open = enabled;
-    return true;
-}
 
 static const char *source_name(command_source_t source)
 {
@@ -187,16 +137,17 @@ static esp_err_t request_command(servo_tool_operation_t operation, uint8_t posit
 
 static void on_user_transcript(const char *text)
 {
-    bool open;
-    if (!parse_power_command(text, &open)) {
-        if (strstr(text, "舵机") || strstr(text, "面具") || strstr(text, "面罩") || strstr(text, "脸甲")) {
+    const servo_voice_command_t command = servo_voice_command_parse(text);
+    if (command == SERVO_VOICE_NONE) {
+        if (text && (strstr(text, "舵机") || strstr(text, "面具") || strstr(text, "面罩") || strstr(text, "脸甲"))) {
             ESP_LOGI(TAG, "Final user transcript mentions the mechanism without an explicit open/close command");
         }
         return;
     }
 
     servo_tool_request_t request;
-    const esp_err_t err = request_command(SERVO_TOOL_SET_POSITION, open ? 1 : 0, SOURCE_TRANSCRIPT, &request);
+    const uint8_t position = command == SERVO_VOICE_OPEN ? 1 : 0;
+    const esp_err_t err = request_command(SERVO_TOOL_SET_POSITION, position, SOURCE_TRANSCRIPT, &request);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "Transcript servo command rejected: %s", esp_err_to_name(err));
     }
