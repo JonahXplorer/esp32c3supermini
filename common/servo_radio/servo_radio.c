@@ -15,15 +15,21 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-enum { SEARCH_DWELL_MS = 420, FOLLOW_TIMEOUT_MS = 1500, DIAGNOSTIC_DEPTH = 8 };
+enum {
+    SEARCH_DWELL_MS = 210,
+    PREFERRED_DWELL_MS = 240,
+    ACTIVE_HOLD_MS = 1000,
+    DIAGNOSTIC_DEPTH = 8,
+};
 
 typedef struct {
     uint8_t first_channel;
     uint8_t last_channel;
     uint8_t current_channel;
-    uint8_t candidate;
-    bool locked;
-    TickType_t last_activity;
+    uint8_t preferred_channel;
+    uint8_t next_probe_channel;
+    TickType_t hold_started;
+    TickType_t hold_ticks;
 } channel_follower_t;
 
 typedef struct {
@@ -223,6 +229,25 @@ static uint8_t next_channel(uint8_t channel)
     return channel < follower.last_channel ? channel + 1 : follower.first_channel;
 }
 
+static void hold_current_channel(unsigned duration_ms)
+{
+    follower.hold_started = xTaskGetTickCount();
+    follower.hold_ticks = pdMS_TO_TICKS(duration_ms);
+}
+
+static void remember_peer_channel(uint8_t channel, uint8_t peer_index)
+{
+    // Keep the radio here for the state reply and any follow-up commands.
+    hold_current_channel(ACTIVE_HOLD_MS);
+    if (channel == follower.preferred_channel) return;
+
+    const uint8_t previous_channel = follower.preferred_channel;
+    follower.preferred_channel = channel;
+    follower.next_probe_channel = next_channel(channel);
+    ESP_LOGI(TAG, "Paired Sugarat found on channel %u (previous=%u, peer=%u)",
+             channel, previous_channel, peer_index);
+}
+
 esp_err_t servo_radio_start(const char *peer_mac, servo_radio_mode_t mode)
 {
     return servo_radio_start_peers(&peer_mac, 1, mode);
@@ -253,34 +278,39 @@ esp_err_t servo_radio_start_peers(const char *const peer_macs[], size_t count, s
     ESP_RETURN_ON_ERROR(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE), TAG, "ESP-NOW channel");
     if (mode == SERVO_RADIO_FOLLOW_PEER) {
         follower.current_channel = channel;
-        follower.candidate = next_channel(channel);
-        follower.last_activity = xTaskGetTickCount();
-        ESP_LOGI(TAG, "Looking for paired Sugarat on channels %u-%u, starting on %u",
-                 follower.first_channel, follower.last_channel, channel);
+        follower.next_probe_channel = next_channel(channel);
+        hold_current_channel(SEARCH_DWELL_MS);
+        ESP_LOGI(TAG, "Looking for paired Sugarat on channels %u-%u, starting on %u; preferred dwell %u ms, probe %u ms",
+                 follower.first_channel, follower.last_channel, channel, PREFERRED_DWELL_MS, SEARCH_DWELL_MS);
     }
     return start_esp_now();
 }
 
 void servo_radio_scan_step(void)
 {
-    const TickType_t now = xTaskGetTickCount();
-    const TickType_t dwell = pdMS_TO_TICKS(follower.locked ? FOLLOW_TIMEOUT_MS : SEARCH_DWELL_MS);
-    if (follower.first_channel == 0 || now - follower.last_activity < dwell) {
+    if (follower.first_channel == 0 || follower.first_channel == follower.last_channel ||
+        xTaskGetTickCount() - follower.hold_started < follower.hold_ticks) {
         return;
     }
-    if (follower.locked) {
-        ESP_LOGW(TAG, "Sugarat timed out on channel %u; searching again", follower.current_channel);
-        follower.locked = false;
+
+    // Once a channel is known, return to it between probes. A probe spans an
+    // ESP-NOW retry from Sugarat, so a peer that changes channel can be found.
+    const bool return_to_preferred = follower.preferred_channel != 0 &&
+                                     follower.current_channel != follower.preferred_channel;
+    const uint8_t channel = return_to_preferred ? follower.preferred_channel : follower.next_probe_channel;
+    if (!return_to_preferred) {
+        follower.next_probe_channel = next_channel(channel);
+        if (follower.next_probe_channel == follower.preferred_channel) {
+            follower.next_probe_channel = next_channel(follower.next_probe_channel);
+        }
     }
-    const uint8_t channel = follower.candidate;
-    follower.candidate = next_channel(channel);
-    follower.last_activity = now;
     const esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if (result == ESP_OK) {
         follower.current_channel = channel;
     } else {
         ESP_LOGW(TAG, "Could not tune to channel %u: %s", channel, esp_err_to_name(result));
     }
+    hold_current_channel(return_to_preferred ? PREFERRED_DWELL_MS : SEARCH_DWELL_MS);
 }
 
 static esp_err_t home_channel(uint8_t *channel)
@@ -329,11 +359,7 @@ bool servo_radio_receive_from(servo_message_t *message, uint8_t *peer_index)
                          (unsigned)packet.message.type);
                 continue;
             }
-            follower.last_activity = xTaskGetTickCount();
-            if (!follower.locked) {
-                follower.locked = true;
-                ESP_LOGI(TAG, "Paired Sugarat found on channel %u", channel);
-            }
+            remember_peer_channel(channel, packet.peer_index);
         }
         *message = packet.message;
         if (peer_index) *peer_index = packet.peer_index;
