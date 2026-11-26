@@ -150,7 +150,7 @@ void screen_conversations_build(lv_obj_t *page)
     refresh = toolbar_button(page, LV_SYMBOL_REFRESH, 0, 287, 44, PANEL);
     next = toolbar_button(page, LV_SYMBOL_RIGHT, 58, 287, 52, PANEL);
 
-    confirmation = screen_surface(page, SCREEN_SIZE, SCREEN_SIZE, 0, BG);
+    confirmation = screen_surface(page, lv_pct(100), lv_pct(100), 0, BG);
     lv_obj_add_flag(confirmation, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_opa(confirmation, LV_OPA_80, 0);
     lv_obj_t *card = screen_surface(confirmation, 242, 196, 26, PANEL);

@@ -19,22 +19,17 @@ static uint32_t tick_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-static int physical_edge(int logical)
-{
-    return (logical * AMOLED_PANEL_SIZE + SCREEN_SIZE - 1) / SCREEN_SIZE;
-}
-
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 {
     const int width = lv_area_get_width(area), height = lv_area_get_height(area);
     lv_draw_sw_rgb565_swap(pixels, width * height);
     const uint16_t *source = (const uint16_t *)pixels;
-    const int left = physical_edge(area->x1), top = physical_edge(area->y1);
-    const int right = physical_edge(area->x2 + 1), bottom = physical_edge(area->y2 + 1);
+    const int left = area->x1, top = area->y1;
+    const int right = area->x2 + 1, bottom = area->y2 + 1;
     for (int y = top; y < bottom; ++y) {
-        const int sy = y * SCREEN_SIZE / AMOLED_PANEL_SIZE - area->y1;
+        const int sy = y - top;
         for (int x = left; x < right; ++x) {
-            const int sx = x * SCREEN_SIZE / AMOLED_PANEL_SIZE - area->x1;
+            const int sx = x - left;
             // Clockwise rotation in native panel space: (x,y) -> (465-y,x).
             panel_pixels[x * AMOLED_PANEL_SIZE + AMOLED_PANEL_SIZE - 1 - y] = source[sy * width + sx];
         }

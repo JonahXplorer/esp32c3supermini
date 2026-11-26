@@ -13,7 +13,7 @@ static unsigned attribute_reads, report_reads, acknowledgements, command_writes,
 static unsigned delays[4], delay_count;
 static bool fail_read, fail_ack, irq_during_read;
 static uint8_t packet[15];
-static uint16_t displayed[466 * 466], logical[360 * 360], pixels[360 * 360];
+static uint16_t displayed[466 * 466], logical[466 * 466], pixels[466 * 466];
 
 void vTaskDelay(unsigned ms) { assert(delay_count < 4); delays[delay_count++] = ms; }
 int64_t esp_timer_get_time(void) { return 10000000; }
@@ -130,8 +130,8 @@ static void check_image(void)
 {
     // Independent inverse-rotation oracle for every native physical pixel.
     for (int py = 0; py < 466; ++py) for (int px = 0; px < 466; ++px) {
-        const int sx = py * 360 / 466, sy = (465 - px) * 360 / 466;
-        const uint16_t value = logical[sy * 360 + sx];
+        const int sx = py, sy = 465 - px;
+        const uint16_t value = logical[sy * 466 + sx];
         assert(displayed[py * 466 + px] == (uint16_t)((value >> 8) | (value << 8)));
     }
 }
@@ -140,17 +140,17 @@ static void repaint(lv_area_t area, unsigned salt)
     size_t count = 0;
     for (int y = area.y1; y <= area.y2; ++y) for (int x = area.x1; x <= area.x2; ++x) {
         const uint16_t value = (uint16_t)(x * 251 + y * 17 + salt);
-        pixels[count++] = logical[y * 360 + x] = value;
+        pixels[count++] = logical[y * 466 + x] = value;
     }
     flush(NULL, &area, (uint8_t *)pixels);
     check_image();
 }
 static void rotation_and_touch(void)
 {
-    repaint((lv_area_t){0, 0, 359, 359}, 0);
+    repaint((lv_area_t){0, 0, 465, 465}, 0);
     repaint((lv_area_t){1, 3, 7, 8}, 1000);
-    repaint((lv_area_t){359, 0, 359, 359}, 2000);
-    repaint((lv_area_t){0, 355, 359, 359}, 3000);
+    repaint((lv_area_t){465, 0, 465, 465}, 2000);
+    repaint((lv_area_t){0, 461, 465, 465}, 3000);
     assert(flushes == 4);
     // Raw touch is mirrored by the board mounting. Verify it selects exactly the
     // logical pixel shown at that physical location after clockwise rotation.
@@ -159,7 +159,7 @@ static void rotation_and_touch(void)
         bool pressed; int x, y;
         assert(sugarat_touch_read(&pressed, &x, &y) == ESP_OK && pressed);
         const unsigned px = 465 - raw_x, py = 465 - raw_y;
-        const uint16_t value = logical[y * 360 + x];
+        const uint16_t value = logical[y * 466 + x];
         assert(displayed[py * 466 + px] == (uint16_t)((value >> 8) | (value << 8)));
     }
     puts("PASS: clockwise full/partial redraws, aligned windows and 217156 touch/display positions");

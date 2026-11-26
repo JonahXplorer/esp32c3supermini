@@ -5,8 +5,8 @@
 #include "esp_err.h"
 #include "driver/i2c_master.h"
 
-// The original 360px interface is scaled to the native 466px AMOLED in screen_port.
-enum { SCREEN_SIZE = 360, AMOLED_PANEL_SIZE = 466,
+// UI and touch coordinates use native panel pixels; screen_port rotates 90deg CW.
+enum { SCREEN_SIZE = 466, AMOLED_PANEL_SIZE = 466,
        SUGARAT_BRIGHTNESS_MIN = 5, SUGARAT_BRIGHTNESS_DEFAULT = 74 };
 
 esp_err_t amoled_board_init(void);

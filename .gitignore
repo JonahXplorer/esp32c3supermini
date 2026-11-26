@@ -1,0 +1,8 @@
+# Locally installed agent skills and their installer metadata.
+/.agents/skills/
+/skills-lock.json
+
+# Python caches from local tooling.
+__pycache__/
+*.pyc
+*.pyo

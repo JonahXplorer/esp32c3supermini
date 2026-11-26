@@ -8,6 +8,16 @@
 #include "servo_radio.h"
 #include <string.h>
 
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+#include "home_presenter.h"
+#include "playback.h"
+#include "ui_theme.h"
+enum { SECONDARY_PAGE_SIZE = 360 };
+static home_screen_t *native_home;
+#else
+enum { SECONDARY_PAGE_SIZE = SCREEN_SIZE };
+#endif
+
 enum { WAVE_BARS = 9 };
 
 typedef enum {
@@ -33,6 +43,7 @@ typedef struct {
     bool awaiting;
 } adjustment_t;
 
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
 typedef struct {
     const char *title;
     const char *detail;
@@ -57,6 +68,7 @@ static const voice_copy_t voice_copy[] = {
     [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Restoring the voice connection", AMBER},
     [SUGARAT_VOICE_NO_SESSION]   = {"No voice session", "Create one in Settings", LILAC},
 };
+#endif
 
 static lv_obj_t *pages[PAGE_COUNT];
 static lv_obj_t *home_grab;
@@ -67,6 +79,7 @@ static lv_obj_t *light_label;
 static lv_obj_t *angle_caption;
 static adjustment_t angle = {.action = SCREEN_SET_ANGLE};
 static adjustment_t speed = {.action = SCREEN_SET_SPEED};
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
 static lv_obj_t *voice_ring;
 static lv_obj_t *voice_core;
 static lv_obj_t *voice_orbit[2];
@@ -74,6 +87,7 @@ static lv_obj_t *waveform[WAVE_BARS];
 static lv_obj_t *voice_title;
 static lv_obj_t *voice_detail;
 static lv_obj_t *voice_end;
+#endif
 static lv_obj_t *wifi_status;
 static lv_obj_t *wifi_setup;
 
@@ -81,7 +95,9 @@ static page_t active_page;
 static screen_action_t action;
 static screen_state_t displayed;
 static bool has_state;
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
 static uint32_t wave_updated;
+#endif
 static int32_t pull_start_y;
 static bool pulling;
 static lv_point_t home_swipe_start;
@@ -138,6 +154,11 @@ static void slide_y(void *object, int32_t y)
     lv_obj_set_y(object, y);
 }
 
+static int page_origin(page_t page)
+{
+    return page == PAGE_HOME ? 0 : (SCREEN_SIZE - SECONDARY_PAGE_SIZE) / 2;
+}
+
 static void show_page(page_t page)
 {
     if (page == active_page) return;
@@ -148,13 +169,16 @@ static void show_page(page_t page)
     if (page == PAGE_SESSIONS) screen_conversations_open(true);
     screen_set_hidden(pages[page], false);
     screen_set_hidden(home_grab, page == PAGE_HOME);
-    lv_obj_set_y(pages[page], 0);
+    lv_obj_set_y(pages[page], page_origin(page));
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    home_screen_set_visible(native_home, page == PAGE_HOME);
+#endif
     if (page == PAGE_SHADE) {
         lv_anim_t animation;
         lv_anim_init(&animation);
         lv_anim_set_var(&animation, pages[page]);
         lv_anim_set_exec_cb(&animation, slide_y);
-        lv_anim_set_values(&animation, -SCREEN_SIZE, 0);
+        lv_anim_set_values(&animation, -SCREEN_SIZE, page_origin(page));
         lv_anim_set_duration(&animation, 180);
         lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
         lv_anim_start(&animation);
@@ -421,6 +445,29 @@ static void build_servos(lv_obj_t *page)
 
 }
 
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+static void native_home_action(home_action_t selected, void *context)
+{
+    (void)context;
+    switch (selected) {
+    case HOME_START_CALL: action = (screen_action_t){.kind = SCREEN_START_CALL}; break;
+    case HOME_END_CALL: action = (screen_action_t){.kind = SCREEN_END_CALL}; break;
+    case HOME_SETUP_WIFI: action = (screen_action_t){.kind = SCREEN_SETUP_WIFI}; break;
+    case HOME_OPEN_SETTINGS: show_page(PAGE_SETTINGS); break;
+    case HOME_OPEN_SESSIONS: show_page(PAGE_SESSIONS); break;
+    default: break;
+    }
+}
+
+static void build_home(lv_obj_t *page)
+{
+    native_home = home_screen_create(page, native_home_action, NULL);
+    if (!native_home) return;
+    lv_obj_t *header = home_screen_header(native_home);
+    lv_obj_add_flag(header, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(header, pull_down, LV_EVENT_ALL, NULL);
+}
+#else
 static lv_obj_t *orbit(lv_obj_t *parent, int size, int start, int end)
 {
     lv_obj_t *arc = lv_arc_create(parent);
@@ -480,6 +527,7 @@ static void build_home(lv_obj_t *page)
     lv_obj_set_style_bg_color(voice_end, lv_color_hex(0x4C202B), 0);
     lv_obj_add_event_cb(voice_end, command_clicked, LV_EVENT_CLICKED, (void *)&end_command);
 }
+#endif
 
 static void build_settings(void)
 {
@@ -534,13 +582,22 @@ esp_err_t screen_init(bool touch_ready)
     lv_obj_t *root = lv_screen_active();
     lv_obj_remove_style_all(root);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    lv_obj_set_style_bg_color(root, UI_BG, 0);
+#else
     lv_obj_set_style_bg_color(root, lv_color_hex(BG), 0);
+#endif
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     for (int i = 0; i < PAGE_COUNT; ++i) {
-        pages[i] = screen_surface(root, SCREEN_SIZE, SCREEN_SIZE, 0, BG);
+        const int size = i == PAGE_HOME ? SCREEN_SIZE : SECONDARY_PAGE_SIZE;
+        pages[i] = screen_surface(root, size, size, 0, BG);
+        lv_obj_set_pos(pages[i], page_origin((page_t)i), page_origin((page_t)i));
         screen_set_hidden(pages[i], i != PAGE_HOME);
     }
     build_home(pages[PAGE_HOME]);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    if (!native_home) return ESP_ERR_NO_MEM;
+#endif
     build_settings();
     build_servos(pages[PAGE_MANUAL]);
 
@@ -593,6 +650,7 @@ static void sync_adjustment(adjustment_t *control, int confirmed, bool enabled, 
     }
 }
 
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
 static void show_voice(const sugarat_voice_view_t *voice)
 {
     const voice_copy_t *copy = &voice_copy[voice->phase];
@@ -636,6 +694,8 @@ static void animate_wave(const sugarat_voice_view_t *voice)
     }
 }
 
+#endif
+
 static void update_manual(const screen_state_t *state)
 {
     const manual_control_view_t *view = &state->manual;
@@ -675,12 +735,17 @@ void screen_update(const screen_state_t *state)
     if (active_page == PAGE_SESSIONS) screen_conversations_update(&state->voice);
     sync_level(&volume, state->settings.volume);
     sync_level(&brightness, state->settings.brightness);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    const home_snapshot_t home = home_presenter_snapshot(state, voice_playback_level());
+    home_screen_update(native_home, &home);
+#else
     if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
         state->voice.speaking != displayed.voice.speaking ||
         strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {
         show_voice(&state->voice);
     }
     if (active_page == PAGE_HOME) animate_wave(&state->voice);
+#endif
     if (!has_state || state->wifi_connected != displayed.wifi_connected ||
         state->wifi_setup_active != displayed.wifi_setup_active ||
         state->voice.can_end != displayed.voice.can_end || state->voice.phase != displayed.voice.phase) {
