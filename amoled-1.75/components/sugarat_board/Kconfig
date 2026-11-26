@@ -1,0 +1,10 @@
+menu "Waveshare AMOLED 1.75 audio"
+    config AMOLED_MIC_GAIN_DB
+        int "ES7210 microphone gain (dB)"
+        range 0 37
+        default 24
+    config AMOLED_REFERENCE_GAIN_DB
+        int "ES7210 analog playback reference gain (dB)"
+        range 0 37
+        default 0
+endmenu

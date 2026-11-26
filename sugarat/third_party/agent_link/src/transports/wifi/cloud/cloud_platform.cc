@@ -40,34 +40,43 @@ std::mutex s_agent_mutex;
 agent_link_platform_agent_t s_bound_agent = {};
 char s_bound_key[CLOUD_AUTH_KEY_MAX] = {};
 
-// Keep one platform HTTPS connection for the voice path on S3. Tool uploads use
-// separate clients so they never hold the grant's connection lock.
-enum class HttpConnection { kOneShot, kVoice, kVoiceReuseOnly };
-constexpr int64_t kVoiceIdleUs = 45 * 1000000LL;
+enum class VoiceHttp { kNone, kKeepAlive, kReuseOnly };
+constexpr int64_t kHttpIdleUs = 45 * 1000000LL;
 constexpr int kPlatformHttpTimeoutMs = 12000;
 constexpr int kGrantCleanupTimeoutMs = 1200;
+
+struct HttpReuse {
+    esp_http_client_handle_t client = nullptr;
+    int64_t idle_until = 0;
+    uint32_t generation = 0;
+
+    HttpReuse() = default;
+    HttpReuse(const HttpReuse&) = delete;
+    HttpReuse& operator=(const HttpReuse&) = delete;
+    ~HttpReuse() { Close(); }
+    void Close() {
+        if (client) esp_http_client_cleanup(client);
+        client = nullptr;
+        idle_until = 0;
+        generation = 0;
+    }
+
+    bool Idle(uint32_t network_generation) const {
+        if (!client || generation != network_generation || esp_timer_get_time() >= idle_until ||
+            esp_http_client_get_state(client) != HTTP_STATE_CONNECTED) return false;
+        const int socket = esp_http_client_get_socket(client);
+        if (socket < 0) return false;
+        char byte;
+        const int received = recv(socket, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+        // EOF, pending TLS data or a socket error calls for a fresh connection.
+        return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+};
+
+// Tools keep their own HTTPS connection only for the duration of a mount.
+// The voice grant and cleanup continue to use this independently locked client.
 std::mutex s_voice_http_mutex;
-esp_http_client_handle_t s_voice_http = nullptr;
-int64_t s_voice_idle_until = 0;
-uint32_t s_voice_http_generation = 0;
-
-void CloseVoiceHttp() {
-    if (s_voice_http) esp_http_client_cleanup(s_voice_http);
-    s_voice_http = nullptr;
-    s_voice_idle_until = 0;
-    s_voice_http_generation = 0;
-}
-
-bool VoiceSocketIdle() {
-    if (!s_voice_http || esp_timer_get_time() >= s_voice_idle_until) return false;
-    const int socket = esp_http_client_get_socket(s_voice_http);
-    if (socket < 0) return false;
-    char byte;
-    const int received = recv(socket, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
-    // An idle HTTP socket has no pending bytes. EOF, an error, or pending
-    // TLS data all call for a fresh connection instead of replaying a POST.
-    return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-}
+HttpReuse s_voice_http;
 
 bool SafeId(const char* id) {
     if (!id || !*id || strlen(id) > 79) return false;
@@ -166,8 +175,8 @@ int ElapsedMs(int64_t from, int64_t to) {
 
 esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const char* path, const char* body,
                    size_t capacity, cJSON** root_out, int* status_out,
-                   HttpConnection connection = HttpConnection::kOneShot, ExchangeTime* timing = nullptr,
-                   int* business_code = nullptr) {
+                   VoiceHttp voice_http = VoiceHttp::kNone, ExchangeTime* timing = nullptr,
+                   int* business_code = nullptr, HttpReuse* tool_http = nullptr) {
     agentlink::cloud::NetworkMemoryLock memory;
     if (root_out) *root_out = nullptr;
     if (status_out) *status_out = 0;
@@ -180,11 +189,13 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     char url[800];
     const int url_len = snprintf(url, sizeof url, "%s%s", s_base, path);
     if (url_len <= 0 || url_len >= static_cast<int>(sizeof url)) return ESP_ERR_INVALID_SIZE;
-    const bool reuse_only = connection == HttpConnection::kVoiceReuseOnly;
+    const bool reuse_only = voice_http == VoiceHttp::kReuseOnly;
 #if CONFIG_IDF_TARGET_ESP32S3
-    const bool keep_voice = connection != HttpConnection::kOneShot;
+    const bool keep_voice = voice_http != VoiceHttp::kNone;
+    HttpReuse* cache = keep_voice ? &s_voice_http : tool_http;
 #else
     const bool keep_voice = false;
+    HttpReuse* cache = nullptr;
 #endif
     std::unique_lock<std::mutex> voice_lock(s_voice_http_mutex, std::defer_lock);
     if (keep_voice) {
@@ -196,15 +207,13 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
         } else {
             voice_lock.lock();
         }
-        const bool idle = s_voice_http_generation == network_generation && VoiceSocketIdle() &&
-                          esp_http_client_get_state(s_voice_http) == HTTP_STATE_CONNECTED;
-        if (!idle) {
-            if (reuse_only) {
-                ESP_LOGI(TAG, "%s: skipped before retry (no reusable HTTPS connection)", operation);
-                return ESP_ERR_INVALID_STATE;
-            }
-            CloseVoiceHttp();
+    }
+    if (cache && !cache->Idle(network_generation)) {
+        if (reuse_only) {
+            ESP_LOGI(TAG, "%s: skipped before retry (no reusable HTTPS connection)", operation);
+            return ESP_ERR_INVALID_STATE;
         }
+        cache->Close();
     }
     if (network_generation != wifi_cloud_network_generation() || !wifi_cloud_requests_allowed()) {
         return ESP_ERR_INVALID_STATE;
@@ -228,16 +237,16 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     config.user_data = &response;
     config.buffer_size = 1024;
     config.buffer_size_tx = 1024;
-    config.keep_alive_enable = keep_voice;
+    config.keep_alive_enable = cache != nullptr;
     config.keep_alive_idle = 10;
     config.keep_alive_interval = 5;
     config.keep_alive_count = 3;
-    const bool reused = keep_voice && s_voice_http;
-    esp_http_client_handle_t client = reused ? s_voice_http : esp_http_client_init(&config);
+    const bool reused = cache && cache->client;
+    esp_http_client_handle_t client = reused ? cache->client : esp_http_client_init(&config);
     if (!client) { free(buffer); return ESP_ERR_NO_MEM; }
-    if (keep_voice) {
-        s_voice_http = client;
-        s_voice_http_generation = network_generation;
+    if (cache) {
+        cache->client = client;
+        cache->generation = network_generation;
     }
 
     esp_err_t result = ESP_OK;
@@ -256,8 +265,10 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     const int64_t request_started = esp_timer_get_time();
     if (result == ESP_OK) result = esp_http_client_perform(client);
     const int64_t finished = esp_timer_get_time();
-    if (result == ESP_ERR_HTTP_CONNECT && esp_http_client_get_and_clear_last_tls_error(client, nullptr, nullptr) ==
-        ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
+    int tls_code = 0, tls_flags = 0;
+    const esp_err_t tls_error = result == ESP_ERR_HTTP_CONNECT
+                            ? esp_http_client_get_and_clear_last_tls_error(client, &tls_code, &tls_flags) : ESP_OK;
+    if (tls_error == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
         wifi_cloud_dns_result(network_generation, false);
     } else if (response.connected_at) {
         wifi_cloud_dns_result(network_generation, true);
@@ -265,21 +276,23 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
     if (network_generation != wifi_cloud_network_generation()) result = ESP_ERR_INVALID_STATE;
     if (timing) *timing = {request_started, response.server_utc_ms};
     const int status = result == ESP_OK ? esp_http_client_get_status_code(client) : 0;
-    if (keep_voice || status_out) {
+    if (keep_voice || tool_http || status_out) {
         wifi_ps_type_t power_save;
         wifi_ap_record_t ap;
         const int ps = esp_wifi_get_ps(&power_save) == ESP_OK ? static_cast<int>(power_save) : -1;
         const int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
         const bool used_existing_socket = reused && !response.connected_at && response.headers_sent_at;
-        ESP_LOGI(TAG, "%s timing: connection=%s connect_ms=%d send_headers_ms=%d wait_status_ms=%d receive_ms=%d total_ms=%d http=%d wifi_ps=%d rssi=%d",
+        ESP_LOGI(TAG, "%s timing: connection=%s connect_ms=%d send_headers_ms=%d wait_status_ms=%d receive_ms=%d "
+                 "total_ms=%d http=%d wifi_ps=%d rssi=%d result=%s tls=%s mbedtls=%d tls_flags=0x%x",
                  operation, used_existing_socket ? "reused" : "new",
                  used_existing_socket ? 0 : ElapsedMs(request_started, response.connected_at),
                  ElapsedMs(used_existing_socket ? request_started : response.connected_at, response.headers_sent_at),
                  ElapsedMs(response.headers_sent_at, response.response_at),
-                 ElapsedMs(response.response_at, finished), ElapsedMs(request_started, finished), status, ps, rssi);
+                 ElapsedMs(response.response_at, finished), ElapsedMs(request_started, finished), status, ps, rssi,
+                 esp_err_to_name(result), esp_err_to_name(tls_error), tls_code, static_cast<unsigned>(tls_flags));
     }
     if (status_out) *status_out = status;
-    if (!keep_voice) {
+    if (!cache) {
         esp_http_client_cleanup(client);
     } else if (result == ESP_OK && status >= 200 && status < 300 && !response.overflow &&
                esp_http_client_is_complete_data_received(client) &&
@@ -288,9 +301,9 @@ esp_err_t Exchange(const char* operation, esp_http_client_method_t method, const
         // The body and callback context belong to this exchange's stack.
         esp_http_client_set_post_field(client, nullptr, 0);
         esp_http_client_set_user_data(client, nullptr);
-        s_voice_idle_until = finished + kVoiceIdleUs;
+        cache->idle_until = finished + kHttpIdleUs;
     } else {
-        CloseVoiceHttp();
+        cache->Close();
     }
     if (voice_lock.owns_lock()) voice_lock.unlock();
     if (result == ESP_OK && response.overflow) result = ESP_ERR_INVALID_SIZE;
@@ -330,7 +343,7 @@ const char* GrantString(const cJSON* data, const char* a, const char* b, const c
 
 void cloud_platform_set_base_url(const char* base_url) {
     std::lock_guard<std::mutex> lock(s_voice_http_mutex);
-    CloseVoiceHttp();
+    s_voice_http.Close();
     Copy(s_base, sizeof s_base, base_url);
     size_t len = strlen(s_base);
     while (len && s_base[len - 1] == '/') s_base[--len] = '\0';
@@ -421,10 +434,11 @@ bool ValidToolTopics(const char* down, const char* up, const char* sn, const cha
     return down && up && (MatchToolTopics(down, up, "device", sn) || MatchToolTopics(down, up, "session", session_id));
 }
 
-esp_err_t FetchToolCredentials(const char* tools_path, cJSON** root) {
+esp_err_t FetchToolCredentials(const char* tools_path, cJSON** root, HttpReuse& http) {
     char path[224];
     snprintf(path, sizeof path, "%s/mqtt-config", tools_path);
-    return Exchange("issue device tool MQTT credentials", HTTP_METHOD_POST, path, nullptr, kSmallBytes, root, nullptr);
+    return Exchange("issue device tool MQTT credentials", HTTP_METHOD_POST, path, nullptr, kSmallBytes, root,
+                    nullptr, VoiceHttp::kNone, nullptr, nullptr, &http);
 }
 
 esp_err_t StartToolClient(const cJSON* root, const char* sn, const char* session_id, const char** client_id) {
@@ -455,13 +469,14 @@ esp_err_t StartToolClient(const cJSON* root, const char* sn, const char* session
     return cloud_tools_start(credentials, session_id);
 }
 
-esp_err_t PutToolRegistration(const ToolRegistration& registration, const char* stage) {
+esp_err_t PutToolRegistration(const ToolRegistration& registration, const char* stage, HttpReuse& http) {
     if (!BoundAgent(registration.agent_id)) return ESP_ERR_INVALID_STATE;
     char path[192];
     snprintf(path, sizeof path, "/api/agents/%d/conversations/%s/tools", registration.agent_id,
              registration.session_id);
     cJSON* response = nullptr;
-    const esp_err_t err = Exchange(stage, HTTP_METHOD_PUT, path, registration.json, kListBytes, &response, nullptr);
+    const esp_err_t err = Exchange(stage, HTTP_METHOD_PUT, path, registration.json, kListBytes, &response,
+                                   nullptr, VoiceHttp::kNone, nullptr, nullptr, &http);
     if (err != ESP_OK) return err;
     const cJSON* data = Data(response);
     const char* sn = dev_identity_sn();
@@ -522,7 +537,7 @@ extern "C" esp_err_t agent_link_platform_conversations(int agent_id, size_t offs
         if (length < 0 || length >= static_cast<int>(sizeof path)) return ESP_ERR_INVALID_SIZE;
         cJSON* root = nullptr;
         esp_err_t result = Exchange("list conversations", HTTP_METHOD_GET, path, nullptr,
-                                    kListBytes, &root, nullptr, HttpConnection::kVoice);
+                                    kListBytes, &root, nullptr, VoiceHttp::kKeepAlive);
         if (result != ESP_OK) return result;
         const cJSON* data = Data(root);
         const cJSON* rows = Items(data);
@@ -573,7 +588,7 @@ extern "C" esp_err_t agent_link_platform_create_conversation(int agent_id, char*
     snprintf(path, sizeof path, "/api/agents/%d/actions/realtime_voice/conversations", agent_id);
     cJSON* root = nullptr;
     esp_err_t result = Exchange("create conversation", HTTP_METHOD_POST, path, nullptr, kSmallBytes,
-                                &root, nullptr, HttpConnection::kVoice);
+                                &root, nullptr, VoiceHttp::kKeepAlive);
     if (result != ESP_OK) return result;
     if (!BoundAgent(agent_id)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
     const cJSON* data = Data(root);
@@ -613,7 +628,9 @@ extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* s
     char path[192];
     snprintf(path, sizeof path, "/api/agents/%d/conversations/%s/tools", agent_id, session_id);
     cJSON* response = nullptr;
-    esp_err_t err = Exchange("get session tools", HTTP_METHOD_GET, path, nullptr, kListBytes, &response, nullptr);
+    HttpReuse http;
+    esp_err_t err = Exchange("get session tools", HTTP_METHOD_GET, path, nullptr, kListBytes, &response,
+                             nullptr, VoiceHttp::kNone, nullptr, nullptr, &http);
     if (err != ESP_OK) return err;
     ToolJson status{response, cJSON_Delete};
     const cJSON* data = Data(status.get());
@@ -659,8 +676,13 @@ extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* s
     status.reset();
     cJSON* credentials = nullptr;
     const char* mqtt_client_id = nullptr;
-    err = FetchToolCredentials(path, &credentials);
-    if (err == ESP_OK) err = StartToolClient(credentials, sn, session_id, &mqtt_client_id);
+    err = FetchToolCredentials(path, &credentials, http);
+    if (err == ESP_OK) {
+        const int64_t started_at = esp_timer_get_time();
+        err = StartToolClient(credentials, sn, session_id, &mqtt_client_id);
+        ESP_LOGI(TAG, "Tool MQTT connect and subscribe: session=%s ms=%d result=%s",
+                 session_id, ElapsedMs(started_at, esp_timer_get_time()), esp_err_to_name(err));
+    }
     char* json = nullptr;
     if (err == ESP_OK && cJSON_AddStringToObject(body.get(), "mqtt_client_id", mqtt_client_id)) {
         json = cJSON_PrintUnformatted(body.get());
@@ -674,7 +696,7 @@ extern "C" esp_err_t agent_link_platform_attach_tool(int agent_id, const char* s
     }
 
     registration.json = json;
-    err = PutToolRegistration(registration, "mount voice tool");
+    err = PutToolRegistration(registration, "mount voice tool", http);
     if (err == ESP_OK) {
         ClearToolRegistration();
         s_registration = registration;
@@ -693,7 +715,8 @@ extern "C" esp_err_t agent_link_platform_refresh_tool(int agent_id, const char* 
         strcmp(s_registration.session_id, session_id) != 0 || !agent_link_platform_tool_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
-    return PutToolRegistration(s_registration, "hot-update voice tool");
+    HttpReuse http;
+    return PutToolRegistration(s_registration, "hot-update voice tool", http);
 }
 
 esp_err_t cloud_platform_grant(int agent_id, const char* session_id, bool refresh,
@@ -720,7 +743,7 @@ esp_err_t cloud_platform_grant(int agent_id, const char* session_id, bool refres
     ExchangeTime timing;
     esp_err_t result = Exchange(refresh ? "refresh voice grant" : "request voice grant",
                                 HTTP_METHOD_POST, path, body, kSmallBytes, &root, http_status,
-                                HttpConnection::kVoice, expires_us ? &timing : nullptr, business_code);
+                                VoiceHttp::kKeepAlive, expires_us ? &timing : nullptr, business_code);
     if (result != ESP_OK) return result;
     if (!BoundAgent(agent_id)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
     const cJSON* data = Data(root);
@@ -784,11 +807,11 @@ void cloud_platform_end_grant(int agent_id, const char* session_id, CloudGrantCl
     cJSON* root = nullptr;
 #if CONFIG_IDF_TARGET_ESP32S3
     // The next grant handles HTTP 409 via refresh if the old reservation survives.
-    const HttpConnection connection = cleanup == CloudGrantCleanup::kBeforeRetry
-                                    ? HttpConnection::kVoiceReuseOnly : HttpConnection::kVoice;
+    const VoiceHttp connection = cleanup == CloudGrantCleanup::kBeforeRetry
+                              ? VoiceHttp::kReuseOnly : VoiceHttp::kKeepAlive;
 #else
     (void)cleanup;
-    const HttpConnection connection = HttpConnection::kVoice;
+    const VoiceHttp connection = VoiceHttp::kKeepAlive;
 #endif
     (void)Exchange("end voice grant", HTTP_METHOD_DELETE, path, nullptr, kSmallBytes, &root,
                    nullptr, connection);

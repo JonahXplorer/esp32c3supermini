@@ -45,6 +45,7 @@ constexpr uint32_t kHeartbeatMs = 60000;
 constexpr uint32_t kCodeRenewLeadS = 20;
 
 constexpr uint32_t kNetPollMs   = 1000;
+constexpr uint32_t kAuthFirstRetryMs = 1500;
 constexpr uint32_t kRetryMs     = 5000;   // after a transport failure
 constexpr uint32_t kFaultRetryMs = 30000; // after the platform refuses
 
@@ -452,7 +453,7 @@ Leave StayOnline(uint32_t network_generation) {
 
 // Authenticate, then stay online. Returns when the key stops working.
 void OnlineLoop() {
-    uint32_t transport_retry_ms = kRetryMs;
+    uint32_t transport_retry_ms = kAuthFirstRetryMs;
     uint32_t retry_generation = 0;
     while (s_run && cloud_cred_is_bound()) {
         WaitForNet();
@@ -469,7 +470,7 @@ void OnlineLoop() {
         const uint32_t network_generation = wifi_cloud_network_generation();
         if (network_generation != retry_generation) {
             retry_generation = network_generation;
-            transport_retry_ms = kRetryMs;
+            transport_retry_ms = kAuthFirstRetryMs;
         }
         const esp_err_t result = cloud_api_auth(cloud_cred_auth_key(), StaMac(),
                                                agent_link_ota_running_version(),
@@ -484,8 +485,11 @@ void OnlineLoop() {
             PublishFailure(err.code == CLOUD_API_NO_AGENT ? AGENT_CLOUD_NO_AGENT
                                                           : AGENT_CLOUD_FAULT, err);
             if (err.code < 0) {
+                ESP_LOGI(TAG, "Device auth retry: result=%s delay_ms=%lu", esp_err_to_name(result),
+                         static_cast<unsigned long>(transport_retry_ms));
                 SessionDelay(transport_retry_ms, network_generation);
-                transport_retry_ms = transport_retry_ms < kFaultRetryMs / 2 ? transport_retry_ms * 2 : kFaultRetryMs;
+                transport_retry_ms = transport_retry_ms < kRetryMs ? kRetryMs
+                                   : transport_retry_ms < kFaultRetryMs / 2 ? transport_retry_ms * 2 : kFaultRetryMs;
             } else {
                 transport_retry_ms = kRetryMs;
                 SessionDelay(BackoffFor(err), network_generation);
@@ -493,7 +497,7 @@ void OnlineLoop() {
             continue;
         }
         NoteAccepted();
-        transport_retry_ms = kRetryMs;
+        transport_retry_ms = kAuthFirstRetryMs;
 
         if (s_agent_json && s_agent_json[0]) {
             ESP_LOGI(TAG, "agent configuration received (%uB)",

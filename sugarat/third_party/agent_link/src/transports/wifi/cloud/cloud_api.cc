@@ -15,11 +15,13 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_tls.h"
 #include "sdkconfig.h"
 
 namespace {
 constexpr const char* TAG = "agent_link.api";
+constexpr char kAuthPath[] = "/api/device-gateway/auth";
 
 constexpr int    kTimeoutMs  = 10000;
 constexpr size_t kRxPsram    = 8192;   // sized for auth's agent config
@@ -48,6 +50,23 @@ void SetErr(cloud_api_err_t* err, int code, bool success, const char* msg) {
 esp_http_client_handle_t s_client   = nullptr;
 bool                     s_reusable = false;   // the next request may reuse the connection
 
+struct AuthTiming {
+    int64_t connected_at = 0;
+    int64_t headers_sent_at = 0;
+};
+
+esp_err_t AuthHttpEvent(esp_http_client_event_t* event) {
+    auto* timing = static_cast<AuthTiming*>(event->user_data);
+    if (!timing) return ESP_OK;
+    if (event->event_id == HTTP_EVENT_ON_CONNECTED) timing->connected_at = esp_timer_get_time();
+    if (event->event_id == HTTP_EVENT_HEADERS_SENT) timing->headers_sent_at = esp_timer_get_time();
+    return ESP_OK;
+}
+
+int ElapsedMs(int64_t from, int64_t to) {
+    return from && to >= from ? static_cast<int>((to - from) / 1000) : -1;
+}
+
 void DropConnection() {
     if (!s_client) return;
     esp_http_client_close(s_client);
@@ -63,6 +82,7 @@ esp_http_client_handle_t Client(const char* url) {
     hc.url               = url;
     hc.method            = HTTP_METHOD_POST;
     hc.timeout_ms        = kTimeoutMs;
+    hc.event_handler     = AuthHttpEvent;
     hc.crt_bundle_attach = esp_crt_bundle_attach;   // public CA bundle; no pinned cert to rotate
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_MBEDTLS_SSL_PROTO_TLS1_3
     hc.tls_version       = ESP_HTTP_CLIENT_TLS_VER_TLS_1_2;
@@ -94,15 +114,42 @@ esp_err_t Exchange(const char* path, const char* url, const char* body,
     esp_http_client_set_header(cl, "Content-Type", "application/json");
     esp_http_client_set_header(cl, "Accept", "application/json");
 
-    // A failure on a reused connection is expected (it went stale) and is retried by the caller, so
-    // only failures on a new connection are logged.
+    const bool trace_auth = strcmp(path, kAuthPath) == 0;
+    AuthTiming timing;
+    if (trace_auth) esp_http_client_set_user_data(cl, &timing);
+    const int64_t started_at = trace_auth ? esp_timer_get_time() : 0;
+    int64_t body_sent_at = 0;
+    int64_t response_headers_at = 0;
+    auto report_auth = [&](const char* phase, esp_err_t result, esp_err_t tls_error = ESP_OK,
+                           int tls_code = 0, int tls_flags = 0) {
+        if (!trace_auth) return;
+        const int64_t finished_at = esp_timer_get_time();
+        esp_http_client_set_user_data(cl, nullptr);
+        const bool used_existing_socket = *reused && !timing.connected_at;
+        ESP_LOG_LEVEL(result == ESP_OK ? ESP_LOG_INFO : ESP_LOG_WARN, TAG,
+                      "POST %s timing: connection=%s phase=%s connect_ms=%d send_headers_ms=%d "
+                      "send_body_ms=%d wait_headers_ms=%d read_body_ms=%d total_ms=%d http=%d result=%s "
+                      "tls=%s tls_code=%d tls_flags=0x%x socket_errno=%d",
+                      path, used_existing_socket ? "reused" : "new", phase,
+                      used_existing_socket ? 0 : ElapsedMs(started_at, timing.connected_at),
+                      ElapsedMs(used_existing_socket ? started_at : timing.connected_at, timing.headers_sent_at),
+                      ElapsedMs(timing.headers_sent_at, body_sent_at),
+                      ElapsedMs(body_sent_at, response_headers_at ? response_headers_at : finished_at),
+                      ElapsedMs(response_headers_at, finished_at), ElapsedMs(started_at, finished_at), *status,
+                      esp_err_to_name(result), esp_err_to_name(tls_error), tls_code, static_cast<unsigned>(tls_flags),
+                      result == ESP_OK ? 0 : esp_http_client_get_errno(cl));
+    };
+
     const int body_len = static_cast<int>(strlen(body));
     esp_err_t r = esp_http_client_open(cl, body_len);
     if (r != ESP_OK) {
-        if (r == ESP_ERR_HTTP_CONNECT &&
-            esp_http_client_get_and_clear_last_tls_error(cl, nullptr, nullptr) == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
+        int tls_code = 0, tls_flags = 0;
+        const esp_err_t tls_error = r == ESP_ERR_HTTP_CONNECT || trace_auth
+                                ? esp_http_client_get_and_clear_last_tls_error(cl, &tls_code, &tls_flags) : ESP_OK;
+        if (r == ESP_ERR_HTTP_CONNECT && tls_error == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) {
             wifi_cloud_dns_result(network_generation, false);
         }
+        report_auth(r == ESP_ERR_HTTP_CONNECT ? "connect" : "send_headers", r, tls_error, tls_code, tls_flags);
         if (!*reused) {
             // The heap figures tell a TLS allocation failure from a network one; both surface as
             // ESP_ERR_HTTP_CONNECT.
@@ -117,26 +164,33 @@ esp_err_t Exchange(const char* path, const char* url, const char* body,
     }
     if (!*reused) wifi_cloud_dns_result(network_generation, true);
     if (esp_http_client_write(cl, body, body_len) != body_len) {
+        report_auth("send_body", ESP_ERR_HTTP_WRITE_DATA);
         if (!*reused) ESP_LOGW(TAG, "POST %s: short write", path);
         SetErr(err, -1, false, "short write");
         DropConnection();
         return ESP_FAIL;
     }
-    if (esp_http_client_fetch_headers(cl) < 0) {
+    if (trace_auth) body_sent_at = esp_timer_get_time();
+    const int64_t fetched = esp_http_client_fetch_headers(cl);
+    if (fetched < 0) {
+        report_auth("wait_headers", fetched == -ESP_ERR_HTTP_EAGAIN ? ESP_ERR_HTTP_EAGAIN : ESP_ERR_HTTP_FETCH_HEADER);
         if (!*reused) ESP_LOGW(TAG, "POST %s: no headers", path);
         SetErr(err, -1, false, "no response headers");
         DropConnection();
         return ESP_FAIL;
     }
 
+    if (trace_auth) response_headers_at = esp_timer_get_time();
     *status = esp_http_client_get_status_code(cl);
     *got    = esp_http_client_read_response(cl, s_rx, static_cast<int>(s_rx_cap) - 1);
     if (*got < 0) {
+        report_auth("read_body", ESP_FAIL);
         SetErr(err, -1, false, "read failed");
         DropConnection();
         return ESP_FAIL;
     }
     s_rx[*got] = '\0';
+    report_auth("complete", ESP_OK);
 
     s_reusable = esp_http_client_is_complete_data_received(cl) &&
                  esp_http_client_is_persistent_connection(cl);
@@ -348,7 +402,7 @@ esp_err_t cloud_api_auth(const char* auth_key, const char* mac, const char* fw_v
 
     cJSON* root = nullptr;
     cJSON* data = nullptr;
-    esp_err_t r = PostJson("/api/device-gateway/auth", body, &root, &data, err, auth_key);
+    esp_err_t r = PostJson(kAuthPath, body, &root, &data, err, auth_key);
     if (r != ESP_OK) {
         if (err && (err->code == CLOUD_API_NO_AGENT || err->code == CLOUD_API_KEY_REVOKED))
             cloud_platform_set_bound_agent(nullptr);

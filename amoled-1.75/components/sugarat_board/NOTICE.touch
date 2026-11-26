@@ -1,0 +1,18 @@
+CST9217 touch protocol
+
+Ported to ESP-IDF's shared i2c_master API from the following Waveshare references:
+Repository: https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.75
+Revision: 54816190c194c3a9cf612f85063899c89b18a776
+
+examples/arduino/10_Touch_CST9217/10_Touch_CST9217.ino
+examples/arduino/libraries/SensorLib/src/touch/TouchDrvCST92xx.cpp
+examples/arduino/libraries/SensorLib/src/REG/CST9xxConstants.h
+
+SensorLib author and copyright: Copyright (c) 2024 lewis he
+License: MIT; the complete notice is in LICENSE.SensorLib.
+
+The port retains the reference's reset/attribute sequence, falling-edge interrupt
+flag, 15-byte report read, D0 00 AB read acknowledgment, and empty-report handling.
+It uses the first finger for the existing pointer UI. Board-specific coordinate
+mapping includes the user's clockwise 90-degree display rotation. GPIO ownership
+and bounded I2C timeouts are adapted to this ESP-IDF application.

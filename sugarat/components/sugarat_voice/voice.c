@@ -25,6 +25,13 @@
 #include "voice_trace.h"
 #include "wake_word.h"
 
+#ifndef SUGARAT_DEVICE_MODEL
+#define SUGARAT_DEVICE_MODEL "SDGOODS-ESP32S3"
+#endif
+#ifndef SUGARAT_DEVICE_MANUFACTURER
+#define SUGARAT_DEVICE_MANUFACTURER "Sugarat"
+#endif
+
 enum {
     UPLINK_FRAMES = 400,   // Up to eight seconds of speech after wake, while the grant opens.
     WAKE_PREROLL_SAMPLES = SUGARAT_SAMPLE_RATE,
@@ -33,6 +40,7 @@ enum {
     RESIDENT_RETRY_MAX_MS = 30000,
     CONVERSATION_CACHE_MS = 120000,
     CONVERSATION_RETRY_MS = 15000,
+    TOOL_FIRST_RETRY_MS = 1500,
     TOOL_RETRY_MS = 5000,
     TOOL_RETRY_MAX_MS = 30000,
     SESSION_STACK_BYTES = 16 * 1024,
@@ -206,6 +214,16 @@ static void save_wake_audio(wake_preroll_t *history, const audio_frame_t *frame)
     history->count = total < WAKE_PREROLL_SAMPLES ? total : WAKE_PREROLL_SAMPLES;
 }
 
+static bool microphone_echo_guard(void)
+{
+#if defined(SUGARAT_AUDIO_AEC) && SUGARAT_AUDIO_AEC
+    // This BSP delivers echo-cancelled PCM continuously, including double talk.
+    return false;
+#else
+    return voice_playback_echo_guard();
+#endif
+}
+
 static void capture_audio(void *context)
 {
     (void)context;
@@ -220,7 +238,7 @@ static void capture_audio(void *context)
             continue;
         }
         const bool echo_before_read = (before_read == VOICE_CONNECTING || before_read == VOICE_ACTIVE) &&
-                                      voice_playback_echo_guard();
+                                      microphone_echo_guard();
         if (sugarat_mic_read(frame.pcm, &frame.count) != ESP_OK || frame.count == 0) {
             vTaskDelay(1);
             continue;
@@ -240,7 +258,7 @@ static void capture_audio(void *context)
         }
         if (current == VOICE_IDLE) {
             overflow_logged = false;
-            if (!voice_playback_echo_guard()) {
+            if (!microphone_echo_guard()) {
                 wake_buffered = true;
                 save_wake_audio(&wake_history, &frame);
                 if (wake_word_feed(frame.pcm, frame.count)) {
@@ -251,7 +269,7 @@ static void capture_audio(void *context)
                 wake_history.count = 0;
             }
         } else if (capturing && !atomic_load(&stop_call)) {
-            const bool echo = voice_playback_echo_guard();
+            const bool echo = microphone_echo_guard();
             voice_timing_mic_level(level, echo_before_read || echo);
             if (echo) {
                 memset(frame.pcm, 0, frame.count * sizeof(frame.pcm[0]));
@@ -466,7 +484,7 @@ static void handle_tools(void *context)
     tool_job_t route = {0};
     uint32_t mount_after = 0;
     uint32_t retry_after = 0;
-    uint32_t retry_delay_ms = TOOL_RETRY_MS;
+    uint32_t retry_delay_ms = TOOL_FIRST_RETRY_MS;
     uint32_t synced_connection = 0;
     bool retry = false;
     while (true) {
@@ -482,7 +500,7 @@ static void handle_tools(void *context)
             route = job;
             mount_after = 0;
             retry_after = 0;
-            retry_delay_ms = TOOL_RETRY_MS;
+            retry_delay_ms = TOOL_FIRST_RETRY_MS;
             synced_connection = 0;
             retry = false;
         }
@@ -517,11 +535,12 @@ static void handle_tools(void *context)
         if (!retry) {
             synced_connection = connection;
             if (!attached) mount_after = finished + TOOL_RETRY_MAX_MS;
-            retry_delay_ms = TOOL_RETRY_MS;
+            retry_delay_ms = TOOL_FIRST_RETRY_MS;
         } else {
             const uint32_t delay_ms = tool_transport_error(err) ? retry_delay_ms : TOOL_RETRY_MAX_MS;
             retry_after = finished + delay_ms;
-            retry_delay_ms = delay_ms < TOOL_RETRY_MAX_MS / 2 ? delay_ms * 2 : TOOL_RETRY_MAX_MS;
+            retry_delay_ms = delay_ms < TOOL_RETRY_MS ? TOOL_RETRY_MS
+                           : delay_ms < TOOL_RETRY_MAX_MS / 2 ? delay_ms * 2 : TOOL_RETRY_MAX_MS;
             ESP_LOGI(TAG, "Voice tool retry scheduled: delay_ms=%lu (idle, after voice setup)",
                      (unsigned long)delay_ms);
         }
@@ -731,7 +750,8 @@ esp_err_t sugarat_voice_start(void)
     };
     const bool audio_ready = start_audio_workers();
     const agent_link_config_t config = {
-        .device_name = "Sugarat-Jarvis", .model = "SDGOODS-ESP32S3", .manufacturer = "Sugarat",
+        .device_name = "Sugarat-Jarvis", .model = SUGARAT_DEVICE_MODEL,
+        .manufacturer = SUGARAT_DEVICE_MANUFACTURER,
         .transport = AGENT_TRANSPORT_WIFI, .platform = &platform,
         .caps = audio_ready ? AGENT_CAP_MIC | AGENT_CAP_SPEAKER : 0,
         .output = &output,
@@ -773,9 +793,16 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
         snprintf(view->activation_code, sizeof(view->activation_code), "%.6s", link.code);
     } else if (current == VOICE_ACTIVE) {
         view->phase = SUGARAT_VOICE_IN_CALL;
+#if defined(SUGARAT_AUDIO_AEC) && SUGARAT_AUDIO_AEC
+        // Full-duplex calls stay in the listening presentation during replies.
+        // The waveform follows the echo-cancelled microphone, just like uplink.
+        view->speaking = false;
+        view->level = atomic_load(&mic_level);
+#else
         const unsigned speaker_level = voice_playback_level();
         view->speaking = speaker_level != 0;
         view->level = view->speaking ? speaker_level : atomic_load(&mic_level);
+#endif
     } else if (current == VOICE_STARTING || current == VOICE_CONNECTING) {
         view->phase = SUGARAT_VOICE_OPENING;
     } else if (current == VOICE_RECOVERING) {
