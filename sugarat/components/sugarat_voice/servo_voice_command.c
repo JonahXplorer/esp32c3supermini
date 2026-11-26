@@ -6,7 +6,13 @@
 enum { MAX_COMMAND_BYTES = 256 };
 
 typedef enum { PREFIX, WHOLE_WORDS } phrase_match_t;
-typedef enum { NO_TARGET, MASK, SERVO } target_t;
+typedef enum {
+    NO_TARGET = 0,
+    MASK = 1 << 0,
+    HELMET = 1 << 1,
+    SERVO = 1 << 2,
+    ALL_TARGETS = MASK | HELMET | SERVO,
+} target_t;
 
 static bool ascii_letter(unsigned char byte)
 {
@@ -143,16 +149,17 @@ static target_t take_english_target(const char **text)
     };
     static const char *const masks[] = {
         "iron man helmet faceplate", "iron mans faceplate", "iron man faceplate", "iron man face plate",
-        "iron man face mask", "iron man helmet visor", "iron man visor", "iron man helmet", "iron man mask",
-        "ironman faceplate", "ironman face mask", "ironman visor", "ironman helmet", "ironman mask",
+        "iron man face mask", "iron man helmet visor", "iron man visor", "iron man mask",
+        "ironman faceplate", "ironman face mask", "ironman visor", "ironman mask",
         "helmets face plate", "helmets faceplate", "helmet faceplate", "helmet face plate",
         "helmet face mask", "helmets mask", "helmet mask",
         "helmets visor", "helmet visor", "helmet shield", "helmet panel",
         "face plates", "face plate", "face plait", "face place", "face play", "face shield", "faceshield", "face mask",
         "face guard", "face cover",
         "facial mask", "faceplates", "faceplate", "visors", "visor", "vis or", "viz or", "vizer", "visar",
-        "helmets", "helmet", "masks", "mask", "masque", "头盔面板", "头盔面罩", "面罩", "面具", "脸甲", "面甲", NULL,
+        "masks", "mask", "masque", "头盔面板", "头盔面罩", "面罩", "面具", "脸甲", "面甲", NULL,
     };
+    static const char *const helmets[] = {"iron man helmet", "ironman helmet", "helmets", "helmet", NULL};
     static const char *const servos[] = {
         "servo motors", "servo motor", "servomotors", "servomotor", "servos", "servo",
         "serv o", "ser vo", "sir vo", "sirvo", "survo", "serbo", "舵机", NULL,
@@ -161,6 +168,7 @@ static target_t take_english_target(const char **text)
     (void)take_one_of(text, qualifiers, WHOLE_WORDS);
     while (take_one_of(text, fillers, WHOLE_WORDS)) {}
     if (take_one_of(text, masks, WHOLE_WORDS)) return MASK;
+    if (take_one_of(text, helmets, WHOLE_WORDS)) return HELMET;
     if (take_one_of(text, servos, WHOLE_WORDS)) return SERVO;
 
     // Limit fuzzy matching to the distinctive mask nouns. "Task" and "server"
@@ -197,11 +205,11 @@ typedef struct {
     const char *verb;
     const char *particle;
     servo_voice_command_t command;
-    bool servo_only;
+    unsigned targets;
 } english_rule_t;
 
-#define OPEN(verb, particle) {verb, particle, SERVO_VOICE_OPEN, false}
-#define CLOSE(verb, particle) {verb, particle, SERVO_VOICE_CLOSE, false}
+#define OPEN(verb, particle) {verb, particle, SERVO_VOICE_OPEN, ALL_TARGETS}
+#define CLOSE(verb, particle) {verb, particle, SERVO_VOICE_CLOSE, ALL_TARGETS}
 
 static servo_voice_command_t parse_english(const char *text, bool question_mark)
 {
@@ -231,9 +239,10 @@ static servo_voice_command_t parse_english(const char *text, bool question_mark)
         OPEN("move", "to position b"), CLOSE("move", "to position a"),
         OPEN("move", "to b"), CLOSE("move", "to a"),
         OPEN("set", "to position b"), CLOSE("set", "to position a"),
-        {"turn", "on", SERVO_VOICE_OPEN, true}, {"turn", "off", SERVO_VOICE_CLOSE, true},
-        {"switch", "on", SERVO_VOICE_OPEN, true}, {"switch", "off", SERVO_VOICE_CLOSE, true},
-        {"power", "on", SERVO_VOICE_OPEN, true}, {"power", "off", SERVO_VOICE_CLOSE, true},
+        // A bare helmet can refer to its electronics. On/off needs a mask or servo.
+        {"turn", "on", SERVO_VOICE_OPEN, MASK | SERVO}, {"turn", "off", SERVO_VOICE_CLOSE, MASK | SERVO},
+        {"switch", "on", SERVO_VOICE_OPEN, MASK | SERVO}, {"switch", "off", SERVO_VOICE_CLOSE, MASK | SERVO},
+        {"power", "on", SERVO_VOICE_OPEN, SERVO}, {"power", "off", SERVO_VOICE_CLOSE, SERVO},
     };
 
     while (take_one_of(&text, prefixes, WHOLE_WORDS) || take_one_of(&text, fillers, WHOLE_WORDS)) {}
@@ -244,7 +253,7 @@ static servo_voice_command_t parse_english(const char *text, bool question_mark)
         while (take_one_of(&rest, fillers, WHOLE_WORDS)) {}
         const bool particle_first = rule->particle && take_particle(&rest, rule->particle);
         const target_t target = take_english_target(&rest);
-        if (target == NO_TARGET || (rule->servo_only && target != SERVO)) continue;
+        if (!(rule->targets & target)) continue;
         if (rule->particle && !particle_first && !take_particle(&rest, rule->particle)) continue;
         if (at_english_end(rest)) return rule->command;
     }
