@@ -278,8 +278,16 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_set_level(LIGHT_GPIO, light_on));
     ESP_LOGI(TAG, "GPIO%d light on at initial position A", LIGHT_GPIO);
 
-    const char *const controllers[] = {SERVO_PEER_MAC, SERVO_ADDITIONAL_PEER_MAC};
-    const size_t controller_count = SERVO_ADDITIONAL_PEER_MAC[0] ? 2 : 1;
+    const char *const configured_controllers[] = {
+        SERVO_PEER_MAC, SERVO_ADDITIONAL_PEER_MAC, SERVO_AMOLED_PEER_MAC,
+    };
+    _Static_assert(sizeof(configured_controllers) / sizeof(configured_controllers[0]) <= SERVO_RADIO_MAX_PEERS,
+                   "Controller configuration exceeds the ESP-NOW pairing capacity");
+    const char *controllers[SERVO_RADIO_MAX_PEERS];
+    size_t controller_count = 0;
+    for (size_t i = 0; i < sizeof(configured_controllers) / sizeof(configured_controllers[0]); ++i) {
+        if (configured_controllers[i][0]) controllers[controller_count++] = configured_controllers[i];
+    }
     const bool radio_ready = servo_radio_start_peers(controllers, controller_count, SERVO_RADIO_FOLLOW_PEER) == ESP_OK;
     ESP_LOGI(TAG, "Ready at A: GPIO%d=%d us, GPIO%d=%d us; press GPIO%d to switch",
              SERVO_1_GPIO, SERVO_GPIO6_A_US, SERVO_2_GPIO, SERVO_GPIO7_A_US, BUTTON_GPIO);
@@ -321,7 +329,7 @@ void app_main(void)
                 position_requested = true;
                 peer->last_session = message.session;
                 peer->last_sequence = message.sequence;
-                ESP_LOGI(TAG, "Sugarat requested position %c: session=%08" PRIx32 " seq=%" PRIu32
+                ESP_LOGI(TAG, "Controller requested position %c: session=%08" PRIx32 " seq=%" PRIu32
                          " GPIO%d=%d us, GPIO%d=%d us", 'A' + target_position, message.session, message.sequence,
                          servos[0].gpio, servo_target_us(&servos[0], target_position, settings.angle_deg),
                          servos[1].gpio, servo_target_us(&servos[1], target_position, settings.angle_deg));
@@ -334,7 +342,7 @@ void app_main(void)
                 }
                 peer->last_session = message.session;
                 peer->last_sequence = message.sequence;
-                ESP_LOGI(TAG, "Sugarat set speed to %u us per %d ms", (unsigned)settings.speed, BUTTON_POLL_MS);
+                ESP_LOGI(TAG, "Controller set speed to %u us per %d ms", (unsigned)settings.speed, BUTTON_POLL_MS);
             } else if (new_command && message.type == SERVO_SET_ANGLE && message.angle_deg <= angle_limit_deg) {
                 if (settings.angle_deg != message.angle_deg) {
                     settings.angle_deg = message.angle_deg;
@@ -343,7 +351,7 @@ void app_main(void)
                 }
                 peer->last_session = message.session;
                 peer->last_sequence = message.sequence;
-                ESP_LOGI(TAG, "Sugarat set B angle to %u degrees: GPIO%d=%d us, GPIO%d=%d us", (unsigned)settings.angle_deg,
+                ESP_LOGI(TAG, "Controller set B angle to %u degrees: GPIO%d=%d us, GPIO%d=%d us", (unsigned)settings.angle_deg,
                          servos[0].gpio, servo_target_us(&servos[0], SERVO_POSITION_B, settings.angle_deg),
                          servos[1].gpio, servo_target_us(&servos[1], SERVO_POSITION_B, settings.angle_deg));
             } else if (new_command && message.type == SERVO_SET_LIGHT &&
@@ -356,7 +364,7 @@ void app_main(void)
             }
             if (!peer->announced && message.type == SERVO_QUERY) {
                 peer->announced = true;
-                ESP_LOGI(TAG, "Sugarat status request received (peer %u)", (unsigned)peer_index);
+                ESP_LOGI(TAG, "Controller status request received (peer %u)", (unsigned)peer_index);
             }
             reply = servo_message_is_command(message.type);
         }

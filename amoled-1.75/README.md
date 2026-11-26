@@ -80,7 +80,9 @@ idf.py -C amoled-1.75 build
 idf.py -C amoled-1.75 -DSERVO_PEER_MAC=AA:BB:CC:DD:EE:FF build
 ```
 
-新 AMOLED 板有自己的 Wi-Fi STA MAC。接收端 `esp32c3` 必须允许这个 MAC；仅复用 Sugarat 的目标 MAC 不会自动获得接收端授权。可在接收端的 `SERVO_PEER_MAC` 或 `SERVO_ADDITIONAL_PEER_MAC` 中配置。实际 MAC 可在本板启动时的 `servo_radio` 日志中查看；舵机页面打开后才按需启动遥控。未确认新板 MAC 前，本工程不会改动接收端配置。
+当前 AMOLED 的配对地址为 `B8:1F:3F:D1:EE:04`（当前 USB 串口 COM5），C3 接收端为 `EC:D6:1B:B6:09:30`（当前 COM21）。接收端新增独立的 `SERVO_AMOLED_PEER_MAC`，原有两台 Sugarat 的授权保留，共允许三个控制器。两端继续使用相同的 20 字节协议，未配对来源仍被拒绝。更换板卡时以启动日志 `ESP-NOW local` 的实际 Wi-Fi STA 地址为准，再修改 C3 的对应 CMake 参数。
+
+原有接收端必须更新应用后才能接收第三个地址；可执行 `idf.py -C esp32c3 -p COM21 app-flash`，保留已保存的角度和速度。AMOLED 顶部下拉或点击 → Settings → Manual control，打开页面后才按需启动遥控。收到 C3 的真实回执后显示 Receiver connected；位置、速度和角度同样由回执确认。分别测试 Position B、Position A，再测试通话中的面罩开/合语音口令。实际舵机动作需要现场观察，单独的发送成功日志不代表舵机到位。AMOLED 的全程开麦和 FD_LOW_COST AEC 不受本次配对改动影响。
 
 确认设备串口后，在 ESP-IDF 环境中执行完整 `flash`，它会同时写入应用、分区表和 Jarvis 模型：
 

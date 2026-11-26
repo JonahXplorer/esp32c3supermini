@@ -163,13 +163,17 @@ static esp_err_t configure_peers(const char *const peer_macs[], size_t count)
                         ESP_ERR_INVALID_ARG, TAG, "Invalid ESP-NOW peer count");
     ESP_RETURN_ON_FALSE(inbox == NULL, ESP_ERR_INVALID_STATE, TAG, "ESP-NOW already started");
     uint8_t addresses[SERVO_RADIO_MAX_PEERS][ESP_NOW_ETH_ALEN];
+    size_t unique_count = 0;
     for (size_t i = 0; i < count; ++i) {
-        ESP_RETURN_ON_FALSE(read_peer_mac(peer_macs[i], addresses[i]),
+        uint8_t address[ESP_NOW_ETH_ALEN];
+        ESP_RETURN_ON_FALSE(read_peer_mac(peer_macs[i], address),
                             ESP_ERR_INVALID_ARG, TAG, "Invalid ESP-NOW peer MAC at index %u", (unsigned)i);
+        size_t existing = 0;
+        while (existing < unique_count && memcmp(addresses[existing], address, sizeof(address)) != 0) ++existing;
+        if (existing == unique_count) memcpy(addresses[unique_count++], address, sizeof(address));
     }
-    if (count == 2 && memcmp(addresses[0], addresses[1], ESP_NOW_ETH_ALEN) == 0) count = 1;
-    memcpy(peer_addresses, addresses, count * sizeof(addresses[0]));
-    peer_count = (uint8_t)count;
+    memcpy(peer_addresses, addresses, unique_count * sizeof(addresses[0]));
+    peer_count = (uint8_t)unique_count;
     return ESP_OK;
 }
 
@@ -244,7 +248,7 @@ static void remember_peer_channel(uint8_t channel, uint8_t peer_index)
     const uint8_t previous_channel = follower.preferred_channel;
     follower.preferred_channel = channel;
     follower.next_probe_channel = next_channel(channel);
-    ESP_LOGI(TAG, "Paired Sugarat found on channel %u (previous=%u, peer=%u)",
+    ESP_LOGI(TAG, "Paired controller found on channel %u (previous=%u, peer=%u)",
              channel, previous_channel, peer_index);
 }
 
@@ -280,7 +284,7 @@ esp_err_t servo_radio_start_peers(const char *const peer_macs[], size_t count, s
         follower.current_channel = channel;
         follower.next_probe_channel = next_channel(channel);
         hold_current_channel(SEARCH_DWELL_MS);
-        ESP_LOGI(TAG, "Looking for paired Sugarat on channels %u-%u, starting on %u; preferred dwell %u ms, probe %u ms",
+        ESP_LOGI(TAG, "Looking for paired controller on channels %u-%u, starting on %u; preferred dwell %u ms, probe %u ms",
                  follower.first_channel, follower.last_channel, channel, PREFERRED_DWELL_MS, SEARCH_DWELL_MS);
     }
     return start_esp_now();

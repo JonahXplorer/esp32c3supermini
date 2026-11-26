@@ -17,7 +17,47 @@ ESP-IDF 6.1 工程，适用于两只 1171MG 这类三线 PWM 角度舵机。上�
 
 在 `main/main.c` 用 `SERVO_GPIO6_A_US`、`SERVO_GPIO6_90_US` 校准 GPIO6，用 `SERVO_GPIO7_A_US`、`SERVO_GPIO7_90_US` 校准 GPIO7。按键日志会分别输出两路的目标脉宽。默认切换速度由 `../common/servo_radio/servo_radio.h` 中的 `SERVO_SPEED_DEFAULT` 设定。
 
-[Sugarat Button 遥控](../sugarat/README.md)通过 ESP-NOW 切换 A/B 和调整两路的速度及 B 点角度。C3 按已配对的 Sugarat 地址识别数据，并在失联后重新寻找 Sugarat 所在的 2.4 GHz 信道。GPIO4 实体按键使用同一组设定。接收端每次重启恢复默认速度和 90°。
+[Sugarat Button 遥控](../sugarat/README.md)和 [AMOLED 1.75 遥控](../amoled-1.75/README.md)通过同一 ESP-NOW 协议切换 A/B、调整两路的速度及 B 点角度。C3 仅接收已配对控制器的数据，并自动寻找控制器所在的 2.4 GHz 信道。GPIO4 实体按键使用同一组设定。有效的角度/速度设置保存在 NVS，重启后恢复；没有有效记录时使用默认速度和 90°。
+
+## 三个控制器的配对
+
+接收端 STA 地址为 `EC:D6:1B:B6:09:30`（当前 USB 串口 COM21）。原有两台 Sugarat 保留，新增 AMOLED：
+
+| CMake 配置 | 默认控制器 STA 地址 | 用途 |
+| --- | --- | --- |
+| `SERVO_PEER_MAC` | `EC:DA:3B:67:12:14` | 第一台 Sugarat |
+| `SERVO_ADDITIONAL_PEER_MAC` | `EC:DA:3B:67:12:2C` | 第二台 Sugarat，当前 COM18 |
+| `SERVO_AMOLED_PEER_MAC` | `B8:1F:3F:D1:EE:04` | AMOLED 1.75，当前 COM5 |
+
+AMOLED 默认向接收端 `EC:D6:1B:B6:09:30` 发送。双方地址须互相对应；
+控制器最多三个，空的可选地址跳过，重复地址合并，未配对设备仍被拒绝。
+每个控制器独立维护 session/sequence，回执返回实际发送者，报文布局仍为 20 字节。
+更换板卡时以该板启动日志的 `ESP-NOW local` / Wi-Fi STA 地址为准，
+通过对应 CMake 配置修改配对地址；串口号会随 USB 插口和系统分配变化。
+
+只编译本接收端：
+
+```powershell
+idf.py -C esp32c3 -DSERVO_AMOLED_PEER_MAC=B8:1F:3F:D1:EE:04 build
+```
+
+默认构建目录会保存此前的 CMake 参数；修改已使用过的配对地址时需显式传入新的 `-D` 值。
+更新已有接收端应用可用 `idf.py -C esp32c3 -p COM21 app-flash`，保留 NVS 角度/速度设置。
+启动后应看到三个 `ESP-NOW local ... peer ...` 配对日志。
+
+AMOLED 顶部下拉或点击 → Settings → Manual control；等待 Receiver connected 后，
+测试 Position B 再 Position A。C3 应记录 `Controller requested position` 和 `peer=2` 的回执，
+AMOLED 应记录匹配 session/sequence 的 `C3 confirmed target`。这些证明命令与回执链路；
+实际舵机是否转到目标仍需现场观察。还可在通话中用现有面罩开/合语音口令验证同一条链路。
+更换信道由 C3 跟随，AMOLED 继续使用路由器信道，不切走其语音联网信道。
+
+2026-11-26 实机验收：已通过 COM21 更新 C3 应用并校验写入内容，NVS 参数保留。
+COM5 运行日志确认 AMOLED 的实际 STA 地址为 `B8:1F:3F:D1:EE:04`；
+信道 1 上捕获 10 条 AMOLED A/B 指令与 C3 `peer=2` 回执及发送端确认匹配，
+用户现场确认两只舵机均正常完成 B→A。同期 24 份 AEC 状态记录均为 FD_LOW_COST、
+`rx_overflows=0`。这是屏幕控制的实机验收，本次未单独验收语音口令。
+日志与记录在 `../amoled-1.75/build/servo-link-device.log` 和 `servo-pairing-checks.json`。
+所有控制器控制同一组舵机，实际目标以接收端最后收到的有效指令为准。
 
 ## 校准遥控上限
 
