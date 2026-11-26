@@ -298,7 +298,9 @@ esp_err_t servo_tool_init(void)
     completion = xSemaphoreCreateBinaryStatic(&completion_control);
     if (!completion) return ESP_ERR_NO_MEM;
     agent_link_platform_set_tool_callback(handle_tool, NULL);
-    agent_link_platform_set_user_transcript_callback(on_user_transcript);
+    agent_link_platform_set_user_transcript_callback(SUGARAT_LOCAL_SERVO_COMMANDS ? on_user_transcript : NULL);
+    ESP_LOGI(TAG, "Voice servo control: %s",
+             SUGARAT_LOCAL_SERVO_COMMANDS ? "platform tools and local transcripts" : "platform tools only");
     return ESP_OK;
 }
 

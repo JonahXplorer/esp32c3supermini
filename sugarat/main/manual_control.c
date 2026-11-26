@@ -1,5 +1,7 @@
 #include "manual_control.h"
 
+#include <inttypes.h>
+
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -82,18 +84,46 @@ void manual_control_init(bool wifi_managed)
     radio.last_reply = -LINK_TIMEOUT_US;
 }
 
+static const char *invalid_state_reason(const servo_message_t *reply)
+{
+    if (reply->type != SERVO_STATE) return "type";
+    if (reply->session != radio.session) return "session_mismatch";
+    if (reply->sequence < radio.last_received_sequence) return "stale_seq";
+    if (reply->sequence > radio.sequence) return "future_seq";
+    if (reply->position > 1) return "invalid_position";
+    if (reply->speed < SERVO_SPEED_MIN || reply->speed > SERVO_SPEED_MAX) return "invalid_speed";
+    if (reply->moving > 1) return "invalid_moving";
+    if (reply->angle_limit_deg != SERVO_ANGLE_DEFAULT && reply->angle_limit_deg != SERVO_ANGLE_MAX) {
+        return "invalid_angle_limit";
+    }
+    if (reply->angle_deg > reply->angle_limit_deg) return "invalid_angle";
+    return NULL;
+}
+
 static void read_state(manual_control_view_t *view, int64_t now)
 {
     servo_message_t reply;
-    if (!servo_radio_receive(&reply) || reply.type != SERVO_STATE || reply.session != radio.session ||
-        reply.sequence < radio.last_received_sequence || reply.sequence > radio.sequence ||
-        reply.position > 1 || reply.speed < SERVO_SPEED_MIN || reply.speed > SERVO_SPEED_MAX || reply.moving > 1 ||
-        (reply.angle_limit_deg != SERVO_ANGLE_DEFAULT && reply.angle_limit_deg != SERVO_ANGLE_MAX) ||
-        reply.angle_deg > reply.angle_limit_deg) {
+    if (!servo_radio_receive(&reply)) return;
+    const char *rejection = invalid_state_reason(&reply);
+    if (rejection) {
+        ESP_LOGW(TAG, "C3 ACK rejected: reason=%s session=%08" PRIx32 " seq=%" PRIu32
+                 " expected_session=%08" PRIx32 " pending_seq=%" PRIu32 " last_rx_seq=%" PRIu32
+                 " last_tx_seq=%" PRIu32 " ch=%u type=%u position=%u speed=%u moving=%u angle=%u/%u",
+                 rejection, reply.session, reply.sequence, radio.session,
+                 radio.pending.type ? radio.pending.sequence : 0, radio.last_received_sequence, radio.sequence,
+                 (unsigned)reply.channel, (unsigned)reply.type, (unsigned)reply.position, (unsigned)reply.speed,
+                 (unsigned)reply.moving, (unsigned)reply.angle_deg, (unsigned)reply.angle_limit_deg);
         return;
     }
 
     const bool confirmed = radio.pending.type && radio.pending.sequence == reply.sequence;
+    if (radio.pending.type) {
+        ESP_LOGI(TAG, "C3 ACK check: result=%s session=%08" PRIx32 " seq=%" PRIu32
+                 " pending_seq=%" PRIu32 " local_id=%lu target=%c moving=%u",
+                 confirmed ? "matched" : "pending_seq_mismatch", reply.session, reply.sequence,
+                 radio.pending.sequence, (unsigned long)(radio.pending_tool ? radio.tool.id : 0),
+                 'A' + reply.position, (unsigned)reply.moving);
+    }
     if (confirmed) {
         if (radio.pending_tool) {
             const servo_tool_state_t state = {.target = reply.position, .moving = reply.moving != 0};
@@ -109,11 +139,12 @@ static void read_state(manual_control_view_t *view, int64_t now)
     if (!view->online || confirmed || view->position != reply.position || view->moving != (reply.moving != 0) ||
         view->speed != reply.speed || view->angle_deg != reply.angle_deg ||
         view->angle_limit_deg != reply.angle_limit_deg || view->receiver_channel != reply.channel || view->light != light) {
-        ESP_LOGI(TAG, "C3 confirmed target %c ch %u, speed %u, B angle %u/%u, light %s%s",
+        ESP_LOGI(TAG, "C3 confirmed target %c ch %u, speed %u, B angle %u/%u, light %s%s session=%08" PRIx32
+                 " seq=%" PRIu32,
                  'A' + reply.position, (unsigned)reply.channel, (unsigned)reply.speed,
                  (unsigned)reply.angle_deg, (unsigned)reply.angle_limit_deg,
                  light == SERVO_LIGHT_ON ? "on" : light == SERVO_LIGHT_OFF ? "off" : "unavailable",
-                 reply.moving ? ", moving" : "");
+                 reply.moving ? ", moving" : "", reply.session, reply.sequence);
     }
     *view = (manual_control_view_t){
         .position = reply.position, .speed = reply.speed, .angle_deg = reply.angle_deg,
@@ -128,12 +159,21 @@ static void send_pending(const int64_t now)
     if (!timed_out) {
         const esp_err_t err = servo_radio_send(radio.pending);
         if (radio.pending_tool && err == ESP_OK) servo_tool_radio_queued(&radio.tool);
-        if (radio.attempts == 0 && err != ESP_OK) ESP_LOGW(TAG, "ESP-NOW command send: %s", esp_err_to_name(err));
+        if (radio.attempts == 0 || err != ESP_OK) {
+            ESP_LOG_LEVEL(err == ESP_OK ? ESP_LOG_INFO : ESP_LOG_WARN, TAG,
+                          "ESP-NOW command send: local_id=%lu session=%08" PRIx32 " seq=%" PRIu32
+                          " type=%u position=%u attempt=%u result=%s",
+                          (unsigned long)(radio.pending_tool ? radio.tool.id : 0), radio.pending.session,
+                          radio.pending.sequence, (unsigned)radio.pending.type, (unsigned)radio.pending.position,
+                          radio.attempts + 1, esp_err_to_name(err));
+        }
         ++radio.attempts;
         radio.next_retry = now + RETRY_US;
         return;
     }
-    ESP_LOGW(TAG, "C3 did not acknowledge command %u", (unsigned)radio.pending.type);
+    ESP_LOGW(TAG, "C3 did not acknowledge command %u: local_id=%lu session=%08" PRIx32 " seq=%" PRIu32 " attempts=%u",
+             (unsigned)radio.pending.type, (unsigned long)(radio.pending_tool ? radio.tool.id : 0),
+             radio.pending.session, radio.pending.sequence, radio.attempts);
     if (radio.pending_tool) {
         servo_tool_complete(&radio.tool, NULL);
         radio.pending_tool = false;
@@ -158,6 +198,8 @@ void manual_control_update(bool visible, bool call_active, screen_action_t actio
     }
     if (!radio.pending.type && servo_tool_receive(&radio.tool)) {
         if (now >= radio.tool.deadline_us) {
+            ESP_LOGW(TAG, "ESP-NOW command expired before dispatch: reason=tool_deadline local_id=%lu seq=none",
+                     (unsigned long)radio.tool.id);
             servo_tool_complete(&radio.tool, NULL);
         } else {
             radio.pending = (servo_message_t){
@@ -175,6 +217,7 @@ void manual_control_update(bool visible, bool call_active, screen_action_t actio
         radio.next_retry = now;
     }
 
+    servo_radio_log_diagnostics();
     if (!visible && !radio.pending.type) {
         view->online = false;
         view->pending = false;
@@ -197,6 +240,9 @@ void manual_control_update(bool visible, bool call_active, screen_action_t actio
         if (radio.ready) {
             send_pending(now);
         } else if (radio.pending_tool && now >= radio.tool.deadline_us) {
+            ESP_LOGW(TAG, "ESP-NOW command expired before send: reason=radio_unavailable local_id=%lu session=%08" PRIx32
+                     " seq=%" PRIu32 " attempts=%u", (unsigned long)radio.tool.id, radio.pending.session,
+                     radio.pending.sequence, radio.attempts);
             servo_tool_complete(&radio.tool, NULL);
             radio.pending.type = 0;
             radio.pending_tool = false;

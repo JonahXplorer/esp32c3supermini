@@ -9,6 +9,7 @@
 #include "realtime_ws_stream.h"
 #include "realtime_ws_upgrade.h"
 #include "realtime_voice_trace.h"
+#include "cloud_task_trace.h"
 #include "audio_downlink.h"
 #include "agent_link_platform.h"
 #include "cloud_platform.h"
@@ -1032,36 +1033,6 @@ uint32_t AdvanceAudioReset(agent_audio_reset_reason_t reason) {
     return seq;
 }
 
-void CheckResponseInterruption(const uint8_t* data, size_t bytes, [[maybe_unused]] int64_t received_at,
-                               [[maybe_unused]] const char* connect_token) {
-    constexpr char event_name[] = "response.interrupted";
-    if (std::search(data, data + bytes, event_name, event_name + sizeof event_name - 1) == data + bytes) return;
-    cJSON* json = cJSON_ParseWithLength(reinterpret_cast<const char*>(data), bytes);
-    const auto* type = cJSON_GetObjectItemCaseSensitive(json, "type");
-    const bool interrupted = cJSON_IsString(type) && strcmp(type->valuestring, event_name) == 0;
-#if CONFIG_IDF_TARGET_ESP32S3
-    char reason[96]{};
-    if (interrupted && s_voice_trace) {
-        const auto* field = agentlink::realtime::EndField(json, "reason", "cause");
-        agentlink::realtime::SafeEndField(reason, sizeof reason, cJSON_IsString(field) ? field->valuestring : nullptr,
-                                         cloud_cred_auth_key(), connect_token);
-    }
-#endif
-    cJSON_Delete(json);
-    if (!interrupted) return;
-    [[maybe_unused]] const uint32_t seq = AdvanceAudioReset(AGENT_AUDIO_RESET_REMOTE_INTERRUPT);
-#if CONFIG_IDF_TARGET_ESP32S3
-    if (s_voice_trace) {
-        const agent_link_platform_voice_trace_t trace{
-            .kind = AGENT_LINK_VOICE_TRACE_RESPONSE_INTERRUPTED, .at_us = received_at,
-            .stream = s_capture_turn.load(), .last_frame = s_tx_sent_frames.load(),
-            .event = event_name, .text = reason, .reset_seq = seq,
-        };
-        s_voice_trace(&trace);
-    }
-#endif
-}
-
 void ResetInputLocked() {
     if (s_capture_turn.load() & 1) s_capture_turn.fetch_add(1);
     s_input = AGENT_STREAM_KIND_COUNT;
@@ -1336,6 +1307,77 @@ public:
                      ws_delivery_waits_ - ws_stall_delivery_waits_, static_cast<unsigned>(s_downlink_bytes.load()));
         }
         ws_stall_started_us_ = 0;
+    }
+#endif
+
+    // The media task can discard messages queued before an audio reset. Trace
+    // the original wire events here, including task events received while muted.
+    void ObserveControlFrame(const uint8_t* data, size_t bytes, [[maybe_unused]] int64_t received_at) {
+        namespace task_trace = agentlink::task_trace;
+        const std::string_view message(reinterpret_cast<const char*>(data), bytes);
+#if CONFIG_IDF_TARGET_ESP32S3
+        if (!task_trace::MayContainTraceEvent(message)) return;
+#else
+        if (message.find(task_trace::kInterrupted) == message.npos) return;
+#endif
+        cJSON* json = cJSON_ParseWithLength(message.data(), message.size());
+        if (!json) return;
+        const char* event = task_trace::String(json, "type");
+        const bool interrupted = event && strcmp(event, task_trace::kInterrupted) == 0;
+        [[maybe_unused]] const uint32_t seq = interrupted
+            ? AdvanceAudioReset(AGENT_AUDIO_RESET_REMOTE_INTERRUPT) : 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+        if (event && task_trace::IsTraceEvent(event)) {
+            const uint32_t stream = s_capture_turn.load();
+            char reason[96]{};
+            const auto* field = agentlink::realtime::EndField(json, "reason", interrupted ? "cause" : "message");
+            agentlink::realtime::SafeEndField(reason, sizeof reason,
+                cJSON_IsString(field) ? field->valuestring : nullptr, cloud_cred_auth_key(), connect_token_);
+            if (interrupted && s_voice_trace) {
+                const agent_link_platform_voice_trace_t trace{
+                    .kind = AGENT_LINK_VOICE_TRACE_RESPONSE_INTERRUPTED, .at_us = received_at,
+                    .stream = stream, .last_frame = s_tx_sent_frames.load(),
+                    .event = event, .text = reason, .reset_seq = seq,
+                };
+                s_voice_trace(&trace);
+            }
+            LogTaskEvent(json, event, received_at, stream, seq, reason);
+        }
+#endif
+        cJSON_Delete(json);
+    }
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    void LogTaskEvent(const cJSON* json, const char* event, int64_t received_at, uint32_t stream,
+                      uint32_t reset_seq, const char* reason) {
+        using agentlink::task_trace::Count;
+        using agentlink::task_trace::Identifier;
+        using agentlink::task_trace::String;
+        const auto* progress = cJSON_GetObjectItemCaseSensitive(json, "progress");
+        const auto* connection = cJSON_GetObjectItemCaseSensitive(json, "realtime_connection");
+        const auto* error_code = agentlink::realtime::EndField(json, "code", "error_code");
+        char numeric_code[32];
+        const char* code = cJSON_IsString(error_code) ? Identifier(error_code->valuestring) : "-";
+        if (cJSON_IsNumber(error_code)) {
+            snprintf(numeric_code, sizeof numeric_code, "%d", error_code->valueint);
+            code = numeric_code;
+        }
+        ESP_LOGI("agent_link.task", "boot_ms=%lld wss_start_ms=%lld stream=%lu session_id=%s event=%s event_id=%s "
+                 "turn_id=%s response_id=%s kind=%s phase=%s status=%s done_tools=%d expected_tools=%d "
+                 "tool_call_id=%s wire_msg_id=%s action=%s code=%s reason=\"%s\" reset_seq=%lu",
+                 static_cast<long long>(received_at / 1000), static_cast<long long>(created_at_ / 1000),
+                 static_cast<unsigned long>(stream), Identifier(conversation_id_), Identifier(event),
+                 Identifier(String(json, "event_id")), Identifier(String(json, "turn_id")),
+                 Identifier(String(json, "response_id")), Identifier(String(json, "kind")),
+                 Identifier(String(json, "phase")), Identifier(String(json, "status")),
+                 Count(progress, "done_tools"), Count(progress, "expected_tools"),
+                 Identifier(String(json, "tool_call_id")), Identifier(String(json, "msg_id")),
+                 Identifier(String(json, "action")), code, reason, static_cast<unsigned long>(reset_seq));
+        if (cJSON_IsObject(connection)) {
+            ESP_LOGI("agent_link.task", "boot_ms=%lld wss_start_ms=%lld session_id=%s realtime_connection_id=%s active_turn_id=%s",
+                     static_cast<long long>(received_at / 1000), static_cast<long long>(created_at_ / 1000), Identifier(conversation_id_),
+                     Identifier(String(connection, "id")), Identifier(String(connection, "activeTaskTurnId")));
+        }
     }
 #endif
 
@@ -2621,7 +2663,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                                   delivery_waits, socket_wakeups};
 #endif
                 if (assembler.Opcode() == 1)
-                    CheckResponseInterruption(message.Data(), assembler.Size(), last_rx, grant.token);
+                    call.ObserveControlFrame(message.Data(), assembler.Size(), last_rx);
                 pending_at = last_rx;
 #if CONFIG_IDF_TARGET_ESP32S3
                 sender.last_data_received_ms = pending_at / 1000;
@@ -2979,7 +3021,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                         call.RecordWsMessage();
                         // Cancel queued speech before an interruption waits behind paced audio.
                         if (assembler.Opcode() == WS_TRANSPORT_OPCODES_TEXT)
-                            CheckResponseInterruption(message.Data(), assembler.Size(), esp_timer_get_time(), grant.token);
+                            call.ObserveControlFrame(message.Data(), assembler.Size(), esp_timer_get_time());
                         pending = true;
                         pending_at = esp_timer_get_time();
                         pending_reset = s_reset.load();

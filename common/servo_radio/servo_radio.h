@@ -63,5 +63,7 @@ bool servo_radio_receive(servo_message_t *message);
 bool servo_radio_receive_from(servo_message_t *message, uint8_t *peer_index);
 esp_err_t servo_radio_send(servo_message_t message);
 esp_err_t servo_radio_send_to(uint8_t peer_index, servo_message_t message);
+// Drain diagnostic events from the control task, outside the Wi-Fi callbacks.
+void servo_radio_log_diagnostics(void);
 // Call from the receiving task after handling and replying to any incoming packet.
 void servo_radio_scan_step(void);

@@ -17,6 +17,6 @@ struct CloudToolCredentials {
     uint32_t expires_in;
 };
 
-esp_err_t cloud_tools_start(const CloudToolCredentials& credentials);
+esp_err_t cloud_tools_start(const CloudToolCredentials& credentials, const char* session_id);
 bool cloud_tools_topics_match(const char* down, const char* up);
 void cloud_tools_enable();

@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -320,8 +321,9 @@ void app_main(void)
                 position_requested = true;
                 peer->last_session = message.session;
                 peer->last_sequence = message.sequence;
-                ESP_LOGI(TAG, "Sugarat requested position %c: GPIO%d=%d us, GPIO%d=%d us",
-                         'A' + target_position, servos[0].gpio, servo_target_us(&servos[0], target_position, settings.angle_deg),
+                ESP_LOGI(TAG, "Sugarat requested position %c: session=%08" PRIx32 " seq=%" PRIu32
+                         " GPIO%d=%d us, GPIO%d=%d us", 'A' + target_position, message.session, message.sequence,
+                         servos[0].gpio, servo_target_us(&servos[0], target_position, settings.angle_deg),
                          servos[1].gpio, servo_target_us(&servos[1], target_position, settings.angle_deg));
             } else if (new_command && message.type == SERVO_SET_SPEED &&
                        message.speed >= SERVO_SPEED_MIN && message.speed <= SERVO_SPEED_MAX) {
@@ -390,15 +392,26 @@ void app_main(void)
             ESP_LOGI(TAG, "GPIO%d light %s, target %c", LIGHT_GPIO, light_on ? "on" : "off", 'A' + target_position);
         }
         if (reply) {
-            (void)servo_radio_send_to(peer_index, (servo_message_t){
+            const esp_err_t err = servo_radio_send_to(peer_index, (servo_message_t){
                 .session = message.session, .sequence = message.sequence, .type = SERVO_STATE,
                 .position = target_position, .speed = settings.speed, .moving = moving,
                 .angle_deg = settings.angle_deg, .angle_limit_deg = angle_limit_deg,
                 .light = light_on ? SERVO_LIGHT_ON : SERVO_LIGHT_OFF,
             });
+            ESP_LOG_LEVEL(err == ESP_OK ? ESP_LOG_INFO : ESP_LOG_WARN, TAG,
+                          "ESP-NOW ACK submit: session=%08" PRIx32 " seq=%" PRIu32
+                          " peer=%u ch=%u rx_type=%u rx_position=%u target=%c moving=%u result=%s",
+                          message.session, message.sequence, (unsigned)peer_index, (unsigned)message.channel,
+                          (unsigned)message.type, (unsigned)message.position, 'A' + target_position,
+                          (unsigned)moving, esp_err_to_name(err));
+        } else if (received) {
+            ESP_LOGW(TAG, "ESP-NOW command ignored: reason=servo_probe_active session=%08" PRIx32
+                     " seq=%" PRIu32 " peer=%u ch=%u type=%u target=%c", message.session, message.sequence,
+                     (unsigned)peer_index, (unsigned)message.channel, (unsigned)message.type, 'A' + target_position);
         }
         if (radio_ready) {
             servo_radio_scan_step();
+            servo_radio_log_diagnostics();
         }
         if (settings_handle && settings_dirty && !moving &&
             xTaskGetTickCount() - last_settings_change >= pdMS_TO_TICKS(SETTINGS_DELAY_MS)) {

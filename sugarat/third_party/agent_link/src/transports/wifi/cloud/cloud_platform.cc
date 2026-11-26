@@ -452,7 +452,7 @@ esp_err_t StartToolClient(const cJSON* root, const char* sn, const char* session
         return ESP_ERR_INVALID_RESPONSE;
     }
     *client_id = credentials.client_id;
-    return cloud_tools_start(credentials);
+    return cloud_tools_start(credentials, session_id);
 }
 
 esp_err_t PutToolRegistration(const ToolRegistration& registration, const char* stage) {
