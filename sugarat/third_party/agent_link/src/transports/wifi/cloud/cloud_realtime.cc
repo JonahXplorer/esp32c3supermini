@@ -717,6 +717,7 @@ struct WsSender {
         unsigned want_read = 0;
         unsigned want_write = 0;
         bool start_logged = false;
+        bool during_logged = false;
     } write_wait;
 #endif
 #endif
@@ -841,6 +842,7 @@ bool PumpWire(WsSender& sender) {
                  static_cast<long long>(std::max(wait.max_loop_gap_us, loop_gap_us)));
         agentlink::realtime::LogTcpStall(sender.tls, agentlink::realtime::TcpStallPhase::kTimeout,
                                         sender.tcp_stall_start);
+        ReportDmaHeap("write_stall");
 #endif
         LogTransportFailure(sender.tls, "write progress timeout", 0, 0);
         return false;
@@ -895,6 +897,10 @@ bool PumpWire(WsSender& sender) {
     }
 #if CONFIG_IDF_TARGET_ESP32S3
     const bool report_tcp_start = LogWriteWaitStart(sender, finished_us);
+    const bool report_tcp_resume = !sender.pending.Busy() && sender.first_wait_at && sender.tcp_stall_start.sampled;
+    const bool report_tcp_during = waiting && sender.tcp_stall_start.sampled && !sender.write_wait.during_logged &&
+                                   finished_us - sender.first_wait_at >= 2500000;
+    if (report_tcp_during) sender.write_wait.during_logged = true;
 #endif
     if (!sender.pending.Busy()) {
         const uint32_t waited_rx = s_rx_bytes.load() - sender.receive_at_first_wait;
@@ -952,6 +958,10 @@ bool PumpWire(WsSender& sender) {
         if (capture_lock.owns_lock()) capture_lock.unlock();
         agentlink::realtime::LogTcpStall(sender.tls, agentlink::realtime::TcpStallPhase::kStart,
                                         sender.tcp_stall_start);
+    } else if (report_tcp_during || report_tcp_resume) {
+        if (capture_lock.owns_lock()) capture_lock.unlock();
+        agentlink::realtime::LogTcpStall(sender.tls, report_tcp_resume ? agentlink::realtime::TcpStallPhase::kResume :
+                                       agentlink::realtime::TcpStallPhase::kDuring, sender.tcp_stall_start);
     }
 #endif
     return true;
@@ -2581,6 +2591,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     }
 #if CONFIG_IDF_TARGET_ESP32S3
     ReportDmaHeap("after_wss");
+    const agentlink::realtime::TcpWifiTrace tcp_wifi_trace(connection.tls);
 #endif
     // Keep a full message alongside the fixed TLS record. Growing/shrinking
     // this buffer during playback otherwise introduces another large realloc.

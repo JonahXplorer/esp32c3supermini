@@ -11,8 +11,7 @@
 #include "freertos/task.h"
 #include "servo_voice_command.h"
 
-// An idle C3 can be scanning for Sugarat when the first voice command arrives.
-enum { ACK_TIMEOUT_MS = 5500, TOOL_WINDOW_MS = 15000, MAX_RECENT_COMMANDS = 16 };
+enum { ACK_TIMEOUT_MS = 1500, TOOL_WINDOW_MS = 15000, MAX_RECENT_COMMANDS = 16 };
 
 static const char *TAG = "servo_tool";
 #define SET_POWER "set_servo_power"
@@ -26,6 +25,7 @@ static const char DEFINITIONS[] =
     "灯光、头盔电源、闲聊、引用、否定、询问如何操作或仅问状态时不调用。对象或方向不清时先问一句。"
     "即使设备已按转写词执行，也要调用本工具取得同一次动作的 C3 回执。source=transcript 表示由 Sugarat 本地规则发起。"
     "只有 c3_ack=true 且 executed=true 才确认，moving=true 时说正在开合。要核对刚才的执行结果，调用 " GET_STATUS " 并传 last_command_only=true。"
+    "如果 c3_ack=false 或 state=unknown，告诉用户暂时无法确认面罩是否到位，继续对话，等待用户明确要求后才能再次操作。"
     "用户说没动或要检查当前是否到位时，调用 " GET_STATUS " 查当前状态，无法核实时如实说明。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"power\":{\"type\":\"boolean\","
     "\"description\":\"布尔值。true 抬起并打开面罩到 B 点，false 放下并关闭面罩到 A 点\"}},\"required\":[\"power\"]},\"timeout\":15},"
@@ -34,7 +34,7 @@ static const char DEFINITIONS[] =
     "默认实时询问 C3，不改变位置。state 为 open=已到 B、closed=已到 A、opening=去 B、closing=去 A、unknown=未收到 C3 状态。"
     "要确认设备刚才是否已执行本地转写指令，用 last_command_only=true，等待本次通话最近一次开合的回执，只读返回 last_command，不再发 ESP-NOW。"
     "last_command.source=transcript 表示本地发起，c3_ack=true 且 executed=true 才表示 C3 确认目标。moving 是回执当时的状态，age_ms 是动作距今时间。"
-    "last_command=null 或没有回执时，如实说明无法确认。查询当前状态时根据实时 C3 结果回答。\","
+    "last_command=null 或没有回执时，如实说明无法确认并继续对话。查询当前状态时根据实时 C3 结果回答。\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"last_command_only\":{\"type\":\"boolean\","
     "\"description\":\"true 读取本次通话最近一次开合的原始回执，默认查询当前状态\"}},\"additionalProperties\":false},\"timeout\":15}]";
 
@@ -201,6 +201,13 @@ static bool target_confirmed(const servo_command_t *command)
     return command->c3_ack && command->state.target == command->request.position;
 }
 
+static const char *delivery_status(const servo_command_t *command, int64_t now)
+{
+    if (command->c3_ack) return target_confirmed(command) ? "confirmed" : "target_mismatch";
+    if (!command->complete && now < command->request.deadline_us) return "pending";
+    return command->esp_now_queued ? "no_c3_ack" : "esp_now_not_queued";
+}
+
 static esp_err_t set_power(const cJSON *params, cJSON *result)
 {
     const cJSON *power = cJSON_GetObjectItemCaseSensitive(params, "power");
@@ -220,15 +227,13 @@ static esp_err_t set_power(const cJSON *params, cJSON *result)
         cJSON_AddStringToObject(result, "position", position_name(command.state.target));
         cJSON_AddBoolToObject(result, "moving", command.state.moving);
     }
-    if (!command.c3_ack) return ESP_ERR_TIMEOUT;
+    if (!command.c3_ack) {
+        cJSON_AddStringToObject(result, "state", "unknown");
+        cJSON_AddStringToObject(result, "status", delivery_status(&command, esp_timer_get_time()));
+        // The tool finished. The payload reports the unconfirmed physical action.
+        return ESP_OK;
+    }
     return executed ? ESP_OK : ESP_FAIL;
-}
-
-static const char *delivery_status(const servo_command_t *command, int64_t now)
-{
-    if (command->c3_ack) return target_confirmed(command) ? "confirmed" : "target_mismatch";
-    if (!command->complete && now < command->request.deadline_us) return "pending";
-    return command->esp_now_queued ? "no_c3_ack" : "esp_now_not_queued";
 }
 
 static esp_err_t add_last_command(cJSON *result, const servo_command_t *last)
@@ -276,6 +281,8 @@ static esp_err_t get_status(const cJSON *params, cJSON *result)
         state = states[query.state.target][query.state.moving];
         cJSON_AddStringToObject(result, "target_position", position_name(query.state.target));
         cJSON_AddBoolToObject(result, "moving", query.state.moving);
+    } else {
+        cJSON_AddStringToObject(result, "status", delivery_status(&query, esp_timer_get_time()));
     }
     cJSON_AddStringToObject(result, "state", state);
 

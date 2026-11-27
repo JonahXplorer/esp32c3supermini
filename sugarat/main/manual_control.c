@@ -14,7 +14,7 @@ enum {
     RETRY_US = 180000,
     LINK_TIMEOUT_US = 2500000,
     RADIO_RETRY_US = 1500000,
-    MAX_TOUCH_SENDS = 5,
+    MAX_COMMAND_SENDS = 5,
 };
 
 static const char *TAG = "sugarat_remote";
@@ -155,7 +155,8 @@ static void read_state(manual_control_view_t *view, int64_t now)
 
 static void send_pending(const int64_t now)
 {
-    const bool timed_out = radio.pending_tool ? now >= radio.tool.deadline_us : radio.attempts >= MAX_TOUCH_SENDS;
+    const bool timed_out = radio.attempts >= MAX_COMMAND_SENDS ||
+                           (radio.pending_tool && now >= radio.tool.deadline_us);
     if (!timed_out) {
         const esp_err_t err = servo_radio_send(radio.pending);
         if (radio.pending_tool && err == ESP_OK) servo_tool_radio_queued(&radio.tool);

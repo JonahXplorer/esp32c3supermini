@@ -77,6 +77,10 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     AGENT_LINK_BUILD_BLE=${_ble} AGENT_LINK_BUILD_WIFI=${_wifi} AGENT_LINK_BUILD_MUSE=${_muse}
     AGENT_LINK_DESKTOP_BLE=${_desktop_ble})
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
+if(_wifi AND IDF_TARGET STREQUAL "esp32s3")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=esp_netif_transmit_wrap" "-Wl,--wrap=esp_netif_receive")
+endif()
 if("$ENV{AGENT_LINK_BUILD_PROFILE}" STREQUAL "sdgoods-wifi")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         AGENT_LINK_NVS_PARTITION="agent_nvs" AGENT_LINK_UI_DEFAULT_ENGLISH=1)
