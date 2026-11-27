@@ -27,9 +27,11 @@ enum {
     SERVO_2_GPIO = 7,
     SERVO_PWM_HZ = 50,
     SERVO_PERIOD_US = 1000000 / SERVO_PWM_HZ,
-    SERVO_GPIO6_A_US = 1000,
+    SERVO_GPIO6_A_US = 848,
+    SERVO_GPIO6_B_0_US = 1000,
     SERVO_GPIO6_90_US = 2000,
-    SERVO_GPIO7_A_US = 2000,
+    SERVO_GPIO7_A_US = 2152,
+    SERVO_GPIO7_B_0_US = 2000,
     SERVO_GPIO7_90_US = 1000,
     PROBE_MIN_US = 500,
     PROBE_MAX_US = 2500,
@@ -56,6 +58,7 @@ typedef struct {
     int gpio;
     ledc_channel_t channel;
     int a_us;
+    int b_at_0_us;
     int at_90_us;
     int at_max_us;
     int current_us;
@@ -135,7 +138,7 @@ static int servo_target_us(const servo_t *servo, int position, int angle_deg)
         return servo->a_us;
     }
     const bool beyond_90 = angle_deg > SERVO_ANGLE_DEFAULT;
-    const int start_us = beyond_90 ? servo->at_90_us : servo->a_us;
+    const int start_us = beyond_90 ? servo->at_90_us : servo->b_at_0_us;
     const int end_us = beyond_90 ? servo->at_max_us : servo->at_90_us;
     const int segment_deg = beyond_90 ? angle_deg - SERVO_ANGLE_DEFAULT : angle_deg;
     const int segment_span_deg = beyond_90 ? SERVO_ANGLE_MAX - SERVO_ANGLE_DEFAULT : SERVO_ANGLE_DEFAULT;
@@ -146,7 +149,7 @@ static int servo_target_us(const servo_t *servo, int position, int angle_deg)
 
 static int probe_pulse_us(const servo_t *servo, int extra_us)
 {
-    return servo->at_90_us + (servo->at_90_us > servo->a_us ? extra_us : -extra_us);
+    return servo->at_90_us + (servo->at_90_us > servo->b_at_0_us ? extra_us : -extra_us);
 }
 
 static void poll_probe(const servo_t servos[], size_t servo_count, probe_t *probe)
@@ -249,6 +252,7 @@ void app_main(void)
             .gpio = SERVO_1_GPIO,
             .channel = LEDC_CHANNEL_0,
             .a_us = SERVO_GPIO6_A_US,
+            .b_at_0_us = SERVO_GPIO6_B_0_US,
             .at_90_us = SERVO_GPIO6_90_US,
             .at_max_us = SERVO_GPIO6_MAX_US,
         },
@@ -256,6 +260,7 @@ void app_main(void)
             .gpio = SERVO_2_GPIO,
             .channel = LEDC_CHANNEL_1,
             .a_us = SERVO_GPIO7_A_US,
+            .b_at_0_us = SERVO_GPIO7_B_0_US,
             .at_90_us = SERVO_GPIO7_90_US,
             .at_max_us = SERVO_GPIO7_MAX_US,
         },
