@@ -8,8 +8,7 @@
 
 // Connections and panel sequence from Waveshare's maintained 1.75 BSP.
 // See README.md for source links. The 1.75C is a different board.
-enum { LCD_STRIPE_ROWS = 12, LCD_COLUMN_OFFSET = 6,
-       LCD_STRIPE_BYTES = AMOLED_PANEL_SIZE * LCD_STRIPE_ROWS * sizeof(uint16_t) };
+enum { LCD_COLUMN_OFFSET = 6 };
 
 static const char *TAG = "amoled_board";
 static i2c_master_bus_handle_t bus;
@@ -49,11 +48,11 @@ esp_err_t sugarat_display_init(void)
         .data0_io_num = GPIO_NUM_4, .data1_io_num = GPIO_NUM_5,
         .data2_io_num = GPIO_NUM_6, .data3_io_num = GPIO_NUM_7,
         .data4_io_num = -1, .data5_io_num = -1, .data6_io_num = -1, .data7_io_num = -1,
-        .max_transfer_sz = LCD_STRIPE_BYTES,
+        .max_transfer_sz = AMOLED_TRANSFER_BYTES,
     };
     ESP_RETURN_ON_ERROR(spi_bus_initialize(SPI2_HOST, &config, SPI_DMA_CH_AUTO), TAG, "LCD SPI");
     ESP_RETURN_ON_ERROR(co5300_new_qspi_io(SPI2_HOST, GPIO_NUM_12, 40 * 1000 * 1000,
-                                          LCD_STRIPE_BYTES, &lcd), TAG, "LCD QSPI");
+                                          AMOLED_TRANSFER_BYTES, &lcd), TAG, "LCD QSPI");
     const gpio_config_t reset = {.pin_bit_mask = 1ULL << GPIO_NUM_39, .mode = GPIO_MODE_OUTPUT};
     ESP_RETURN_ON_ERROR(gpio_config(&reset), TAG, "LCD reset pin");
     ESP_RETURN_ON_ERROR(gpio_set_level(GPIO_NUM_39, 0), TAG, "Assert LCD reset");
@@ -90,16 +89,14 @@ esp_err_t sugarat_display_write(int x, int y, int width, int height, const uint8
     const uint8_t columns[] = {left >> 8, left & 0xff, right >> 8, right & 0xff};
     const int row_bytes = width * sizeof(uint16_t);
     // Each transfer starts and ends on a two-row boundary.
-    const int stripe_rows = (LCD_STRIPE_BYTES / row_bytes) & ~1;
+    const int stripe_rows = (AMOLED_TRANSFER_BYTES / row_bytes) & ~1;
     for (int top = y; top < y + height; top += stripe_rows) {
         const int remaining = y + height - top;
         const int lines = remaining < stripe_rows ? remaining : stripe_rows;
         const int bottom = top + lines - 1;
         const uint8_t rows[] = {top >> 8, top & 0xff, bottom >> 8, bottom & 0xff};
-        ESP_RETURN_ON_ERROR(panel_command(0x2A, columns, sizeof(columns)), TAG, "LCD columns");
-        ESP_RETURN_ON_ERROR(panel_command(0x2B, rows, sizeof(rows)), TAG, "LCD rows");
-        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_color(lcd, 0x32002C00,
-                            pixels + (top - y) * row_bytes, lines * row_bytes), TAG, "LCD pixels");
+        ESP_RETURN_ON_ERROR(co5300_qspi_write_window(lcd, columns, rows,
+                            pixels + (top - y) * row_bytes, lines * row_bytes), TAG, "LCD window");
     }
     return ESP_OK;
 }

@@ -10,10 +10,12 @@
 
 #if defined(SUGARAT_NATIVE_AMOLED_UI)
 #include "home_presenter.h"
+#include "esp_timer.h"
 #include "playback.h"
 #include "ui_theme.h"
 enum { SECONDARY_PAGE_SIZE = 360 };
 static home_screen_t *native_home;
+static int64_t next_poll_us;
 #else
 enum { SECONDARY_PAGE_SIZE = SCREEN_SIZE };
 #endif
@@ -760,11 +762,25 @@ void screen_update(const screen_state_t *state)
 
 screen_action_t screen_poll(void)
 {
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    uint32_t wait_ms = lv_timer_handler();
+    if (wait_ms > 15) wait_ms = 15; // Keep state polling and ESP-NOW responsive, including idle screens.
+    if (wait_ms == 0) wait_ms = 1;
+    next_poll_us = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+#else
     lv_timer_handler();
+#endif
     const screen_action_t selected = action;
     action = (screen_action_t){0};
     return selected;
 }
+
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+void screen_wait(void)
+{
+    screen_port_wait_until(next_poll_us);
+}
+#endif
 
 bool screen_manual_is_open(void)
 {

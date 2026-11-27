@@ -7,6 +7,10 @@
 
 // UI and touch coordinates use native panel pixels; screen_port rotates 90deg CW.
 enum { SCREEN_SIZE = 466, AMOLED_PANEL_SIZE = 466,
+       AMOLED_FRAME_PERIOD_MS = 33, AMOLED_TOUCH_PERIOD_MS = 10,
+       AMOLED_TRANSFER_ROWS = 32,
+       AMOLED_TRANSFER_PIXELS = AMOLED_PANEL_SIZE * AMOLED_TRANSFER_ROWS,
+       AMOLED_TRANSFER_BYTES = AMOLED_TRANSFER_PIXELS * sizeof(uint16_t),
        SUGARAT_BRIGHTNESS_MIN = 5, SUGARAT_BRIGHTNESS_DEFAULT = 74 };
 
 esp_err_t amoled_board_init(void);

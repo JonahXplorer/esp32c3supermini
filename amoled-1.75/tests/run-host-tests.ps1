@@ -24,7 +24,7 @@ try {
     $compilerBin = Join-Path $toolchain 'bin\Hostx64\x64'
     $env:Path = $compilerBin + ';' + $env:Path
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    foreach ($test in @('touch_rotation_test', 'audio_capture_test')) {
+    foreach ($test in @('touch_rotation_test', 'audio_capture_test', 'qspi_window_test')) {
         $program = Join-Path $outputDir ($test + '.exe')
         $arguments = @('/nologo', '/std:c11', '/experimental:c11atomics',
             ('/I' + (Join-Path $PSScriptRoot 'stubs')),

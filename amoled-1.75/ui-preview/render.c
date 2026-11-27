@@ -5,7 +5,8 @@
 #include <string.h>
 
 static uint32_t now_ms;
-static uint16_t framebuffer[UI_SIZE * UI_SIZE], draw_buffer[UI_SIZE * 24];
+enum { FRAME_MS = 33, MOTION_FRAMES = 48 };
+static uint16_t framebuffer[UI_SIZE * UI_SIZE], draw_buffer[UI_SIZE * UI_SIZE], draw_buffer_b[UI_SIZE * UI_SIZE];
 static unsigned flushed_pixels, clicks;
 static home_action_t clicked_action;
 static lv_area_t dirty;
@@ -32,16 +33,14 @@ static void reset_stats(void)
 }
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 {
-    const int width = lv_area_get_width(area);
-    const uint16_t *src = (const uint16_t *)pixels;
-    for (int y = area->y1; y <= area->y2; ++y)
-        memcpy(framebuffer + y * UI_SIZE + area->x1,
-               src + (y - area->y1) * width, (size_t)width * sizeof(*src));
-    flushed_pixels += (unsigned)(width * lv_area_get_height(area));
-    if (dirty.x1 > area->x1) dirty.x1 = area->x1;
-    if (dirty.y1 > area->y1) dirty.y1 = area->y1;
-    if (dirty.x2 < area->x2) dirty.x2 = area->x2;
-    if (dirty.y2 < area->y2) dirty.y2 = area->y2;
+    (void)area;
+    if (lv_display_flush_is_last(display)) {
+        /* Like the port: DIRECT preserves the logical frame, and each completed
+         * group of changed rectangles results in one full physical transfer. */
+        memcpy(framebuffer, pixels, sizeof(framebuffer));
+        flushed_pixels += UI_SIZE * UI_SIZE;
+        dirty = (lv_area_t){0, 0, UI_SIZE - 1, UI_SIZE - 1};
+    }
     lv_display_flush_ready(display);
 }
 static void advance(unsigned elapsed)
@@ -108,7 +107,7 @@ int main(int argc, char **argv)
     lv_display_t *display = lv_display_create(UI_SIZE, UI_SIZE);
     lv_display_set_theme(display, NULL);
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_buffers(display, draw_buffer, NULL, sizeof(draw_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(display, draw_buffer, draw_buffer_b, sizeof(draw_buffer), LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(display, flush);
     lv_obj_t *root = lv_screen_active();
     lv_obj_remove_style_all(root);
@@ -131,10 +130,10 @@ int main(int argc, char **argv)
         snprintf(name, sizeof(name), "device_%02u_%s", phase, phase_names[phase]);
         fprintf(states, "%s,%s,%s,%s,%s,%d,%d\n", name, phase_names[phase], snap.title,
                 snap.hint, snap.action_label, snap.action_enabled, snap.state);
-        for (unsigned frame = 0; frame < 18; ++frame) {
+        for (unsigned frame = 0; frame < MOTION_FRAMES; ++frame) {
             reset_stats();
             if (phase == SUGARAT_VOICE_IN_CALL) state.voice.level = (uint8_t)(20 + frame * 7 % 70);
-            snap = home_presenter_snapshot(&state, 0); home_screen_update(screen, &snap); advance(80);
+            snap = home_presenter_snapshot(&state, 0); home_screen_update(screen, &snap); advance(FRAME_MS);
             sample(metrics, phase_names[phase], frame);
             if (phase == SUGARAT_VOICE_IN_CALL) {
                 char frame_name[128]; snprintf(frame_name, sizeof(frame_name), "device_listening_%02u", frame);
@@ -152,12 +151,12 @@ int main(int argc, char **argv)
             speaking.action == listening.action && speaking.action_enabled == listening.action_enabled,
             "Playback changes central visual only, with Listening and mic indication preserved");
     home_screen_update(screen, &listening); advance(200); save(argv[1], "device_listening");
-    reset_stats(); home_screen_update(screen, &speaking); advance(80);
+    reset_stats(); home_screen_update(screen, &speaking); advance(FRAME_MS);
     sample(metrics, "listening_to_speaking", 0);
-    require(dirty.y1 >= UI_ORBIT_Y && dirty.y2 < UI_ORBIT_TITLE_Y,
-            "Playback transition does not redraw title, status or controls");
-    for (unsigned i = 0; i < 18; ++i) {
-        reset_stats(); advance(80); sample(metrics, "speaking", i);
+    require(dirty.x1 == 0 && dirty.y1 == 0 && dirty.x2 == 465 && dirty.y2 == 465,
+            "Full-frame path submits one complete frame");
+    for (unsigned i = 0; i < MOTION_FRAMES; ++i) {
+        reset_stats(); advance(FRAME_MS); sample(metrics, "speaking", i);
         snprintf(name, sizeof(name), "device_speaking_%02u", i); save(argv[1], name);
         if (i == 5) save(argv[1], "device_speaking");
     }
@@ -176,6 +175,6 @@ int main(int argc, char **argv)
     screen_state_t bad = mock_state(999);
     require(!strcmp(home_presenter_snapshot(&bad, 0).title, "Voice error"), "Unknown phase has a safe presentation");
     fclose(metrics); home_screen_destroy(screen); lv_display_delete(display);
-    puts("PASS: 16 device phases, action guards, Listening during playback, central-only transition and hidden-page pause");
+    puts("PASS: 16 device phases, action guards, Listening during playback, full-frame submission and hidden-page pause");
     return 0;
 }

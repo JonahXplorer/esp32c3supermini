@@ -17,23 +17,27 @@ typedef struct {
     SemaphoreHandle_t mutex;
     // Both descriptor and DMA buffer outlive a timed-out call. In particular,
     // never queue a stack descriptor or lend SPI an LVGL/command-stack buffer.
-    spi_transaction_t transaction;
+    spi_transaction_t transaction[3];
     uint8_t *dma;
     size_t capacity;
     uint32_t sequence;
-    bool pending;
+    unsigned pending, retired;
     esp_err_t fault;
 } co5300_io_t;
 
 static esp_err_t reap(co5300_io_t *io, TickType_t wait)
 {
-    if (!io->pending) return ESP_OK;
-    spi_transaction_t *finished = NULL;
-    esp_err_t err = spi_device_get_trans_result(io->device, &finished, wait);
-    // DMA errors also return a completed descriptor. A timeout returns none.
-    if (finished == &io->transaction) io->pending = false;
-    if (err == ESP_OK && io->pending) return ESP_ERR_INVALID_STATE;
-    return err;
+    while (io->pending) {
+        spi_transaction_t *finished = NULL;
+        esp_err_t err = spi_device_get_trans_result(io->device, &finished, wait);
+        // DMA errors may still return ownership; a timeout returns no descriptor.
+        if (finished == &io->transaction[io->retired]) {
+            ++io->retired;
+            --io->pending;
+        } else if (err == ESP_OK) return ESP_ERR_INVALID_STATE;
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t transmit(esp_lcd_panel_io_t *base, int cmd, const void *data,
@@ -52,31 +56,76 @@ static esp_err_t transmit(esp_lcd_panel_io_t *base, int cmd, const void *data,
     if (io->pending) { err = ESP_ERR_INVALID_STATE; goto fail; }
 
     if (bytes) memcpy(io->dma, data, bytes);
-    memset(&io->transaction, 0, sizeof io->transaction);
-    io->transaction.cmd = (uint16_t)opcode;
-    io->transaction.addr = (uint32_t)cmd & 0xFFFFFF;
-    io->transaction.flags = color ? SPI_TRANS_MODE_QIO : 0;
-    io->transaction.length = bytes * 8;
-    io->transaction.tx_buffer = bytes ? io->dma : NULL;
+    memset(io->transaction, 0, sizeof io->transaction);
+    io->retired = 0;
+    io->transaction[0].cmd = (uint16_t)opcode;
+    io->transaction[0].addr = (uint32_t)cmd & 0xFFFFFF;
+    io->transaction[0].flags = color ? SPI_TRANS_MODE_QIO : 0;
+    io->transaction[0].length = bytes * 8;
+    io->transaction[0].tx_buffer = bytes ? io->dma : NULL;
     ++io->sequence;
-    err = spi_device_queue_trans(io->device, &io->transaction, wait);
+    err = spi_device_queue_trans(io->device, &io->transaction[0], wait);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "queue failed: seq=%lu cmd=%08lx bytes=%u error=%s",
                  (unsigned long)io->sequence, (unsigned long)(uint32_t)cmd,
                  (unsigned)bytes, esp_err_to_name(err));
         goto fail;
     }
-    io->pending = true;
+    io->pending = 1;
     err = reap(io, wait);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "completion failed: seq=%lu cmd=%08lx bytes=%u pending=%d error=%s",
                  (unsigned long)io->sequence, (unsigned long)(uint32_t)cmd,
-                 (unsigned)bytes, io->pending, esp_err_to_name(err));
+                 (unsigned)bytes, (int)io->pending, esp_err_to_name(err));
         goto fail;
     }
     goto out;
 fail:
     io->fault = err;
+out:
+    xSemaphoreGive(io->mutex);
+    return err;
+}
+
+esp_err_t co5300_qspi_write_window(esp_lcd_panel_io_handle_t base,
+                                  const uint8_t columns[4], const uint8_t rows[4],
+                                  const void *pixels, size_t bytes)
+{
+    if (!base || !columns || !rows || !pixels || !bytes) return ESP_ERR_INVALID_ARG;
+    co5300_io_t *io = (co5300_io_t *)base;
+    if (bytes > io->capacity) return ESP_ERR_INVALID_ARG;
+    const TickType_t wait = pdMS_TO_TICKS(IO_TIMEOUT_MS) ? pdMS_TO_TICKS(IO_TIMEOUT_MS) : 1;
+    if (xSemaphoreTake(io->mutex, wait) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t err = io->fault;
+    if (err != ESP_OK) goto out;
+    if (io->pending) { err = ESP_ERR_INVALID_STATE; goto fail; }
+    memcpy(io->dma, pixels, bytes);
+    memset(io->transaction, 0, sizeof io->transaction);
+    io->retired = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        io->transaction[i].cmd = 0x02;
+        io->transaction[i].addr = (i ? 0x2B : 0x2A) << 8;
+        io->transaction[i].flags = SPI_TRANS_USE_TXDATA;
+        io->transaction[i].length = 32;
+        memcpy(io->transaction[i].tx_data, i ? rows : columns, 4);
+    }
+    io->transaction[2].cmd = 0x32;
+    io->transaction[2].addr = 0x002C00;
+    io->transaction[2].flags = SPI_TRANS_MODE_QIO;
+    io->transaction[2].length = bytes * 8;
+    io->transaction[2].tx_buffer = io->dma;
+    ++io->sequence;
+    for (unsigned i = 0; i < 3; ++i) {
+        err = spi_device_queue_trans(io->device, &io->transaction[i], wait);
+        if (err != ESP_OK) goto fail;
+        ++io->pending;
+    }
+    err = reap(io, wait);
+    if (err == ESP_OK) goto out;
+fail:
+    io->fault = err;
+    ESP_LOGE(TAG, "window failed: seq=%lu pending=%u error=%s",
+             (unsigned long)io->sequence, io->pending, esp_err_to_name(err));
 out:
     xSemaphoreGive(io->mutex);
     return err;
@@ -138,7 +187,7 @@ esp_err_t co5300_new_qspi_io(spi_host_device_t host, int cs, uint32_t clock_hz,
         .clock_speed_hz = (int)clock_hz,
         .spics_io_num = cs,
         .flags = SPI_DEVICE_HALFDUPLEX,
-        .queue_size = 1,
+        .queue_size = 3,
     };
     err = spi_bus_add_device(host, &config, &io->device);
     if (err != ESP_OK) {
@@ -161,7 +210,7 @@ esp_err_t co5300_new_qspi_io(spi_host_device_t host, int cs, uint32_t clock_hz,
     io->base.rx_param = rx_param; io->base.del = delete_io;
     io->base.register_event_callbacks = callbacks;
     *out = &io->base;
-    ESP_LOGI(TAG, "QSPI single transactions, %dms queue/completion limits, %uB owned DMA buffer",
+    ESP_LOGI(TAG, "QSPI window queue=3, %dms queue/completion limits, %uB owned DMA buffer",
              IO_TIMEOUT_MS, (unsigned)max_bytes);
     return ESP_OK;
 fail:

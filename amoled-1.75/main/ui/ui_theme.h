@@ -40,7 +40,6 @@
 #define UI_HANDLE_W             32
 #define UI_HANDLE_H             2
 #define UI_HANDLE_Y             22
-#define UI_MOTION_FRAME_MS       80
 #define UI_ORBIT_BUTTON_Y       402
 #define UI_BUTTON_W             176
 #define UI_BUTTON_H             48

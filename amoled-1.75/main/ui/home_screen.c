@@ -10,7 +10,6 @@ struct home_screen {
     home_action_cb_t on_action;
     void *context;
     int32_t motion;
-    uint32_t motion_at;
     bool visible;
 };
 
@@ -267,9 +266,6 @@ static void motion_exec(void *var, int32_t value)
 {
     home_screen_t *s = var;
     if (s->motion == value) return;
-    const uint32_t at = lv_tick_get();
-    if (at - s->motion_at < UI_MOTION_FRAME_MS) return;
-    s->motion_at = at;
     s->motion = value;
     lv_obj_invalidate(s->hero); /* Only the bounded centre is animated. */
 }

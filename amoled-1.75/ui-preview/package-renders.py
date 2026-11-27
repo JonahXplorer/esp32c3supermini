@@ -37,7 +37,7 @@ sheet.save(output / "A-device-states-native.png")
 frames = []
 header = None
 for state in ["listening", "speaking"]:
-    for i in range(18):
+    for i in range(48):
         with Image.open(source / f"device_{state}_{i:02}.ppm") as frame:
             frame = frame.convert("RGB")
             region = frame.crop((0, 0, 466, 104))
@@ -48,7 +48,7 @@ for state in ["listening", "speaking"]:
 palette = frames[0].quantize(colors=128)
 frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
 frames[0].save(output / "A-listening-speaking.gif", save_all=True, append_images=frames[1:],
-               duration=80, loop=0, disposal=2, optimize=False)
+               duration=[30, 30, 40] * (len(frames) // 3), loop=0, disposal=2, optimize=False)
 with Image.open(output / "device_listening.png") as a, Image.open(output / "device_speaking.png") as b:
     box = ImageChops.difference(a, b).getbbox()
     assert box and box[0] >= 129 and box[1] >= 110 and box[2] <= 338 and box[3] <= 319, box
@@ -56,7 +56,7 @@ with Image.open(output / "device_listening.png") as a, Image.open(output / "devi
 rows = list(csv.DictReader((source / "device-refresh.csv").open()))
 stationary = {"ready", "activate", "bind_agent", "platform_retrying", "error", "no_session", "setup"}
 assert all(int(r["flushed_pixels"]) == 0 for r in rows if r["state"] in stationary)
-assert max(float(r["screen_percent"]) for r in rows) < 21
+assert max(float(r["screen_percent"]) for r in rows) == 100
 tokens = (output.parents[2] / "main/ui/ui_theme.h").read_text(encoding="utf-8")
 colors = dict(re.findall(r"#define\s+(UI_\w+)\s+lv_color_hex\(0x([A-Fa-f0-9]{6})\)", tokens))
 def luminance(token):
@@ -69,6 +69,8 @@ for ink, bg in [("UI_TEXT", "UI_BG"), ("UI_TEXT_DIM", "UI_BG"), ("UI_TEXT", "UI_
     ratios[f"{ink}/{bg}"] = round((hi + .05) / (lo + .05), 2)
 assert min(ratios.values()) >= 4.5
 report = {"design": "A / Orbit", "lvgl": "9.2.2", "resolution": [466, 466], "device_phases": len(states),
+          "simulation_step_ms": 33, "gif_fps": 30,
+          "render_mode": "direct_full_transfer",
           "max_animation_flush_percent": max(float(r["screen_percent"]) for r in rows),
           "contrast": ratios, "checks": {"all_device_phases_rendered": True, "round_glass_safe": True,
           "listening_preserved_during_playback": True, "playback_changes_centre_only": True,

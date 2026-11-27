@@ -49,4 +49,7 @@ typedef struct {
 esp_err_t screen_init(bool touch_ready);
 void screen_update(const screen_state_t *state);
 screen_action_t screen_poll(void);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+void screen_wait(void);
+#endif
 bool screen_manual_is_open(void);

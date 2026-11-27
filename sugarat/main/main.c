@@ -81,7 +81,11 @@ static void ui_task(void *context)
             }
         }
         manual_control_update(screen_manual_is_open(), call_active, action, &state.manual);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+        screen_wait();
+#else
         vTaskDelay(pdMS_TO_TICKS(UI_TICK_MS));
+#endif
     }
 }
 

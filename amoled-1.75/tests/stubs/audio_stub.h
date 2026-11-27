@@ -8,7 +8,8 @@ enum { GPIO_NUM_NC = -1, GPIO_NUM_8 = 8, GPIO_NUM_9 = 9, GPIO_NUM_10 = 10,
        I2C_NUM_0 = 0, I2S_NUM_0 = 0, I2S_ROLE_MASTER, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO,
        I2S_MCLK_MULTIPLE_256 = 256, I2S_TDM_SLOT0 = 1, I2S_TDM_SLOT1 = 2,
        I2S_TDM_SLOT2 = 4, I2S_TDM_SLOT3 = 8,
-       MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2 };
+       MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2, MALLOC_CAP_INTERNAL = 4, MALLOC_CAP_DMA = 8 };
+size_t heap_caps_get_free_size(uint32_t caps);
 typedef void *i2s_chan_handle_t;
 typedef struct { int unused; } i2s_event_data_t;
 typedef struct { unsigned dma_desc_num, dma_frame_num; bool auto_clear_after_cb; } i2s_chan_config_t;
