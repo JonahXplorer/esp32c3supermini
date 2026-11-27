@@ -830,6 +830,7 @@ void StartCloudSession() {
     cloud_platform_set_base_url(cc.base_url);
     cc.product_id = s_platform->product_id;
     cc.chip_type  = s_platform->chip_type;
+    cc.credential_namespace = s_platform->credential_namespace;
     cc.net_ready   = &NetReady;
     cc.on_state    = &OnCloudState;
     cc.on_downlink = &OnDownlink;

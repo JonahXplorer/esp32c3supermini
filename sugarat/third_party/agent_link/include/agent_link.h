@@ -219,6 +219,7 @@ typedef struct {
     const char* base_url;    ///< Platform root, no trailing slash, e.g. "https://api.example.com"
     int         product_id;  ///< Platform product id for this hardware
     const char* chip_type;   ///< e.g. "esp32-s3"
+    const char* credential_namespace;  ///< Optional NVS namespace for auth_key, NULL uses the existing default
 } agent_platform_t;
 
 /**

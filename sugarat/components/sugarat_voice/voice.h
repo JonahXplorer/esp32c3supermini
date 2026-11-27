@@ -33,7 +33,20 @@ typedef struct {
     char conversation_id[80];
 } sugarat_voice_view_t;
 
-esp_err_t sugarat_voice_start(void);
+#define SUGARAT_VOICE_HOST_OVERSEAS "bot.sugarat.ai"
+#define SUGARAT_VOICE_HOST_CHINA "bot.deotaland.cn"
+
+static inline const char *sugarat_voice_server_host(bool china)
+{
+    return china ? SUGARAT_VOICE_HOST_CHINA : SUGARAT_VOICE_HOST_OVERSEAS;
+}
+
+static inline bool sugarat_voice_call_busy(const sugarat_voice_view_t *view)
+{
+    return view->can_end || view->phase == SUGARAT_VOICE_OPENING || view->phase == SUGARAT_VOICE_ENDING;
+}
+
+esp_err_t sugarat_voice_start(bool china);
 void sugarat_voice_start_call(void);
 void sugarat_voice_view(sugarat_voice_view_t *view);
 void sugarat_voice_end_call(void);

@@ -17,8 +17,8 @@ static const phase_copy_t phases[] = {
     [SUGARAT_VOICE_JOINING] = {HOME_BUSY, "Joining Wi-Fi", "Connecting to your network", "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_PLATFORM_CONNECTING] = {HOME_BUSY, "Connecting", "Contacting the platform", "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_PLATFORM_RETRYING] = {HOME_OFFLINE, "Offline", "Platform unavailable / retrying", "Settings", HOME_OPEN_SETTINGS},
-    [SUGARAT_VOICE_ACTIVATE] = {HOME_IDLE, "Activate", "Enter code at bot.sugarat.ai", "Waiting", HOME_NO_ACTION},
-    [SUGARAT_VOICE_BIND_AGENT] = {HOME_IDLE, "Choose agent", "Bind a voice agent at bot.sugarat.ai", "Waiting", HOME_NO_ACTION},
+    [SUGARAT_VOICE_ACTIVATE] = {HOME_IDLE, "Activate", NULL, "Waiting", HOME_NO_ACTION},
+    [SUGARAT_VOICE_BIND_AGENT] = {HOME_IDLE, "Choose agent", NULL, "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_PREPARING] = {HOME_BUSY, "Preparing", "Connecting to the voice server", "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_READY] = {HOME_IDLE, "Ready", "Say Jarvis or tap Start call", "Start call", HOME_START_CALL},
     [SUGARAT_VOICE_OPENING] = {HOME_BUSY, "Listening", "Opening voice connection", "End call", HOME_END_CALL},
@@ -68,6 +68,9 @@ home_snapshot_t home_presenter_snapshot(const screen_state_t *state, unsigned pl
         result.action = HOME_END_CALL;
     } else if (phase == SUGARAT_VOICE_ACTIVATE) {
         memcpy(result.activation_code, state->voice.activation_code, sizeof(result.activation_code) - 1);
+    }
+    if (phase == SUGARAT_VOICE_ACTIVATE || phase == SUGARAT_VOICE_BIND_AGENT) {
+        result.hint = sugarat_voice_server_host(state->settings.voice_china);
     }
     result.action_enabled = action_enabled(state, result.action);
     return result;

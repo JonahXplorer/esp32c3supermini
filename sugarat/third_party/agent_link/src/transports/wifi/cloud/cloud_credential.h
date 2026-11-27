@@ -12,8 +12,8 @@ extern "C" {
 
 #define CLOUD_AUTH_KEY_MAX 65   // the platform caps auth_key at 64 chars
 
-/** @brief Read the stored key, if any. Call once at session start. */
-esp_err_t cloud_cred_load(void);
+/** @brief Read the platform's stored key, if any. NULL selects the legacy namespace. */
+esp_err_t cloud_cred_load(const char* namespace_name);
 
 /** @brief The stored auth_key, or "" when not bound. */
 const char* cloud_cred_auth_key(void);

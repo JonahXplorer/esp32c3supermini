@@ -24,6 +24,7 @@ typedef struct {
     bool touch_ready;
     bool wifi_connected;
     bool wifi_setup_active;
+    bool voice_server_save_failed;
     sugarat_voice_view_t voice;
 } screen_state_t;
 
@@ -38,6 +39,7 @@ typedef enum {
     SCREEN_SETUP_WIFI,
     SCREEN_SET_VOLUME,
     SCREEN_SET_BRIGHTNESS,
+    SCREEN_SET_VOICE_SERVER,
 } screen_action_kind_t;
 
 typedef struct {

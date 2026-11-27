@@ -23,7 +23,7 @@ enum { SECONDARY_PAGE_SIZE = SCREEN_SIZE };
 enum { WAVE_BARS = 9 };
 
 typedef enum {
-    PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_WIFI, PAGE_VOLUME, PAGE_BRIGHTNESS, PAGE_SESSIONS, PAGE_COUNT
+    PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_NETWORK, PAGE_VOLUME, PAGE_BRIGHTNESS, PAGE_SESSIONS, PAGE_COUNT
 } page_t;
 
 typedef struct {
@@ -58,8 +58,8 @@ static const voice_copy_t voice_copy[] = {
     [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "", AMBER},
     [SUGARAT_VOICE_PLATFORM_CONNECTING] = {"Connecting", "Contacting the platform", LILAC},
     [SUGARAT_VOICE_PLATFORM_RETRYING]   = {"Platform unreachable", "Retrying", AMBER},
-    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "Enter this code at bot.sugarat.ai", AMBER},
-    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "Bind a voice agent in Sugarat", AMBER},
+    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "", AMBER},
+    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "", AMBER},
     [SUGARAT_VOICE_PREPARING]    = {"Connecting voice", "Waiting for the voice server", LILAC},
     [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Or tap the waveform", TEAL},
     [SUGARAT_VOICE_OPENING]      = {"Opening a call", "You can start speaking", LILAC},
@@ -92,6 +92,11 @@ static lv_obj_t *voice_end;
 #endif
 static lv_obj_t *wifi_status;
 static lv_obj_t *wifi_setup;
+static lv_obj_t *voice_server_buttons[2];
+static lv_obj_t *voice_server_detail;
+static lv_obj_t *voice_server_confirmation;
+static lv_obj_t *voice_server_confirmation_title;
+static bool voice_server_pending_china;
 
 static page_t active_page;
 static screen_action_t action;
@@ -165,6 +170,7 @@ static void show_page(page_t page)
 {
     if (page == active_page) return;
     if (active_page == PAGE_SESSIONS) screen_conversations_open(false);
+    if (active_page == PAGE_NETWORK) screen_set_hidden(voice_server_confirmation, true);
     lv_anim_delete(pages[active_page], slide_y);
     screen_set_hidden(pages[active_page], true);
     active_page = page;
@@ -531,6 +537,83 @@ static void build_home(lv_obj_t *page)
 }
 #endif
 
+static void choose_voice_server(lv_event_t *event)
+{
+    const bool china = (uintptr_t)lv_event_get_user_data(event) != 0;
+    if (china == displayed.settings.voice_china) return;
+
+    voice_server_pending_china = china;
+    lv_label_set_text(voice_server_confirmation_title, china ? "Use China server?" : "Use overseas server?");
+    screen_set_hidden(voice_server_confirmation, false);
+}
+
+static void close_voice_server_confirmation(lv_event_t *event)
+{
+    screen_set_hidden(voice_server_confirmation, true);
+    if (lv_event_get_user_data(event)) {
+        action = (screen_action_t){.kind = SCREEN_SET_VOICE_SERVER, .value = voice_server_pending_china};
+    }
+}
+
+static void build_network(lv_obj_t *page)
+{
+    enum {
+        STATUS_Y = 98, SETUP_Y = 128, SERVER_TITLE_Y = 196, SERVER_OPTIONS_Y = 222,
+        SERVER_DETAIL_Y = 282, OPTION_WIDTH = 116, OPTION_OFFSET = 62, BUTTON_HEIGHT = 48,
+        DIALOG_WIDTH = 242, DIALOG_HEIGHT = 170, DIALOG_BUTTON_WIDTH = 100,
+    };
+    static const screen_action_t setup = {.kind = SCREEN_SETUP_WIFI};
+    static const char *const regions[] = {"Overseas", "China"};
+    build_header(page, "Network", PAGE_SETTINGS);
+    wifi_status = screen_label(page, "", &lv_font_montserrat_16, TEXT);
+    lv_obj_set_width(wifi_status, 250);
+    lv_obj_set_style_text_align(wifi_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(wifi_status, LV_LABEL_LONG_WRAP);
+    lv_obj_align(wifi_status, LV_ALIGN_TOP_MID, 0, STATUS_Y);
+    wifi_setup = screen_button(page, 170, BUTTON_HEIGHT, "Set up Wi-Fi", NULL);
+    lv_obj_set_style_bg_color(wifi_setup, lv_color_hex(PANEL), 0);
+    lv_obj_align(wifi_setup, LV_ALIGN_TOP_MID, 0, SETUP_Y);
+    lv_obj_add_event_cb(wifi_setup, command_clicked, LV_EVENT_CLICKED, (void *)&setup);
+
+    lv_obj_t *label = screen_label(page, "Voice server", &lv_font_montserrat_16, TEXT);
+    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, SERVER_TITLE_Y);
+    for (uintptr_t i = 0; i < sizeof(regions) / sizeof(regions[0]); ++i) {
+        lv_obj_t *button = screen_button(page, OPTION_WIDTH, BUTTON_HEIGHT, regions[i], NULL);
+        voice_server_buttons[i] = button;
+        lv_obj_align(button, LV_ALIGN_TOP_MID, i == 0 ? -OPTION_OFFSET : OPTION_OFFSET, SERVER_OPTIONS_Y);
+        lv_obj_set_style_bg_color(button, lv_color_hex(PANEL), 0);
+        lv_obj_set_style_bg_color(button, lv_color_mix(lv_color_hex(TEAL), lv_color_hex(PANEL), LV_OPA_20),
+                                  LV_STATE_CHECKED);
+        lv_obj_set_style_border_width(button, 2, LV_STATE_CHECKED);
+        lv_obj_set_style_border_color(button, lv_color_hex(TEAL), LV_STATE_CHECKED);
+        lv_obj_add_event_cb(button, choose_voice_server, LV_EVENT_CLICKED, (void *)i);
+    }
+    voice_server_detail = screen_label(page, "", &lv_font_montserrat_14, MUTED);
+    lv_obj_align(voice_server_detail, LV_ALIGN_TOP_MID, 0, SERVER_DETAIL_Y);
+
+    voice_server_confirmation = screen_surface(page, lv_pct(100), lv_pct(100), 0, BG);
+    lv_obj_add_flag(voice_server_confirmation, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(voice_server_confirmation, LV_OPA_80, 0);
+    lv_obj_t *card = screen_surface(voice_server_confirmation, DIALOG_WIDTH, DIALOG_HEIGHT, 26, PANEL);
+    lv_obj_center(card);
+    voice_server_confirmation_title = screen_label(card, "", &lv_font_montserrat_16, TEXT);
+    lv_obj_align(voice_server_confirmation_title, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_t *detail = screen_label(card, "Device will restart", &lv_font_montserrat_14, MUTED);
+    lv_obj_align(detail, LV_ALIGN_TOP_MID, 0, 58);
+
+    lv_obj_t *cancel = screen_button(card, DIALOG_BUTTON_WIDTH, BUTTON_HEIGHT, "Cancel", NULL);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(EDGE), 0);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -55, -20);
+    lv_obj_add_event_cb(cancel, close_voice_server_confirmation, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *restart_label;
+    lv_obj_t *restart = screen_button(card, DIALOG_BUTTON_WIDTH, BUTTON_HEIGHT, "Restart", &restart_label);
+    lv_obj_set_style_bg_color(restart, lv_color_hex(TEAL), 0);
+    lv_obj_set_style_text_color(restart_label, lv_color_hex(INK), 0);
+    lv_obj_align(restart, LV_ALIGN_BOTTOM_MID, 55, -20);
+    lv_obj_add_event_cb(restart, close_voice_server_confirmation, LV_EVENT_CLICKED, restart);
+    screen_set_hidden(voice_server_confirmation, true);
+}
+
 static void build_settings(void)
 {
     lv_obj_t *shade = pages[PAGE_SHADE];
@@ -555,21 +638,10 @@ static void build_settings(void)
     lv_obj_add_event_cb(sessions, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_SESSIONS);
     lv_obj_t *manual = menu_row(page, 229, 43, LV_SYMBOL_LIST, "Manual control", TEAL);
     lv_obj_add_event_cb(manual, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_MANUAL);
-    lv_obj_t *network = menu_row(page, 276, 43, LV_SYMBOL_WIFI, "Wi-Fi", LILAC);
-    lv_obj_add_event_cb(network, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_WIFI);
+    lv_obj_t *network = menu_row(page, 276, 43, LV_SYMBOL_WIFI, "Network", LILAC);
+    lv_obj_add_event_cb(network, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_NETWORK);
 
-    static const screen_action_t setup = {.kind = SCREEN_SETUP_WIFI};
-    page = pages[PAGE_WIFI];
-    build_header(page, "Wi-Fi", PAGE_SETTINGS);
-    wifi_status = screen_label(page, "", &lv_font_montserrat_16, TEXT);
-    lv_obj_set_width(wifi_status, 220);
-    lv_obj_set_style_text_align(wifi_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(wifi_status, LV_LABEL_LONG_WRAP);
-    lv_obj_align(wifi_status, LV_ALIGN_TOP_MID, 0, 117);
-    wifi_setup = screen_button(page, 170, 48, "Set up Wi-Fi", NULL);
-    lv_obj_set_style_bg_color(wifi_setup, lv_color_hex(PANEL), 0);
-    lv_obj_align(wifi_setup, LV_ALIGN_TOP_MID, 0, 215);
-    lv_obj_add_event_cb(wifi_setup, command_clicked, LV_EVENT_CLICKED, (void *)&setup);
+    build_network(pages[PAGE_NETWORK]);
     build_level_page(pages[PAGE_VOLUME], &volume, 0, "Volume", LV_SYMBOL_VOLUME_MAX, TEAL);
     build_level_page(pages[PAGE_BRIGHTNESS], &brightness, SUGARAT_BRIGHTNESS_MIN,
                      "Brightness", LV_SYMBOL_EYE_OPEN, AMBER);
@@ -653,7 +725,7 @@ static void sync_adjustment(adjustment_t *control, int confirmed, bool enabled, 
 }
 
 #if !defined(SUGARAT_NATIVE_AMOLED_UI)
-static void show_voice(const sugarat_voice_view_t *voice)
+static void show_voice(const sugarat_voice_view_t *voice, bool china)
 {
     const voice_copy_t *copy = &voice_copy[voice->phase];
     const bool activation = voice->phase == SUGARAT_VOICE_ACTIVATE;
@@ -672,8 +744,15 @@ static void show_voice(const sugarat_voice_view_t *voice)
     lv_obj_set_style_text_font(voice_title, activation ? &lv_font_montserrat_40 : &lv_font_montserrat_24, 0);
     lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, activation ? 232 : 247);
     lv_label_set_text(voice_title, activation ? voice->activation_code : copy->title);
-    lv_label_set_text(voice_detail, voice->phase == SUGARAT_VOICE_IN_CALL && voice->speaking
-                                   ? "Jarvis is speaking" : copy->detail);
+    const char *host = sugarat_voice_server_host(china);
+    if (activation) {
+        lv_label_set_text_fmt(voice_detail, "Enter this code at %s", host);
+    } else if (voice->phase == SUGARAT_VOICE_BIND_AGENT) {
+        lv_label_set_text_fmt(voice_detail, "Bind a voice agent at %s", host);
+    } else {
+        lv_label_set_text(voice_detail, voice->phase == SUGARAT_VOICE_IN_CALL && voice->speaking
+                                       ? "Jarvis is speaking" : copy->detail);
+    }
     screen_set_hidden(voice_end, !voice->can_end);
 }
 
@@ -743,18 +822,30 @@ void screen_update(const screen_state_t *state)
 #else
     if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
         state->voice.speaking != displayed.voice.speaking ||
+        state->settings.voice_china != displayed.settings.voice_china ||
         strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {
-        show_voice(&state->voice);
+        show_voice(&state->voice, state->settings.voice_china);
     }
     if (active_page == PAGE_HOME) animate_wave(&state->voice);
 #endif
     if (!has_state || state->wifi_connected != displayed.wifi_connected ||
         state->wifi_setup_active != displayed.wifi_setup_active ||
-        state->voice.can_end != displayed.voice.can_end || state->voice.phase != displayed.voice.phase) {
+        state->voice.can_end != displayed.voice.can_end || state->voice.phase != displayed.voice.phase ||
+        state->settings.voice_china != displayed.settings.voice_china ||
+        state->voice_server_save_failed != displayed.voice_server_save_failed) {
         const bool call_active = state->voice.can_end || state->voice.phase == SUGARAT_VOICE_OPENING;
-        lv_label_set_text(wifi_status, state->wifi_setup_active ? "Join Sugarat-Jarvis on your phone" :
-                          call_active ? "Voice call active" : state->wifi_connected ? "Connected" : "Disconnected");
+        lv_label_set_text(wifi_status, state->wifi_setup_active ? "Join the setup hotspot" :
+                          state->wifi_connected ? "Wi-Fi connected" : "Wi-Fi disconnected");
         screen_mark_enabled(wifi_setup, !state->wifi_setup_active && !call_active);
+        const bool can_switch = !sugarat_voice_call_busy(&state->voice);
+        for (int i = 0; i < 2; ++i) {
+            lv_obj_set_state(voice_server_buttons[i], LV_STATE_CHECKED, i == state->settings.voice_china);
+            screen_mark_enabled(voice_server_buttons[i], can_switch);
+        }
+        if (!can_switch) screen_set_hidden(voice_server_confirmation, true);
+        lv_label_set_text(voice_server_detail, !can_switch ? "End call to switch servers" :
+                          state->voice_server_save_failed ? "Couldn't save server" :
+                          sugarat_voice_server_host(state->settings.voice_china));
     }
     displayed = *state;
     has_state = true;

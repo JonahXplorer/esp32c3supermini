@@ -8,6 +8,7 @@
 #include "voice.h"
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,7 +35,7 @@ static void ui_task(void *context)
     sugarat_speaker_set_volume(state.settings.volume);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(servo_tool_init());
-    const bool wifi_managed = sugarat_voice_start() == ESP_OK;
+    const bool wifi_managed = sugarat_voice_start(state.settings.voice_china) == ESP_OK;
     manual_control_init(wifi_managed);
     ESP_LOGI(TAG, "Jarvis home ready; ESP-NOW starts on demand");
 
@@ -77,6 +78,19 @@ static void ui_task(void *context)
                 state.settings.brightness = action.value;
                 if (!action.preview) ESP_ERROR_CHECK_WITHOUT_ABORT(device_settings_save(state.settings));
             } else {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(result);
+            }
+        } else if (action.kind == SCREEN_SET_VOICE_SERVER && action.value != state.settings.voice_china) {
+            sugarat_voice_view(&state.voice);
+            if (!sugarat_voice_call_busy(&state.voice)) {
+                device_settings_t settings = state.settings;
+                settings.voice_china = action.value != 0;
+                const esp_err_t result = device_settings_save(settings);
+                if (result == ESP_OK) {
+                    ESP_LOGI(TAG, "Restarting to use %s", sugarat_voice_server_host(settings.voice_china));
+                    esp_restart();
+                }
+                state.voice_server_save_failed = true;
                 ESP_ERROR_CHECK_WITHOUT_ABORT(result);
             }
         }

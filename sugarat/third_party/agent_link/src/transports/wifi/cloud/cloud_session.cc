@@ -534,7 +534,7 @@ esp_err_t cloud_session_start(const cloud_session_config_t* cfg) {
     // Minting is safe: the backend starts the session after esp_wifi_start(), so RF is running.
     esp_err_t r = dev_identity_load(/*allow_mint=*/true);
     if (r != ESP_OK) return r;
-    r = cloud_cred_load();
+    r = cloud_cred_load(cfg->credential_namespace);
     if (r != ESP_OK) return r;
     r = cloud_api_init(cfg->base_url);
     if (r != ESP_OK) return r;

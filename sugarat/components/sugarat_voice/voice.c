@@ -739,11 +739,18 @@ static bool start_audio_workers(void)
     return false;
 }
 
-esp_err_t sugarat_voice_start(void)
+esp_err_t sugarat_voice_start(bool china)
 {
-    static const agent_platform_t platform = {
-        .base_url = "https://bot.sugarat.ai", .product_id = 13, .chip_type = "esp32-s3",
+    static const agent_platform_t overseas_platform = {
+        .base_url = "https://" SUGARAT_VOICE_HOST_OVERSEAS, .product_id = 13, .chip_type = "esp32-s3",
     };
+    static const agent_platform_t china_platform = {
+        .base_url = "https://" SUGARAT_VOICE_HOST_CHINA, .product_id = 13, .chip_type = "esp32-s3",
+        .credential_namespace = "al_deotaland_cn",
+    };
+    const agent_platform_t *platform = china ? &china_platform : &overseas_platform;
+    ESP_LOGI(TAG, "Voice platform: host=%s product=%d",
+             sugarat_voice_server_host(china), platform->product_id);
     static const agent_output_cb_t output = {
         .on_audio_out = voice_playback_queue, .on_audio_end = voice_playback_end,
         .on_audio_reset_with_reason = voice_playback_reset,
@@ -752,7 +759,7 @@ esp_err_t sugarat_voice_start(void)
     const agent_link_config_t config = {
         .device_name = "Sugarat-Jarvis", .model = SUGARAT_DEVICE_MODEL,
         .manufacturer = SUGARAT_DEVICE_MANUFACTURER,
-        .transport = AGENT_TRANSPORT_WIFI, .platform = &platform,
+        .transport = AGENT_TRANSPORT_WIFI, .platform = platform,
         .caps = audio_ready ? AGENT_CAP_MIC | AGENT_CAP_SPEAKER : 0,
         .output = &output,
     };

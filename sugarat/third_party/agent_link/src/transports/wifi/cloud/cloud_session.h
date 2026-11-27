@@ -14,6 +14,7 @@ typedef struct {
     const char* base_url;    ///< Platform root, no trailing slash
     int         product_id;  ///< Platform product id for this hardware
     const char* chip_type;   ///< e.g. "esp32-s3"
+    const char* credential_namespace;  ///< Optional auth_key namespace, valid for the session lifetime
 
     /**
      * @brief Whether requests may start now. Required.

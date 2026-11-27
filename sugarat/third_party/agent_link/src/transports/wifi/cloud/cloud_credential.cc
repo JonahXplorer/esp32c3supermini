@@ -13,15 +13,16 @@
 namespace {
 constexpr const char* TAG = "agent_link.cred";
 
-// Keep bot.sugarat.ai credentials separate from the previous platform's al_dev key.
-constexpr const char* kNs      = "al_sugarat_ai";
+// Preserve the existing overseas binding on upgrade and after a region switch.
+constexpr const char* kDefaultNs = "al_sugarat_ai";
 constexpr const char* kKeyAuth = "auth_key";
 
+const char* s_namespace = kDefaultNs;
 char s_auth[CLOUD_AUTH_KEY_MAX] = {0};
 
 esp_err_t StoreStr(const char* value) {
     nvs_handle_t h;
-    esp_err_t r = agentlink::storage::Open(kNs, NVS_READWRITE, &h);
+    esp_err_t r = agentlink::storage::Open(s_namespace, NVS_READWRITE, &h);
     if (r != ESP_OK) return r;
     r = (value && value[0]) ? nvs_set_str(h, kKeyAuth, value) : nvs_erase_key(h, kKeyAuth);
     if (r == ESP_ERR_NVS_NOT_FOUND) r = ESP_OK;   // nothing to erase
@@ -31,14 +32,20 @@ esp_err_t StoreStr(const char* value) {
 }
 }  // namespace
 
-esp_err_t cloud_cred_load(void) {
+esp_err_t cloud_cred_load(const char* namespace_name) {
     s_auth[0] = '\0';
+    const char* selected = namespace_name ? namespace_name : kDefaultNs;
+    const size_t length = strlen(selected);
+    if (length == 0 || length >= NVS_NS_NAME_MAX_SIZE) return ESP_ERR_INVALID_ARG;
+    s_namespace = selected;
     nvs_handle_t h;
-    if (agentlink::storage::Open(kNs, NVS_READONLY, &h) != ESP_OK) return ESP_OK;   // no namespace yet: not bound
-    size_t len = sizeof s_auth;
-    if (nvs_get_str(h, kKeyAuth, s_auth, &len) != ESP_OK) s_auth[0] = '\0';
-    nvs_close(h);
-    ESP_LOGI(TAG, "%s", s_auth[0] ? "bound (auth_key stored)" : "not bound");
+    if (agentlink::storage::Open(s_namespace, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof s_auth;
+        if (nvs_get_str(h, kKeyAuth, s_auth, &len) != ESP_OK) s_auth[0] = '\0';
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "Platform credential namespace=%s: %s", s_namespace,
+             s_auth[0] ? "bound (auth_key stored)" : "not bound");
     return ESP_OK;
 }
 
