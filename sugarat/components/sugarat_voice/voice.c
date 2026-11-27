@@ -172,7 +172,7 @@ static void queue_preroll(const wake_preroll_t *history)
 
 static void start_call(const char *source, const wake_preroll_t *history)
 {
-    if (atomic_load(&mode) != VOICE_IDLE) return;
+    if (atomic_load(&mode) != VOICE_IDLE || voice_playback_draining()) return;
     if (!voice_connection_ready(agent_link_realtime_running()) || voice_agent_id() <= 0) {
         if (history) ESP_LOGI(TAG, "Jarvis detected while the voice connection was not ready");
         return;
@@ -450,15 +450,16 @@ static esp_err_t request_session(conversation_cache_t *cache, int agent_id)
     return err;
 }
 
-static void close_stream(agent_stream_handle_t *stream, const char *reset_reason)
+static void close_stream(agent_stream_handle_t *stream, bool hangup, const char *reason)
 {
+    if (hangup) voice_playback_accept(false, reason);
+    else voice_playback_drain(reason);
     voice_timing_set_active(false);
     if (*stream) {
         (void)agent_link_stream_close(*stream, true);
         *stream = NULL;
     }
     servo_tool_accept_transcripts(false);
-    voice_playback_accept(false, reset_reason);
 }
 
 static bool tool_transport_error(esp_err_t err)
@@ -550,7 +551,8 @@ static void handle_tools(void *context)
 static void finish_call(agent_stream_handle_t *stream, esp_err_t err)
 {
     atomic_store(&mode, VOICE_ENDING);
-    close_stream(stream, atomic_load(&stop_call) ? "user_hangup" : "call_ended");
+    const bool hangup = atomic_load(&stop_call);
+    close_stream(stream, hangup, hangup ? "user_hangup" : "call_ended");
     voice_trace_end();
     if (err != ESP_OK && !atomic_load(&stop_call)) {
         atomic_store(&error_until, now_ms() + 3000);
@@ -633,7 +635,7 @@ static void handle_calls(void *context)
             }
         } else if (talking && !ready) {
             if (stream) {
-                close_stream(&stream, "connection_not_ready");
+                close_stream(&stream, false, "connection_not_ready");
                 xQueueReset(uplink);
             }
             if (agent_link_realtime_recovering() && current != VOICE_RECOVERING) {
@@ -641,7 +643,7 @@ static void handle_calls(void *context)
                 ESP_LOGI(TAG, "Voice session state: reconnecting");
             }
         } else if (talking && ready) {
-            if (!stream) {
+            if (!stream && !atomic_load(&stop_call) && !voice_playback_draining()) {
                 const esp_err_t err = agent_link_stream_open(AGENT_STREAM_VOICE, NULL, &stream);
                 if (err == ESP_OK) {
                     voice_timing_set_active(true);
@@ -784,12 +786,14 @@ esp_err_t sugarat_voice_start(bool china)
 void sugarat_voice_view(sugarat_voice_view_t *view)
 {
     const voice_mode_t current = atomic_load(&mode);
+    const bool finishing_reply = voice_playback_draining();
     agent_link_status_t link;
     agent_link_get_status(&link);
     const int agent_id = current == VOICE_FAULT ? 0 : voice_agent_id();
     const conversation_cache_t selected = load_conversation();
     *view = (sugarat_voice_view_t){
-        .can_end = current == VOICE_CONNECTING || current == VOICE_ACTIVE || current == VOICE_RECOVERING,
+        .can_end = current == VOICE_CONNECTING || current == VOICE_ACTIVE || current == VOICE_RECOVERING ||
+                   finishing_reply,
         .agent_id = agent_id,
     };
     if (selected.agent_id == agent_id) {
@@ -814,7 +818,7 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
         view->phase = SUGARAT_VOICE_OPENING;
     } else if (current == VOICE_RECOVERING) {
         view->phase = SUGARAT_VOICE_RECONNECTING;
-    } else if (current == VOICE_ENDING) {
+    } else if (current == VOICE_ENDING || finishing_reply) {
         view->phase = SUGARAT_VOICE_ENDING;
     } else if (current == VOICE_MANAGING) {
         view->phase = SUGARAT_VOICE_PREPARING;
@@ -849,5 +853,6 @@ void sugarat_voice_view(sugarat_voice_view_t *view)
 void sugarat_voice_end_call(void)
 {
     atomic_store(&stop_call, true);
+    voice_playback_accept(false, "user_hangup");
     if (session_task) xTaskNotifyGive(session_task);
 }

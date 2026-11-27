@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "turn_timing.h"
 #include "voice_trace.h"
@@ -18,7 +19,9 @@
 enum {
     PLAYBACK_FRAMES = 360,
     PLAYBACK_CAPACITY_MS = PLAYBACK_FRAMES * SUGARAT_AUDIO_FRAME * 1000 / SUGARAT_SAMPLE_RATE,
-    BASE_PREBUFFER_MS = 800,
+    BASE_PREBUFFER_MS = 400,
+    FALLBACK_PREBUFFER_MS = 800,
+    FALLBACK_REPLIES = 3,
     JITTER_PREBUFFER_MS = 1600,
     SLOW_PREBUFFER_MS = 5000,
     JITTER_GAP_MS = 500,
@@ -88,11 +91,14 @@ typedef struct {
 static const char *TAG = "jarvis_speaker";
 static QueueHandle_t queue;
 static StaticQueue_t queue_control;
+static StaticSemaphore_t input_guard_storage;
+static SemaphoreHandle_t input_guard;
 static EXT_RAM_BSS_ATTR playback_frame_t storage[PLAYBACK_FRAMES + 1];
 static EXT_RAM_BSS_ATTR _Alignas(16) StackType_t playback_stack[4096];
 static StaticTask_t playback_tcb;
 static TaskHandle_t worker;
 static atomic_bool accepting;
+static atomic_bool draining;
 static atomic_uint generation;
 static atomic_uint echo_until;
 static atomic_uint meter_level;
@@ -102,6 +108,7 @@ static playback_stats_t reply;
 // Track PCM across reply-end markers. Those clear reply statistics while PCM may remain queued.
 static playback_queue_stats_t queue_stats;
 static unsigned reply_sequence;
+static unsigned fallback_replies;
 
 static uint32_t now_ms(void)
 {
@@ -138,9 +145,9 @@ static void log_reply(unsigned id, const char *reason, const playback_delivery_t
              progress->max_write_gap_ms, progress->max_empty_ms, progress->write_errors);
 }
 
-void voice_playback_end(void *context)
+// input_guard orders PCM, end markers, and resets across the SDK and UI tasks.
+static void finish_reply(void)
 {
-    (void)context;
     portENTER_CRITICAL(&stats_lock);
     const playback_stats_t stats = reply;
     const unsigned current = atomic_load(&generation);
@@ -158,6 +165,15 @@ void voice_playback_end(void *context)
     }
 }
 
+void voice_playback_end(void *context)
+{
+    (void)context;
+    if (!input_guard) return;
+    xSemaphoreTake(input_guard, portMAX_DELAY);
+    if (atomic_load(&accepting)) finish_reply();
+    xSemaphoreGive(input_guard);
+}
+
 static unsigned pending_pcm_ms(const playback_queue_stats_t *stats)
 {
     // Producer and consumer snapshots can straddle a queue operation. This is
@@ -169,6 +185,8 @@ static unsigned pending_pcm_ms(const playback_queue_stats_t *stats)
 static void reset_playback(const char *reason, uint32_t reset_seq)
 {
     const int64_t cleared_us = esp_timer_get_time();
+    sugarat_speaker_enable(false);
+    atomic_store(&draining, false);
     atomic_store(&meter_until, 0);
     portENTER_CRITICAL(&stats_lock);
     atomic_fetch_add(&generation, 1);
@@ -194,50 +212,82 @@ static void reset_playback(const char *reason, uint32_t reset_seq)
     }
 }
 
+void voice_playback_drain(const char *reason)
+{
+    if (!input_guard) return;
+    xSemaphoreTake(input_guard, portMAX_DELAY);
+    if (atomic_exchange(&accepting, false)) {
+        portENTER_CRITICAL(&stats_lock);
+        const unsigned queued_ms = pending_pcm_ms(&queue_stats);
+        portEXIT_CRITICAL(&stats_lock);
+        atomic_store(&draining, true);
+        // Seal an incomplete reply so prebuffering can release its received tail.
+        finish_reply();
+        ESP_LOGI(TAG, "Playback draining: reason=%s pending_pcm_ms_est=%u", reason, queued_ms);
+    }
+    xSemaphoreGive(input_guard);
+}
+
+bool voice_playback_draining(void)
+{
+    return atomic_load(&draining);
+}
+
 void voice_playback_reset(agent_audio_reset_reason_t reason, uint32_t reset_seq, void *context)
 {
     (void)context;
-    const char *name;
+    if (!input_guard) return;
     switch (reason) {
-        case AGENT_AUDIO_RESET_REMOTE_INTERRUPT: name = "cloud_interrupt"; break;
-        case AGENT_AUDIO_RESET_INPUT_START: name = "input_started"; break;
-        case AGENT_AUDIO_RESET_INPUT_CLOSED: name = "input_closed"; break;
-        case AGENT_AUDIO_RESET_CONNECTION_LOST: name = "connection_lost"; break;
-        case AGENT_AUDIO_RESET_CONNECTION_ENDED: name = "connection_ended"; break;
-        case AGENT_AUDIO_RESET_CONNECTION_CANCELLED: name = "connection_cancelled"; break;
-        default: name = "unknown_transport_reset"; break;
+        case AGENT_AUDIO_RESET_REMOTE_INTERRUPT:
+        case AGENT_AUDIO_RESET_INPUT_START:
+            xSemaphoreTake(input_guard, portMAX_DELAY);
+            reset_playback(reason == AGENT_AUDIO_RESET_REMOTE_INTERRUPT ? "cloud_interrupt" : "input_started",
+                           reset_seq);
+            xSemaphoreGive(input_guard);
+            break;
+        case AGENT_AUDIO_RESET_INPUT_CLOSED:
+            // The application decides whether to drain or discard before closing the mic.
+            break;
+        case AGENT_AUDIO_RESET_CONNECTION_LOST: voice_playback_drain("connection_lost"); break;
+        case AGENT_AUDIO_RESET_CONNECTION_ENDED: voice_playback_drain("connection_ended"); break;
+        case AGENT_AUDIO_RESET_CONNECTION_CANCELLED: voice_playback_drain("connection_cancelled"); break;
+        default: voice_playback_drain("unknown_transport_reset"); break;
     }
-    reset_playback(name, reset_seq);
 }
 
 void voice_playback_accept(bool enabled, const char *reset_reason)
 {
-    atomic_store(&accepting, enabled);
-    if (!enabled) {
-        sugarat_speaker_enable(false);
+    if (!input_guard) return;
+    xSemaphoreTake(input_guard, portMAX_DELAY);
+    const bool was_accepting = atomic_exchange(&accepting, enabled);
+    if (!enabled && (was_accepting || atomic_load(&draining))) {
         reset_playback(reset_reason, 0);
     }
+    xSemaphoreGive(input_guard);
 }
 
 void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
 {
     (void)context;
-    const unsigned current = atomic_load(&generation);
     const size_t samples = bytes / sizeof(int16_t);
-    if (!samples || !atomic_load(&accepting)) {
+    if (!samples || !input_guard || !atomic_load(&accepting)) return;
+    xSemaphoreTake(input_guard, portMAX_DELAY);
+    if (!atomic_load(&accepting)) {
+        xSemaphoreGive(input_guard);
         return;
     }
+    const unsigned current = atomic_load(&generation);
     const int64_t arrival_us = esp_timer_get_time();
     portENTER_CRITICAL(&stats_lock);
-    if (current != atomic_load(&generation) || !atomic_load(&accepting)) {
-        portEXIT_CRITICAL(&stats_lock);
-        return;
-    }
     const bool first_pcm = !reply.id;
     if (first_pcm) {
         reply.id = ++reply_sequence;
         reply.first_audio_us = arrival_us;
         reply.prebuffer_ms = BASE_PREBUFFER_MS;
+        if (fallback_replies) {
+            reply.prebuffer_ms = FALLBACK_PREBUFFER_MS;
+            --fallback_replies;
+        }
     }
     const int64_t gap_us = first_pcm ? 0 : arrival_us - reply.last_audio_us;
     const int64_t span_us = arrival_us - reply.first_audio_us;
@@ -254,6 +304,10 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         reply.prebuffer_ms = JITTER_PREBUFFER_MS;
     }
     const unsigned prebuffer_ms = reply.prebuffer_ms;
+    if (prebuffer_ms > previous_prebuffer_ms) {
+        fallback_replies = FALLBACK_REPLIES;
+    }
+    const unsigned fallback_left = fallback_replies;
     playback_frame_t frame = {.generation = current, .reply_id = reply.id};
     portEXIT_CRITICAL(&stats_lock);
     if (first_pcm) voice_timing_first_pcm(frame.reply_id);
@@ -267,7 +321,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
         const size_t copied = frame.count * sizeof(frame.pcm[0]);
         memcpy(frame.pcm, pcm, copied);
         // Leave one slot for voice_playback_end even if a burst fills the PCM queue.
-        if (current != atomic_load(&generation) || uxQueueSpacesAvailable(queue) <= 1 ||
+        if (uxQueueSpacesAvailable(queue) <= 1 ||
             xQueueSend(queue, &frame, 0) != pdTRUE) {
             break;
         }
@@ -276,7 +330,7 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     }
     const int64_t enqueued_ms = remaining != samples ? esp_timer_get_time() / 1000 : -1;
     portENTER_CRITICAL(&stats_lock);
-    if (current == atomic_load(&generation)) queue_stats.enqueued_samples += samples - remaining;
+    queue_stats.enqueued_samples += samples - remaining;
     if (reply.id == frame.reply_id) {
         reply.enqueued_samples += samples - remaining;
         reply.delivery.dropped_samples += remaining;
@@ -286,19 +340,20 @@ void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context)
     if (remaining != samples) {
         xTaskNotify(worker, 0, eNoAction);
     }
+    xSemaphoreGive(input_guard);
     if (first_pcm || gap_us >= REPORT_PCM_GAP_MS * 1000LL ||
         prebuffer_ms != previous_prebuffer_ms || remaining) {
         ESP_LOGI(TAG, "PCM enqueue: reply=%u callback_ms=%lld enqueue_ms=%lld gap_ms=%lld "
-                      "accepted_samples=%u dropped_samples=%u received_ms=%lld target_ms=%u",
+                      "accepted_samples=%u dropped_samples=%u received_ms=%lld target_ms=%u fallback_left=%u",
                  frame.reply_id, (long long)(arrival_us / 1000), (long long)enqueued_ms,
                  (long long)(gap_us / 1000), (unsigned)(samples - remaining), (unsigned)remaining,
-                 (long long)(pcm_us / 1000), prebuffer_ms);
+                 (long long)(pcm_us / 1000), prebuffer_ms, fallback_left);
     }
 }
 
 static bool frame_is_current(const playback_frame_t *frame)
 {
-    return atomic_load(&accepting) && frame->generation == atomic_load(&generation);
+    return frame->generation == atomic_load(&generation);
 }
 
 static void wait_for_prebuffer(const playback_frame_t *frame, int64_t last_write_us, bool rebuffer)
@@ -365,7 +420,20 @@ static void queue_drain_report(playback_report_t reports[DRAIN_REPORTS], const p
     log_reply(progress->id, "drain_unverified", &end->delivery, progress);
 }
 
-static bool check_playback_gap(playback_progress_t *progress, int64_t now_us)
+static void record_underrun(const playback_frame_t *frame)
+{
+    portENTER_CRITICAL(&stats_lock);
+    if (frame_is_current(frame)) {
+        fallback_replies = FALLBACK_REPLIES;
+        if (reply.id == frame->reply_id && reply.prebuffer_ms < JITTER_PREBUFFER_MS) {
+            reply.prebuffer_ms = JITTER_PREBUFFER_MS;
+        }
+    }
+    portEXIT_CRITICAL(&stats_lock);
+}
+
+static bool check_playback_gap(playback_progress_t *progress, const playback_frame_t *frame,
+                               int64_t now_us)
 {
     if (!progress->last_write_us) return false;
     const unsigned gap_ms = (unsigned)((now_us - progress->last_write_us) / 1000);
@@ -376,11 +444,7 @@ static bool check_playback_gap(playback_progress_t *progress, int64_t now_us)
     progress->dma_empty_slots += empty;
     const unsigned empty_ms = empty * SUGARAT_SPEAKER_DMA_SAMPLES * 1000 / SUGARAT_SAMPLE_RATE;
     if (empty_ms > progress->max_empty_ms) progress->max_empty_ms = empty_ms;
-    portENTER_CRITICAL(&stats_lock);
-    if (reply.id == progress->id && reply.prebuffer_ms < JITTER_PREBUFFER_MS) {
-        reply.prebuffer_ms = JITTER_PREBUFFER_MS;
-    }
-    portEXIT_CRITICAL(&stats_lock);
+    record_underrun(frame);
     if (gap_ms >= REPORT_PLAYBACK_GAP_MS) {
         ESP_LOGW(TAG, "Playback gap: reply=%u write_gap_ms=%u dma_empty_slots=%u", progress->id, gap_ms, empty);
     }
@@ -398,6 +462,11 @@ static void play_audio(void *context)
         report_drained(reports);
         if (xQueueReceive(queue, &frame, pdMS_TO_TICKS(PA_DRAIN_MS)) != pdTRUE) {
             sugarat_speaker_enable(false);
+            if (atomic_load(&draining)) {
+                xSemaphoreTake(input_guard, portMAX_DELAY);
+                if (!uxQueueMessagesWaiting(queue)) atomic_store(&draining, false);
+                xSemaphoreGive(input_guard);
+            }
             continue;
         }
         if (!frame_is_current(&frame)) continue;
@@ -411,16 +480,16 @@ static void play_audio(void *context)
 
         const bool first = progress.id != frame.reply_id;
         if (first) progress = (playback_progress_t){.id = frame.reply_id};
-        const bool rebuffer = !first && check_playback_gap(&progress, esp_timer_get_time());
+        const bool rebuffer = !first && check_playback_gap(&progress, &frame, esp_timer_get_time());
         if (first || rebuffer) {
             wait_for_prebuffer(&frame, last_write_us, rebuffer);
         }
-        if (!frame_is_current(&frame)) {
-            sugarat_speaker_enable(false);
-            continue;
-        }
+        xSemaphoreTake(input_guard, portMAX_DELAY);
+        const bool current = frame_is_current(&frame);
+        if (current) sugarat_speaker_enable(true);
+        xSemaphoreGive(input_guard);
+        if (!current) continue;
         atomic_store(&echo_until, now_ms() + ECHO_GUARD_MS);
-        sugarat_speaker_enable(true);
         const unsigned empty_before_write = sugarat_speaker_dma().empty_slots;
         const esp_err_t err = sugarat_speaker_write(frame.pcm, frame.count);
         atomic_store(&echo_until, now_ms() + ECHO_GUARD_MS);
@@ -455,6 +524,7 @@ static void play_audio(void *context)
                 if (empty) {
                     ++progress.underruns;
                     progress.dma_empty_slots += empty;
+                    record_underrun(&frame);
                     ESP_LOGW(TAG, "Speaker DMA starved during write: reply=%u empty_slots=%u", progress.id, empty);
                 }
             }
@@ -467,6 +537,8 @@ static void play_audio(void *context)
 
 esp_err_t voice_playback_start(void)
 {
+    input_guard = xSemaphoreCreateMutexStatic(&input_guard_storage);
+    if (!input_guard) return ESP_ERR_NO_MEM;
     queue = xQueueCreateStatic(PLAYBACK_FRAMES + 1, sizeof(playback_frame_t), (uint8_t *)storage, &queue_control);
     if (queue) {
         worker = xTaskCreateStatic(play_audio, TAG, sizeof(playback_stack), NULL, 6, playback_stack, &playback_tcb);
@@ -479,13 +551,15 @@ esp_err_t voice_playback_start(void)
     agent_link_playback_set_buffer_level_callback(playback_buffer_level, NULL);
     ESP_LOGI(TAG, "Playback buffer: %u ms (%u slots), underrun threshold: %u ms",
              PLAYBACK_CAPACITY_MS, PLAYBACK_FRAMES, SUGARAT_SPEAKER_DMA_MS);
-    ESP_LOGI(TAG, "Playback prebuffer: normal=%u ms jitter=%u ms slow=%u ms (static PSRAM)",
-             BASE_PREBUFFER_MS, JITTER_PREBUFFER_MS, SLOW_PREBUFFER_MS);
+    ESP_LOGI(TAG, "Playback prebuffer: normal=%u ms fallback=%u ms for %u replies jitter=%u ms slow=%u ms (static PSRAM)",
+             BASE_PREBUFFER_MS, FALLBACK_PREBUFFER_MS, FALLBACK_REPLIES, JITTER_PREBUFFER_MS, SLOW_PREBUFFER_MS);
     return ESP_OK;
 }
 
 void voice_playback_stop(void)
 {
+    atomic_store(&accepting, false);
+    atomic_store(&draining, false);
     if (worker) {
         vTaskDelete(worker);
         worker = NULL;
@@ -497,10 +571,15 @@ void voice_playback_stop(void)
         const unsigned incoming_reply = reply.id;
         const playback_queue_stats_t queued = queue_stats;
         queue_stats = (playback_queue_stats_t){0};
+        fallback_replies = 0;
         portEXIT_CRITICAL(&stats_lock);
         vQueueDelete(queue);
         queue = NULL;
         voice_trace_playback_reset(cleared_us, "speaker_stop", 0, incoming_reply, queued.last_i2s_reply,
                                    pending_pcm_ms(&queued), slots);
+    }
+    if (input_guard) {
+        vSemaphoreDelete(input_guard);
+        input_guard = NULL;
     }
 }

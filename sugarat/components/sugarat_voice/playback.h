@@ -9,6 +9,8 @@
 esp_err_t voice_playback_start(void);
 void voice_playback_stop(void);
 void voice_playback_accept(bool enabled, const char *reset_reason);
+void voice_playback_drain(const char *reason);
+bool voice_playback_draining(void);
 void voice_playback_queue(const uint8_t *pcm, size_t bytes, void *context);
 void voice_playback_end(void *context);
 void voice_playback_reset(agent_audio_reset_reason_t reason, uint32_t reset_seq, void *context);

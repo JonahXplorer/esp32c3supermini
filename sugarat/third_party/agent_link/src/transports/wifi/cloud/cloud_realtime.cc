@@ -702,7 +702,8 @@ struct WsSender {
     int64_t first_wait_at = 0;
 #if CONFIG_IDF_TARGET_ESP32S3
     agentlink::realtime::VoiceFrameCounts voice_counts;
-    int64_t last_data_received_ms = 0;
+    int64_t last_data_received_us = 0;
+    int64_t last_write_progress_us = 0;
     int64_t last_pump_at = 0;
     bool wait_extension_logged = false;
     unsigned peak_uplink_queue_ms = 0;
@@ -799,10 +800,12 @@ bool PumpWire(WsSender& sender) {
         const unsigned queued_ms = (uxQueueMessagesWaiting(s_tx) + s_encoded_pending.load()) * 20;
         sender.peak_uplink_queue_ms = std::max(sender.peak_uplink_queue_ms, queued_ms);
     }
-    const bool receiving = sender.audio_messages && sender.first_wait_at &&
-                           sender.last_data_received_ms >= sender.first_wait_at / 1000 &&
-                           now_ms - sender.last_data_received_ms <= 1000;
-    if (receiving) {
+    // Downlink received in this stall grants the longer deadline for the
+    // whole stall. A successful write starts a fresh inactivity interval.
+    const bool received_downlink = sender.audio_messages && sender.first_wait_at &&
+                                  sender.last_data_received_us >= sender.first_wait_at &&
+                                  sender.last_data_received_us > sender.last_write_progress_us;
+    if (received_downlink) {
         stall_limit_ms = kActiveDownlinkStallMs;
         if (!sender.wait_extension_logged && sender.pending.StalledMs(now_ms) >= kNoDownlinkStallMs) {
             sender.wait_extension_logged = true;
@@ -879,6 +882,12 @@ bool PumpWire(WsSender& sender) {
     if (sent > 0 && writable == 0) s_tx_select0_accepted.fetch_add(1);
     const int64_t finished_us = esp_timer_get_time();
     const int64_t finished_ms = finished_us / 1000;
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (sent > 0) {
+        sender.last_write_progress_us = finished_us;
+        sender.wait_extension_logged = false;
+    }
+#endif
     if (!sender.pending.Advance(sent, waiting, finished_ms, stall_limit_ms)) {
         if (waiting && sender.pending.Expired(finished_ms, stall_limit_ms)) return timed_out(finished_ms);
         LogTransportFailure(sender.tls, "write", sent, errno);
@@ -909,9 +918,6 @@ bool PumpWire(WsSender& sender) {
         }
 #endif
         sender.first_wait_at = 0;
-#if CONFIG_IDF_TARGET_ESP32S3
-        sender.wait_extension_logged = false;
-#endif
         memset(sender.wire, 0, sender.pending.Size());
         if (sender.audio_messages && (!sender.audio_turn || sender.audio_turn == s_capture_turn.load())) {
             const uint32_t elapsed = static_cast<uint32_t>((esp_timer_get_time() - sender.queued_at) / 1000);
@@ -2666,7 +2672,7 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
                     call.ObserveControlFrame(message.Data(), assembler.Size(), last_rx);
                 pending_at = last_rx;
 #if CONFIG_IDF_TARGET_ESP32S3
-                sender.last_data_received_ms = pending_at / 1000;
+                sender.last_data_received_us = pending_at;
 #endif
                 pending_reset = s_reset.load();
                 deliver(assembler.Opcode());
@@ -2776,6 +2782,18 @@ bool ConnectOnce(const Grant& grant, agentlink::realtime::RetryBudget& recovery)
     if (gap_from_us) {
         agentlink::realtime::LogTcpReadGap(connection.tls, agentlink::realtime::TcpReadGapPhase::kClosed,
                                           gap_start, static_cast<unsigned>((esp_timer_get_time() - gap_from_us) / 1000));
+    }
+    // Finish decoding complete messages already received, without reading the
+    // failed socket again. Hangup, cancellation, or a terminal event ends this work.
+    while (Current(grant.epoch) && call.Healthy() && s_ready && !s_mute) {
+        if (pending_message) deliver(assembler.Opcode());
+        if (valid && !pending_message && rx_offset < rx_size) {
+            size_t consumed = 0;
+            valid = receive(scratch->read + rx_offset, rx_size - rx_offset, &consumed);
+            rx_offset += consumed;
+        }
+        if (!pending_message && (!valid || rx_offset == rx_size) && !s_downlink_bytes.load()) break;
+        vTaskDelay(1);
     }
 #endif
     call.Stop();

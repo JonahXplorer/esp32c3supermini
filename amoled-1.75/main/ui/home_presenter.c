@@ -62,8 +62,8 @@ home_snapshot_t home_presenter_snapshot(const screen_state_t *state, unsigned pl
         /* Speaking changes central drawing only. Copy and controls stay identical;
          * the original mic waveform level continues to come from the AEC path. */
         result.state = playback_level ? HOME_SPEAKING : HOME_LISTENING;
-    } else if (phase == SUGARAT_VOICE_RECONNECTING && state->voice.can_end) {
-        result.title = "Listening";
+    } else if ((phase == SUGARAT_VOICE_RECONNECTING || phase == SUGARAT_VOICE_ENDING) && state->voice.can_end) {
+        if (phase == SUGARAT_VOICE_RECONNECTING) result.title = "Listening";
         result.action_label = "End call";
         result.action = HOME_END_CALL;
     } else if (phase == SUGARAT_VOICE_ACTIVATE) {
