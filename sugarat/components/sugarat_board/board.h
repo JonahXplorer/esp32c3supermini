@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include "esp_err.h"
 
+// Both platforms use product 37, with separate credentials for each region.
+#define SUGARAT_OVERSEAS_PRODUCT_ID 37
+#define SUGARAT_OVERSEAS_CREDENTIAL_NAMESPACE "al_os_sugar37"
+#define SUGARAT_CHINA_PRODUCT_ID 37
+#define SUGARAT_CHINA_CREDENTIAL_NAMESPACE "al_cn_sugar37"
+
 enum { SCREEN_SIZE = 360, SUGARAT_BRIGHTNESS_MIN = 5, SUGARAT_BRIGHTNESS_DEFAULT = 74 };
 
 esp_err_t sugarat_display_init(void);

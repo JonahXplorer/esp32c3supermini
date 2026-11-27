@@ -17,7 +17,8 @@
 ## Jarvis 语音
 
 - 首次启动时连接 `Sugarat-Jarvis-XXXX` 热点，通过 Agent Link 配网页设置 2.4 GHz Wi-Fi。Sugarat 按当前 Wi-Fi 信道发送 ESP-NOW。C3 失联后轮询本机地区配置允许的信道，收到已配对 Sugarat 的数据后锁定该信道。舵机页显示 `Finding receiver...` 或已连上的信道。配网热点仍使用信道 6。
-- 在 `Settings → Network → Voice server` 选择 `Overseas` 或 `China`，确认后设备会重启。升级默认使用海外平台。两边独立保存设备绑定，共用 Wi-Fi 设置。
+- 在 `Settings → Network → Voice server` 选择 `Overseas` 或 `China`，确认后设备会重启。未保存环境选择时默认使用海外。两边独立保存设备绑定，共用 Wi-Fi 设置。
+- 国内和海外均使用 `product_id=37`（`PulseSyncCluster`）申请激活码。从旧产品升级时，板子会用原设备 SN 重新申请激活码。若出现 `deviceAlreadyBound`，请在当前平台核对旧设备记录的产品 ID，处理旧绑定后再认领。
 - Jarvis 页显示六位激活码时，在屏幕提示的平台认领设备并绑定支持语音的 Agent。`Say “Jarvis”` 表示可以唤醒。[海外平台](https://bot.sugarat.ai) · [国内平台](https://bot.deotaland.cn)
 - 说 **Jarvis** 后接着说话。设备通过 ESP-SR 的单麦 AFE 在本地做语音活动和 WakeNet 检测，唤醒后缓冲最多约 8 秒语音，Agent Link 的 Realtime 会话就绪后才发送。通话使用已绑定 Agent 的最近一个会话，没有会话时会尝试创建。
 - Realtime 回复从 Sugarat 扬声器播放。播放期间上传静音，播放结束后恢复真实麦克风。点 Jarvis 页的 `End call` 结束通话，设备回到唤醒待机。

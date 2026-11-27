@@ -10,6 +10,7 @@
 #include "agent_link_stream.h"
 #include "audio.h"
 #include "audio_meter.h"
+#include "board.h"
 #include "conversations_internal.h"
 #include "esp_attr.h"
 #include "esp_http_client.h"
@@ -744,11 +745,12 @@ static bool start_audio_workers(void)
 esp_err_t sugarat_voice_start(bool china)
 {
     static const agent_platform_t overseas_platform = {
-        .base_url = "https://" SUGARAT_VOICE_HOST_OVERSEAS, .product_id = 13, .chip_type = "esp32-s3",
+        .base_url = "https://" SUGARAT_VOICE_HOST_OVERSEAS, .product_id = SUGARAT_OVERSEAS_PRODUCT_ID,
+        .chip_type = "esp32-s3", .credential_namespace = SUGARAT_OVERSEAS_CREDENTIAL_NAMESPACE,
     };
     static const agent_platform_t china_platform = {
-        .base_url = "https://" SUGARAT_VOICE_HOST_CHINA, .product_id = 13, .chip_type = "esp32-s3",
-        .credential_namespace = "al_deotaland_cn",
+        .base_url = "https://" SUGARAT_VOICE_HOST_CHINA, .product_id = SUGARAT_CHINA_PRODUCT_ID,
+        .chip_type = "esp32-s3", .credential_namespace = SUGARAT_CHINA_CREDENTIAL_NAMESPACE,
     };
     const agent_platform_t *platform = china ? &china_platform : &overseas_platform;
     ESP_LOGI(TAG, "Voice platform: host=%s product=%d",

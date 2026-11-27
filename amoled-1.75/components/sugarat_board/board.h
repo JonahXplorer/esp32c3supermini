@@ -5,6 +5,12 @@
 #include "esp_err.h"
 #include "driver/i2c_master.h"
 
+// Keep credentials separate for each regional product, including on upgrades.
+#define SUGARAT_CHINA_PRODUCT_ID 39
+#define SUGARAT_CHINA_CREDENTIAL_NAMESPACE "al_cn_amoled39"
+#define SUGARAT_OVERSEAS_PRODUCT_ID 50
+#define SUGARAT_OVERSEAS_CREDENTIAL_NAMESPACE "al_os_amoled50"
+
 // UI and touch coordinates use native panel pixels; screen_port rotates 90deg CW.
 enum { SCREEN_SIZE = 466, AMOLED_PANEL_SIZE = 466,
        AMOLED_FRAME_PERIOD_MS = 33, AMOLED_TOUCH_PERIOD_MS = 10,

@@ -9,6 +9,8 @@
 - A / Orbit 原生 AMOLED 主屏，接入现有全部 16 个设备状态；触摸发起通话、Jarvis 本地唤醒、结束通话、会话列表/新建/选择/删除。
 - 开启通话、正常通话及通话内重连时主标题保持 `Listening`；正常通话中，Agent 播放只将中央输入波形切换为外扩圆波，标题、提示和按钮不变，不单独建立 AI 思考状态。待机波形入口改为唯一的 `Start call` 主按钮。
 - Sugarat 平台激活、Agent 绑定、Wi-Fi 配网、Realtime 语音、语音工具及本地舵机口令。
+- 从主屏顶部下拉或点击，进入 `Settings → Network → Voice server`，选择 `Overseas` 或 `China` 并确认重启。未保存环境选择时默认使用海外，通话结束后可以切换。两套环境各自保存设备绑定，共用 Wi-Fi 配置。[海外平台](https://bot.sugarat.ai) · [国内平台](https://bot.deotaland.cn)
+- 国内平台使用 `product_id=39`（`Agent_link-waveshare175`）申请激活码，海外平台使用 `product_id=50`（`iron-man-amoled-175`）。从旧产品升级时，板子会用原设备 SN 重新申请当前产品的激活码。若出现 `deviceAlreadyBound`，请在对应平台核对旧设备记录的产品 ID，处理旧绑定后再认领。
 - ESP-NOW 舵机 A/B 控制、角度/速度设置及接收端状态同步。
 - 主屏使用原生 466×466 坐标，不再放大 360×360 画布；顺时针旋转 90°，触摸同步对应。音量、亮度、会话、手动控制等原有页面以 360×360 居中保留，从主屏顶部下拉或点击进入。AMOLED 亮度通过 CO5300 的 `0x51` 命令控制，音量/亮度设置继续保存到 NVS。
 - UI 状态与按钮权限集中在 `main/ui/home_presenter.c`，布局和绘制在 `home_screen.c`，主题在 `ui_theme.h`。详见 [状态与代码结构](main/ui/README.md)。现有程序没有电量接口，主屏隐藏未知电量。
@@ -103,7 +105,7 @@ idf.py -C amoled-1.75 build merge-bin -o amoled-175-jarvis-full.bin
 合并镜像中的填充区会覆盖现有 NVS，因此用于首次安装；保留配网与激活信息的更新应使用上面的分段 `flash` 或 `app-flash`。
 
 1. 检查画面相对原固件顺时针旋转 90°，点击与拖动位置对应，松手后正确释放，待机无 `Read touch` 刷屏；再检查亮度与音量设置。连接外置扬声器到板载扬声器接口。
-2. 首次启动连接 `Sugarat-Jarvis-XXXX` 热点，设置 2.4 GHz Wi-Fi。根据屏幕激活码在 <https://bot.sugarat.ai> 认领，并绑定语音 Agent。
+2. 首次启动连接 `Sugarat-Jarvis-XXXX` 热点，设置 2.4 GHz Wi-Fi。在主屏显示的平台输入六位激活码认领设备，并绑定语音 Agent。首次切换到尚未绑定的环境时，在该环境完成激活和绑定。切回已绑定的环境后，检查原有绑定是否恢复。
 3. 启动日志应有 `AEC full duplex ready`。说 Jarvis 或触摸开始通话，确认用户声音能上传并听到回复。
 4. **单独播报**：播放期间保持安静，确认回采 `ref` 随播报变化、回采不削顶、没有把设备播报重复识别为用户发言。
 5. **同时说话**：设备播报时说另一句完整的话，检查语音转写、服务端打断和设备停止旧回复的效果；不能只测播报结束后的识别。

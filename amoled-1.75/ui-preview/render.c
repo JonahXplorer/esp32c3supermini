@@ -143,6 +143,14 @@ int main(int argc, char **argv)
         }
     }
     fclose(states);
+    for (unsigned phase = SUGARAT_VOICE_ACTIVATE; phase <= SUGARAT_VOICE_BIND_AGENT; ++phase) {
+        screen_state_t onboarding = mock_state(phase);
+        require(!strcmp(home_presenter_snapshot(&onboarding, 0).hint, "bot.sugarat.ai"),
+                "Default onboarding points to the overseas server");
+        onboarding.settings.voice_china = true;
+        require(!strcmp(home_presenter_snapshot(&onboarding, 0).hint, "bot.deotaland.cn"),
+                "China onboarding points to the China server");
+    }
     screen_state_t call = mock_state(SUGARAT_VOICE_IN_CALL);
     home_snapshot_t listening = home_presenter_snapshot(&call, 0);
     home_snapshot_t speaking = home_presenter_snapshot(&call, 40);
@@ -175,6 +183,6 @@ int main(int argc, char **argv)
     screen_state_t bad = mock_state(999);
     require(!strcmp(home_presenter_snapshot(&bad, 0).title, "Voice error"), "Unknown phase has a safe presentation");
     fclose(metrics); home_screen_destroy(screen); lv_display_delete(display);
-    puts("PASS: 16 device phases, action guards, Listening during playback, full-frame submission and hidden-page pause");
+    puts("PASS: 16 device phases, regional onboarding, action guards, Listening during playback, full-frame submission and hidden-page pause");
     return 0;
 }
