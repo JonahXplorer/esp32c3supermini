@@ -2,13 +2,14 @@
 
 #include <stdatomic.h>
 
+#include "board_pins.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_attr.h"
 #include "esp_timer.h"
 
-enum { AMP_ENABLE = GPIO_NUM_3, MIC_GAIN_NUM = 3, MIC_GAIN_DEN = 2, MIC_REPORT_US = 4000000 };
+enum { MIC_GAIN_NUM = 3, MIC_GAIN_DEN = 2, MIC_REPORT_US = 4000000 };
 
 static const char *TAG = "sugarat_audio";
 static i2s_chan_handle_t mic;
@@ -91,7 +92,7 @@ static esp_err_t init_speaker(void)
 
 esp_err_t sugarat_audio_init(void)
 {
-    const gpio_config_t amplifier = {.pin_bit_mask = 1ULL << AMP_ENABLE, .mode = GPIO_MODE_OUTPUT};
+    const gpio_config_t amplifier = {.pin_bit_mask = 1ULL << AMPLIFIER_ENABLE, .mode = GPIO_MODE_OUTPUT};
     ESP_RETURN_ON_ERROR(gpio_config(&amplifier), TAG, "Configure amplifier");
     sugarat_speaker_enable(false);
     esp_err_t err = init_mic();
@@ -179,5 +180,5 @@ void sugarat_speaker_set_volume(unsigned percent)
 
 void sugarat_speaker_enable(bool enabled)
 {
-    (void)gpio_set_level(AMP_ENABLE, enabled);
+    (void)gpio_set_level(AMPLIFIER_ENABLE, enabled);
 }

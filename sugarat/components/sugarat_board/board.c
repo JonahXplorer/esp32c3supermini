@@ -1,5 +1,6 @@
 #include "board.h"
 
+#include "board_pins.h"
 #include "co5300_qspi_io.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -9,13 +10,7 @@
 #include "freertos/task.h"
 
 enum {
-    BATTERY_LATCH = GPIO_NUM_7,
-    AMPLIFIER_ENABLE = GPIO_NUM_3,
-    LCD_POWER = GPIO_NUM_12,
-    LCD_RESET = GPIO_NUM_9,
-    LCD_BACKLIGHT = GPIO_NUM_13,
     LCD_BACKLIGHT_MAX_DUTY = (1 << 10) - 1,
-    TOUCH_RESET = GPIO_NUM_5,
     LCD_STRIPE_ROWS = 12,
     LCD_STRIPE_BYTES = SCREEN_SIZE * LCD_STRIPE_ROWS * sizeof(uint16_t),
 };
@@ -35,7 +30,6 @@ static esp_err_t output(gpio_num_t pin, int level)
 
 esp_err_t sugarat_display_init(void)
 {
-    ESP_RETURN_ON_ERROR(output(BATTERY_LATCH, 1), TAG, "Battery latch");
     ESP_RETURN_ON_ERROR(output(AMPLIFIER_ENABLE, 0), TAG, "Turn off amplifier");
     ESP_RETURN_ON_ERROR(output(LCD_BACKLIGHT, 0), TAG, "Turn off backlight");
     ESP_RETURN_ON_ERROR(output(LCD_POWER, 0), TAG, "LCD power");

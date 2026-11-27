@@ -14,6 +14,11 @@
 
 角度由各路校准点之间的脉宽插值估算。实际角度和转动时间取决于舵机和负载。`B angle` 显示接收端已开放的角度范围。实测流程见 [ESP32-C3 接收端说明](../esp32c3/README.md#校准遥控上限)。
 
+## 实体电源键
+
+- **开机**：关机时长按 Sugarat 的实体电源键 1 秒。固件确认按住后才启动屏幕、网络和语音。冷启动时芯片初始化也会占用少量时间。
+- **关机**：开机后重新按住实体电源键至少 1.2 秒，再松手。设备保存设置、结束语音并熄屏。电池供电时切断主电源，接 USB 时进入深度睡眠。
+
 ## Jarvis 语音
 
 - 首次启动时连接 `Sugarat-Jarvis-XXXX` 热点，通过 Agent Link 配网页设置 2.4 GHz Wi-Fi。Sugarat 按当前 Wi-Fi 信道发送 ESP-NOW。C3 失联后轮询本机地区配置允许的信道，收到已配对 Sugarat 的数据后锁定该信道。舵机页显示 `Finding receiver...` 或已连上的信道。配网热点仍使用信道 6。
@@ -30,7 +35,7 @@
 | --- | --- |
 | `main/` | ESP-NOW 遥控、LVGL 页面及圆屏和触摸适配 |
 | `main/ui/` | 两款圆屏共用的 Orbit 状态映射、主题和按钮组件 |
-| `components/sugarat_board/` | Sugarat 屏幕、触摸、I2S 麦克风和扬声器 |
+| `components/sugarat_board/` | Sugarat 电源键、屏幕、触摸、I2S 麦克风和扬声器 |
 | `components/sugarat_voice/` | Jarvis 模型、Realtime 会话和播放队列 |
 | `third_party/agent_link/` | 内置 Agent Link SDK，来源 `277420e`，附 MIT 许可 |
 | `../common/servo_radio/` | 本仓库内 Sugarat 与 ESP32-C3 共用的舵机协议 |

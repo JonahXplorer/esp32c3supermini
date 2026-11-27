@@ -13,6 +13,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
+#include "esp_wifi.h"
+#include "power.h"
+#endif
+
 enum { UI_TICK_MS = 15, VOICE_STATUS_US = 100000, WIFI_STATUS_US = 1000000, UI_STACK_BYTES = 8192 };
 
 static const char *TAG = "sugarat";
@@ -42,6 +47,15 @@ static void ui_task(void *context)
     int64_t next_voice_poll = 0;
     int64_t next_wifi_poll = 0;
     while (true) {
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
+        if (sugarat_power_off_requested()) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(device_settings_save(state.settings));
+            sugarat_voice_end_call();
+            const esp_err_t stopped = esp_wifi_stop();
+            if (stopped != ESP_ERR_WIFI_NOT_INIT) ESP_ERROR_CHECK_WITHOUT_ABORT(stopped);
+            sugarat_power_off();
+        }
+#endif
         const int64_t now = esp_timer_get_time();
         if (now >= next_voice_poll) {
             next_voice_poll = now + VOICE_STATUS_US;
@@ -105,6 +119,9 @@ static void ui_task(void *context)
 
 void app_main(void)
 {
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
+    sugarat_power_start();
+#endif
     // Startup may write NVS, which requires an internal task stack.
     const BaseType_t started = xTaskCreate(ui_task, "sugarat_ui", UI_STACK_BYTES, NULL,
                                            tskIDLE_PRIORITY + 1, NULL);
