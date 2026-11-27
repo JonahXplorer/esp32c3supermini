@@ -1,6 +1,6 @@
 # Sugarat Button 舵机遥控与 Jarvis 对话
 
-独立 ESP32-S3 固件。点顶部的 `Servos` 或 `Jarvis` 切换页面，也可以在滑块外左右划。舵机页点 `Position A` 或 `Position B` 切换目标，拖动 `B angle` 或 `Travel time / 90°` 滑块调节角度或速度。达到目标设定后松手，界面会等接收端确认。B 点以 5° 为步长，位于 B 点时立即移动，位于 A 点时下次切到 B 点生效。速度显示为 90° 行程的估计用时，向右滑更快。ESP32-C3 的 GPIO4 实体按键使用同一组设定，屏幕会同步接收板回报的状态。
+独立 ESP32-S3 固件。主屏采用 360×360 原生 Orbit 布局，显示设备状态和当前可用的主操作。点击顶部或下拉打开控制中心，从 `Settings → Manual control` 进入舵机页。点 `Position A` 或 `Position B` 切换目标，拖动 `B angle` 或 `Travel time / 90°` 滑块调节角度或速度。达到目标设定后松手，界面会等接收端确认。B 点以 5° 为步长，位于 B 点时立即移动，位于 A 点时下次切到 B 点生效。速度显示为 90° 行程的估计用时，向右滑更快。ESP32-C3 的 GPIO4 实体按键使用同一组设定，屏幕会同步接收板回报的状态。
 
 | 项目 | 设置 |
 | --- | --- |
@@ -22,18 +22,22 @@
 - Jarvis 页显示六位激活码时，在屏幕提示的平台认领设备并绑定支持语音的 Agent。`Say “Jarvis”` 表示可以唤醒。[海外平台](https://bot.sugarat.ai) · [国内平台](https://bot.deotaland.cn)
 - 说 **Jarvis** 后接着说话。设备通过 ESP-SR 的单麦 AFE 在本地做语音活动和 WakeNet 检测，唤醒后缓冲最多约 8 秒语音，Agent Link 的 Realtime 会话就绪后才发送。通话使用已绑定 Agent 的最近一个会话，没有会话时会尝试创建。
 - Realtime 回复从 Sugarat 扬声器播放。播放期间上传静音，播放结束后恢复真实麦克风。点 Jarvis 页的 `End call` 结束通话，设备回到唤醒待机。
+- 主屏接入现有 16 个设备状态。通话保持 `Listening`，播放只切换中央动效。动效使用局部刷新，离开主屏即暂停。音量、亮度、会话和国内外切换都在 `Settings` 中。
 
 ## 源码结构
 
 | 路径 | 职责 |
 | --- | --- |
 | `main/` | ESP-NOW 遥控、LVGL 页面及圆屏和触摸适配 |
+| `main/ui/` | 两款圆屏共用的 Orbit 状态映射、主题和按钮组件 |
 | `components/sugarat_board/` | Sugarat 屏幕、触摸、I2S 麦克风和扬声器 |
 | `components/sugarat_voice/` | Jarvis 模型、Realtime 会话和播放队列 |
 | `third_party/agent_link/` | 内置 Agent Link SDK，来源 `277420e`，附 MIT 许可 |
 | `../common/servo_radio/` | 本仓库内 Sugarat 与 ESP32-C3 共用的舵机协议 |
 
 本项目使用自带的 SDK 和板级驱动，外部依赖由 ESP-IDF 组件管理器按 `dependencies.lock` 下载。
+
+在仓库根目录执行 `.\amoled-1.75\ui-preview\render.ps1 -Board Sugarat` 可生成原生主屏和设置页预览，输出到 `build/ui-preview-renders/`。
 
 ## 编译和烧录
 

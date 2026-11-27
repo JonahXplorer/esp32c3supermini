@@ -22,7 +22,11 @@ static const phase_copy_t phases[] = {
     [SUGARAT_VOICE_PREPARING] = {HOME_BUSY, "Preparing", "Connecting to the voice server", "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_READY] = {HOME_IDLE, "Ready", "Say Jarvis or tap Start call", "Start call", HOME_START_CALL},
     [SUGARAT_VOICE_OPENING] = {HOME_BUSY, "Listening", "Opening voice connection", "End call", HOME_END_CALL},
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     [SUGARAT_VOICE_IN_CALL] = {HOME_LISTENING, "Listening", "Microphone is on", "End call", HOME_END_CALL},
+#else
+    [SUGARAT_VOICE_IN_CALL] = {HOME_LISTENING, "Listening", "Call in progress", "End call", HOME_END_CALL},
+#endif
     [SUGARAT_VOICE_RECONNECTING] = {HOME_BUSY, "Reconnecting", "Restoring the voice connection", "Settings", HOME_OPEN_SETTINGS},
     [SUGARAT_VOICE_ENDING] = {HOME_BUSY, "Ending call", "Closing the voice stream", "Waiting", HOME_NO_ACTION},
     [SUGARAT_VOICE_ERROR] = {HOME_OFFLINE, "Voice error", "Restart device to try again", "Settings", HOME_OPEN_SETTINGS},
@@ -59,8 +63,7 @@ home_snapshot_t home_presenter_snapshot(const screen_state_t *state, unsigned pl
         .level = (state->voice.level > 100 ? 100 : state->voice.level) / 5,
     };
     if (phase == SUGARAT_VOICE_IN_CALL) {
-        /* Speaking changes central drawing only. Copy and controls stay identical;
-         * the original mic waveform level continues to come from the AEC path. */
+        /* Playback changes the central drawing only. */
         result.state = playback_level ? HOME_SPEAKING : HOME_LISTENING;
     } else if ((phase == SUGARAT_VOICE_RECONNECTING || phase == SUGARAT_VOICE_ENDING) && state->voice.can_end) {
         if (phase == SUGARAT_VOICE_RECONNECTING) result.title = "Listening";

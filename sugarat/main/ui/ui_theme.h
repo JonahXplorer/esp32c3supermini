@@ -1,0 +1,126 @@
+#pragma once
+#include "lvgl.h"
+
+/* One palette for Orbit and Sugarat controls, with a panel-specific ground. */
+#define UI_SURFACE_RGB          0x101919
+#define UI_SURFACE_PRESSED_RGB  0x203332
+#define UI_BORDER_RGB           0x344744
+#define UI_TEXT_RGB             0xF0F4F3
+#define UI_TEXT_DIM_RGB         0x9BAAA7
+#define UI_ACCENT_RGB           0x55DDC3
+#define UI_WARN_RGB             0xFFCB80
+#define UI_DANGER_RGB           0xFF9EAA
+#define UI_DANGER_FILL_RGB      0x47232E
+#define UI_INK_RGB              0x112B2C
+#define UI_BG                   lv_color_hex(UI_BG_RGB)
+#define UI_SURFACE              lv_color_hex(UI_SURFACE_RGB)
+#define UI_SURFACE_PRESSED      lv_color_hex(UI_SURFACE_PRESSED_RGB)
+#define UI_BORDER               lv_color_hex(UI_BORDER_RGB)
+#define UI_TEXT                 lv_color_hex(UI_TEXT_RGB)
+#define UI_TEXT_DIM             lv_color_hex(UI_TEXT_DIM_RGB)
+#define UI_ACCENT               lv_color_hex(UI_ACCENT_RGB)
+#define UI_CENTER               (UI_SIZE / 2)
+#define UI_ORBIT_X              ((UI_SIZE - UI_ORBIT_SIZE) / 2)
+#define UI_STROKE               2
+#define UI_GAP                  8
+#define UI_PAD                  12
+#define UI_TOUCH_EXT            20
+#define UI_DENSE_TOUCH_EXT      2
+#define UI_PRESS_MS             120
+#define UI_FONT_SMALL           (&lv_font_montserrat_14)
+#define UI_FONT_CODE            (&lv_font_montserrat_40)
+#define UI_HEADER_Y             0
+#define UI_BRAND_TRACKING       4
+#define UI_HANDLE_W             32
+#define UI_HANDLE_H             2
+#define UI_STATUS_W             180
+#define UI_STATUS_H             24
+#define UI_CODE_W               192
+#define UI_BUTTON_H             48
+#define UI_BUTTON_ICON_Y        12
+#define UI_BUTTON_ICON_SIZE     24
+#define UI_MOTION_MS            1600
+
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+#define UI_MENU_START_Y         88
+#define UI_MENU_STEP_Y          47
+#define UI_MENU_ROW_H           43
+#define UI_LEVEL_BRIGHTNESS_RGB 0xFFCB80
+#define UI_SESSION_CREATE_RGB   0x23529A
+#define UI_ANGLE_UNIT           "°"
+#define UI_RECEIVER_STATUS_Y    81
+#define UI_SERVO_SELECTOR_Y     105
+#define UI_SERVO_ANGLE_Y        165
+#define UI_SERVO_SPEED_Y        228
+#define UI_SERVO_LIGHT_Y        286
+#define UI_ADJUSTMENT_H         60
+#define UI_CODE_ORBIT_GAP_DEG   0
+#define UI_SIZE                 466
+#define UI_BG_RGB               0x000000
+#define UI_RADIUS               16
+#define UI_FONT_BODY            (&lv_font_montserrat_18)
+#define UI_FONT_TITLE           (&lv_font_montserrat_40)
+#define UI_STATUS_Y             44
+#define UI_HEADER_H             104
+#define UI_STATUS_X             143
+#define UI_BATTERY_LABEL_X      289
+#define UI_BRAND_Y              82
+#define UI_ORBIT_Y              110
+#define UI_ORBIT_SIZE           208
+#define UI_ORBIT_TITLE_Y        320
+#define UI_ORBIT_HINT_Y         370
+#define UI_HINT_W               340
+#define UI_CODE_Y               194
+#define UI_HANDLE_Y             22
+#define UI_ORBIT_BUTTON_Y       402
+#define UI_BUTTON_W             176
+#define UI_BUTTON_ICON_X        30
+#define UI_BUTTON_LABEL_X       62
+#define UI_BUTTON_LABEL_Y       14
+#define UI_RING_RADIUS          84
+#define UI_RING_INNER           66
+#define UI_RIPPLE_MIN           38
+#define UI_RIPPLE_SPAN          41
+#else
+#define UI_MENU_START_Y         94
+#define UI_MENU_STEP_Y          47
+#define UI_MENU_ROW_H           44
+#define UI_MENU_ROW_W           192
+#define UI_MENU_LABEL_X         40
+#define UI_LEVEL_BRIGHTNESS_RGB UI_ACCENT_RGB
+#define UI_SESSION_CREATE_RGB   UI_SURFACE_RGB
+#define UI_ANGLE_UNIT           " deg"
+#define UI_RECEIVER_STATUS_Y    90
+#define UI_SERVO_SELECTOR_Y     110
+#define UI_SERVO_ANGLE_Y        170
+#define UI_SERVO_SPEED_Y        230
+#define UI_SERVO_LIGHT_Y        288
+#define UI_ADJUSTMENT_H         56
+#define UI_CODE_ORBIT_GAP_DEG   30
+#define UI_SIZE                 360
+#define UI_BG_RGB               0x080D10
+#define UI_RADIUS               12
+#define UI_FONT_BODY            (&lv_font_montserrat_16)
+#define UI_FONT_TITLE           (&lv_font_montserrat_24)
+#define UI_STATUS_Y             29
+#define UI_HEADER_H             76
+#define UI_STATUS_X             90
+#define UI_BATTERY_LABEL_X      234
+#define UI_BRAND_Y              55
+#define UI_ORBIT_Y              76
+#define UI_ORBIT_SIZE           144
+#define UI_ORBIT_TITLE_Y        220
+#define UI_ORBIT_HINT_Y         252
+#define UI_HINT_W               240
+#define UI_CODE_Y               122
+#define UI_HANDLE_Y             17
+#define UI_ORBIT_BUTTON_Y       286
+#define UI_BUTTON_W             148
+#define UI_BUTTON_ICON_X        16
+#define UI_BUTTON_LABEL_X       47
+#define UI_BUTTON_LABEL_Y       15
+#define UI_RING_RADIUS          64
+#define UI_RING_INNER           49
+#define UI_RIPPLE_MIN           28
+#define UI_RIPPLE_SPAN          32
+#endif

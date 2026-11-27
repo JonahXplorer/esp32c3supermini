@@ -2,25 +2,23 @@
 #include "screen_conversations.h"
 #include "screen_port.h"
 #include "screen_widgets.h"
+#include "home_presenter.h"
+#include "ui_button.h"
+#include "ui_theme.h"
 
 #include "board.h"
 #include "lvgl.h"
 #include "servo_radio.h"
-#include <string.h>
 
 #if defined(SUGARAT_NATIVE_AMOLED_UI)
-#include "home_presenter.h"
 #include "esp_timer.h"
 #include "playback.h"
-#include "ui_theme.h"
-enum { SECONDARY_PAGE_SIZE = 360 };
-static home_screen_t *native_home;
 static int64_t next_poll_us;
-#else
-enum { SECONDARY_PAGE_SIZE = SCREEN_SIZE };
 #endif
 
-enum { WAVE_BARS = 9 };
+enum { SECONDARY_PAGE_SIZE = 360 };
+_Static_assert(UI_SIZE == SCREEN_SIZE, "Orbit geometry must match the panel");
+static home_screen_t *orbit_home;
 
 typedef enum {
     PAGE_HOME, PAGE_SHADE, PAGE_SETTINGS, PAGE_MANUAL, PAGE_NETWORK, PAGE_VOLUME, PAGE_BRIGHTNESS, PAGE_SESSIONS, PAGE_COUNT
@@ -45,33 +43,6 @@ typedef struct {
     bool awaiting;
 } adjustment_t;
 
-#if !defined(SUGARAT_NATIVE_AMOLED_UI)
-typedef struct {
-    const char *title;
-    const char *detail;
-    uint32_t tint;
-} voice_copy_t;
-
-static const voice_copy_t voice_copy[] = {
-    [SUGARAT_VOICE_BOOT]         = {"Starting Jarvis", "", LILAC},
-    [SUGARAT_VOICE_SETUP]        = {"Set up Wi-Fi", "Join Sugarat-Jarvis on your phone", AMBER},
-    [SUGARAT_VOICE_JOINING]      = {"Joining Wi-Fi", "", AMBER},
-    [SUGARAT_VOICE_PLATFORM_CONNECTING] = {"Connecting", "Contacting the platform", LILAC},
-    [SUGARAT_VOICE_PLATFORM_RETRYING]   = {"Platform unreachable", "Retrying", AMBER},
-    [SUGARAT_VOICE_ACTIVATE]     = {"Activate device", "", AMBER},
-    [SUGARAT_VOICE_BIND_AGENT]   = {"Choose an agent", "", AMBER},
-    [SUGARAT_VOICE_PREPARING]    = {"Connecting voice", "Waiting for the voice server", LILAC},
-    [SUGARAT_VOICE_READY]        = {"Say \"Jarvis\"", "Or tap the waveform", TEAL},
-    [SUGARAT_VOICE_OPENING]      = {"Opening a call", "You can start speaking", LILAC},
-    [SUGARAT_VOICE_IN_CALL]      = {"In conversation", "Listening", TEAL},
-    [SUGARAT_VOICE_RECONNECTING] = {"Reconnecting voice", "Restoring your conversation", AMBER},
-    [SUGARAT_VOICE_ENDING]       = {"Ending the call", "", LILAC},
-    [SUGARAT_VOICE_ERROR]        = {"Voice unavailable", "Restart Sugarat to try again", RED},
-    [SUGARAT_VOICE_RETRY]        = {"Call interrupted", "Restoring the voice connection", AMBER},
-    [SUGARAT_VOICE_NO_SESSION]   = {"No voice session", "Create one in Settings", LILAC},
-};
-#endif
-
 static lv_obj_t *pages[PAGE_COUNT];
 static lv_obj_t *home_grab;
 static lv_obj_t *receiver_status;
@@ -81,15 +52,6 @@ static lv_obj_t *light_label;
 static lv_obj_t *angle_caption;
 static adjustment_t angle = {.action = SCREEN_SET_ANGLE};
 static adjustment_t speed = {.action = SCREEN_SET_SPEED};
-#if !defined(SUGARAT_NATIVE_AMOLED_UI)
-static lv_obj_t *voice_ring;
-static lv_obj_t *voice_core;
-static lv_obj_t *voice_orbit[2];
-static lv_obj_t *waveform[WAVE_BARS];
-static lv_obj_t *voice_title;
-static lv_obj_t *voice_detail;
-static lv_obj_t *voice_end;
-#endif
 static lv_obj_t *wifi_status;
 static lv_obj_t *wifi_setup;
 static lv_obj_t *voice_server_buttons[2];
@@ -102,9 +64,6 @@ static page_t active_page;
 static screen_action_t action;
 static screen_state_t displayed;
 static bool has_state;
-#if !defined(SUGARAT_NATIVE_AMOLED_UI)
-static uint32_t wave_updated;
-#endif
 static int32_t pull_start_y;
 static bool pulling;
 static lv_point_t home_swipe_start;
@@ -132,6 +91,7 @@ lv_obj_t *screen_label(lv_obj_t *parent, const char *text, const lv_font_t *font
 
 lv_obj_t *screen_button(lv_obj_t *parent, int width, int height, const char *text, lv_obj_t **label)
 {
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     lv_obj_t *object = lv_button_create(parent);
     lv_obj_remove_style_all(object);
     lv_obj_set_size(object, width, height);
@@ -139,6 +99,9 @@ lv_obj_t *screen_button(lv_obj_t *parent, int width, int height, const char *tex
     lv_obj_set_style_bg_opa(object, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_opa(object, LV_OPA_70, LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(object, LV_OPA_50, LV_STATE_DISABLED);
+#else
+    lv_obj_t *object = ui_button_create(parent, width, height, UI_DENSE_TOUCH_EXT);
+#endif
     lv_obj_t *title = screen_label(object, text, &lv_font_montserrat_16, TEXT);
     lv_obj_center(title);
     if (label) {
@@ -178,9 +141,7 @@ static void show_page(page_t page)
     screen_set_hidden(pages[page], false);
     screen_set_hidden(home_grab, page == PAGE_HOME);
     lv_obj_set_y(pages[page], page_origin(page));
-#if defined(SUGARAT_NATIVE_AMOLED_UI)
-    home_screen_set_visible(native_home, page == PAGE_HOME);
-#endif
+    home_screen_set_visible(orbit_home, page == PAGE_HOME);
     if (page == PAGE_SHADE) {
         lv_anim_t animation;
         lv_anim_init(&animation);
@@ -251,8 +212,13 @@ static void swipe_home(lv_event_t *event)
 
 static void build_header(lv_obj_t *page, const char *title, page_t back)
 {
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     lv_obj_t *back_button = screen_button(page, 40, 40, LV_SYMBOL_LEFT, NULL);
     lv_obj_set_pos(back_button, 66, 40);
+#else
+    lv_obj_t *back_button = screen_button(page, 48, 48, LV_SYMBOL_LEFT, NULL);
+    lv_obj_set_pos(back_button, 66, 42);
+#endif
     lv_obj_set_style_bg_color(back_button, lv_color_hex(PANEL), 0);
     lv_obj_add_event_cb(back_button, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)back);
     lv_obj_t *label = screen_label(page, title, &lv_font_montserrat_16, TEXT);
@@ -261,6 +227,7 @@ static void build_header(lv_obj_t *page, const char *title, page_t back)
 
 static lv_obj_t *menu_row(lv_obj_t *page, int y, int height, const char *symbol, const char *title, uint32_t tint)
 {
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     lv_obj_t *row = screen_button(page, 242, height, "", NULL);
     lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_bg_color(row, lv_color_hex(PANEL), 0);
@@ -269,6 +236,13 @@ static lv_obj_t *menu_row(lv_obj_t *page, int y, int height, const char *symbol,
     lv_obj_align(tile, LV_ALIGN_LEFT_MID, 10, 0);
     lv_obj_center(screen_label(tile, symbol, &lv_font_montserrat_16, BG));
     lv_obj_align(screen_label(row, title, &lv_font_montserrat_16, TEXT), LV_ALIGN_LEFT_MID, 58, 0);
+#else
+    (void)tint;
+    lv_obj_t *row = screen_button(page, UI_MENU_ROW_W, height, "", NULL);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_align(screen_label(row, symbol, &lv_font_montserrat_16, MUTED), LV_ALIGN_LEFT_MID, UI_PAD, 0);
+    lv_obj_align(screen_label(row, title, &lv_font_montserrat_16, TEXT), LV_ALIGN_LEFT_MID, UI_MENU_LABEL_X, 0);
+#endif
     lv_obj_align(screen_label(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, MUTED), LV_ALIGN_RIGHT_MID, -14, 0);
     return row;
 }
@@ -352,7 +326,7 @@ void screen_mark_enabled(lv_obj_t *object, bool enabled)
 static void readout(adjustment_t *control, int value)
 {
     if (control->action == SCREEN_SET_ANGLE) {
-        lv_label_set_text_fmt(control->readout, "%d°", value * SERVO_ANGLE_INCREMENT);
+        lv_label_set_text_fmt(control->readout, "%d" UI_ANGLE_UNIT, value * SERVO_ANGLE_INCREMENT);
     } else {
         const unsigned us_per_step = SERVO_SPEED_MIN + value * SERVO_SPEED_INCREMENT;
         const unsigned centiseconds = (1000u + us_per_step - 1) / us_per_step;
@@ -386,7 +360,7 @@ static void slider_input(lv_event_t *event)
 static lv_obj_t *build_adjustment(lv_obj_t *page, adjustment_t *control, int y,
                                  int width, const char *caption, uint32_t tint)
 {
-    lv_obj_t *card = screen_surface(page, width, 60, 20, PANEL);
+    lv_obj_t *card = screen_surface(page, width, UI_ADJUSTMENT_H, 20, PANEL);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(EDGE), 0);
@@ -426,10 +400,10 @@ static void build_servos(lv_obj_t *page)
     };
     build_header(page, "Manual control", PAGE_SETTINGS);
     receiver_status = screen_label(page, "", &lv_font_montserrat_14, MUTED);
-    lv_obj_align(receiver_status, LV_ALIGN_TOP_MID, 0, 81);
+    lv_obj_align(receiver_status, LV_ALIGN_TOP_MID, 0, UI_RECEIVER_STATUS_Y);
 
     lv_obj_t *selector = screen_surface(page, 254, 54, 27, PANEL);
-    lv_obj_align(selector, LV_ALIGN_TOP_MID, 0, 105);
+    lv_obj_align(selector, LV_ALIGN_TOP_MID, 0, UI_SERVO_SELECTOR_Y);
     for (int i = 0; i < 2; ++i) {
         lv_obj_t *label;
         targets[i] = screen_button(selector, 119, 46, i == 0 ? "Position A" : "Position B", &label);
@@ -443,18 +417,16 @@ static void build_servos(lv_obj_t *page)
         lv_obj_add_event_cb(targets[i], command_clicked, LV_EVENT_CLICKED, (void *)&target_commands[i]);
     }
 
-    angle_caption = build_adjustment(page, &angle, 165, 274, "", TEAL);
-    build_adjustment(page, &speed, 228, 250, "Travel time / 90°", LILAC);
+    angle_caption = build_adjustment(page, &angle, UI_SERVO_ANGLE_Y, 274, "", TEAL);
+    build_adjustment(page, &speed, UI_SERVO_SPEED_Y, 250, "Travel time / 90" UI_ANGLE_UNIT, LILAC);
     lv_slider_set_range(speed.slider, 0, (SERVO_SPEED_MAX - SERVO_SPEED_MIN) / SERVO_SPEED_INCREMENT);
 
     light_button = screen_button(page, 134, 42, "Light", &light_label);
-    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, 286);
+    lv_obj_align(light_button, LV_ALIGN_TOP_MID, 0, UI_SERVO_LIGHT_Y);
     lv_obj_add_event_cb(light_button, light_clicked, LV_EVENT_CLICKED, NULL);
-
 }
 
-#if defined(SUGARAT_NATIVE_AMOLED_UI)
-static void native_home_action(home_action_t selected, void *context)
+static void orbit_home_action(home_action_t selected, void *context)
 {
     (void)context;
     switch (selected) {
@@ -469,73 +441,12 @@ static void native_home_action(home_action_t selected, void *context)
 
 static void build_home(lv_obj_t *page)
 {
-    native_home = home_screen_create(page, native_home_action, NULL);
-    if (!native_home) return;
-    lv_obj_t *header = home_screen_header(native_home);
+    orbit_home = home_screen_create(page, orbit_home_action, NULL);
+    if (!orbit_home) return;
+    lv_obj_t *header = home_screen_header(orbit_home);
     lv_obj_add_flag(header, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
     lv_obj_add_event_cb(header, pull_down, LV_EVENT_ALL, NULL);
 }
-#else
-static lv_obj_t *orbit(lv_obj_t *parent, int size, int start, int end)
-{
-    lv_obj_t *arc = lv_arc_create(parent);
-    lv_obj_remove_style_all(arc);
-    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(arc, size, size);
-    lv_obj_center(arc);
-    lv_arc_set_bg_angles(arc, 0, 360);
-    lv_arc_set_angles(arc, start, end);
-    lv_obj_set_style_arc_width(arc, 1, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(EDGE), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 3, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
-    return arc;
-}
-
-static void build_home(lv_obj_t *page)
-{
-    static const screen_action_t start_command = {.kind = SCREEN_START_CALL};
-    static const screen_action_t end_command = {.kind = SCREEN_END_CALL};
-
-    // The grab area starts at the top and extends until the drag threshold.
-    lv_obj_t *grab = screen_surface(page, 200, 78, 0, BG);
-    lv_obj_align(grab, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_opa(grab, LV_OPA_TRANSP, 0);
-    lv_obj_add_flag(grab, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_add_event_cb(grab, pull_down, LV_EVENT_ALL, NULL);
-    lv_obj_t *handle = screen_surface(grab, 42, 4, 2, TRACK);
-    lv_obj_align(handle, LV_ALIGN_TOP_MID, 0, 27);
-
-    voice_ring = screen_surface(page, 170, 170, LV_RADIUS_CIRCLE, BG);
-    lv_obj_align(voice_ring, LV_ALIGN_TOP_MID, 0, 75);
-    lv_obj_add_event_cb(voice_ring, command_clicked, LV_EVENT_CLICKED, (void *)&start_command);
-    voice_orbit[0] = orbit(voice_ring, 168, 202, 302);
-    voice_orbit[1] = orbit(voice_ring, 154, 16, 139);
-
-    voice_core = screen_surface(voice_ring, 132, 132, LV_RADIUS_CIRCLE, PANEL);
-    lv_obj_center(voice_core);
-    lv_obj_set_style_border_width(voice_core, 1, 0);
-    lv_obj_set_style_border_color(voice_core, lv_color_hex(EDGE), 0);
-    lv_obj_set_style_bg_grad_dir(voice_core, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_grad_color(voice_core, lv_color_hex(BG), 0);
-    for (int i = 0; i < WAVE_BARS; ++i) {
-        waveform[i] = screen_surface(voice_core, 5, 8, LV_RADIUS_CIRCLE, TEAL);
-        lv_obj_align(waveform[i], LV_ALIGN_CENTER, (i - WAVE_BARS / 2) * 11, 0);
-    }
-
-    voice_title = screen_label(page, "", &lv_font_montserrat_24, TEXT);
-    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, 247);
-    voice_detail = screen_label(page, "", &lv_font_montserrat_14, MUTED);
-    lv_obj_set_style_text_align(voice_detail, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(voice_detail, 232);
-    lv_label_set_long_mode(voice_detail, LV_LABEL_LONG_WRAP);
-    lv_obj_align(voice_detail, LV_ALIGN_TOP_MID, 0, 281);
-    voice_end = screen_button(page, 120, 37, LV_SYMBOL_CLOSE "   End call", NULL);
-    lv_obj_align(voice_end, LV_ALIGN_TOP_MID, 0, 304);
-    lv_obj_set_style_bg_color(voice_end, lv_color_hex(0x4C202B), 0);
-    lv_obj_add_event_cb(voice_end, command_clicked, LV_EVENT_CLICKED, (void *)&end_command);
-}
-#endif
 
 static void choose_voice_server(lv_event_t *event)
 {
@@ -630,21 +541,21 @@ static void build_settings(void)
 
     lv_obj_t *page = pages[PAGE_SETTINGS];
     build_header(page, "Settings", PAGE_SHADE);
-    lv_obj_t *sound = menu_row(page, 88, 43, LV_SYMBOL_VOLUME_MAX, "Volume", TEAL);
+    lv_obj_t *sound = menu_row(page, UI_MENU_START_Y, UI_MENU_ROW_H, LV_SYMBOL_VOLUME_MAX, "Volume", TEAL);
     lv_obj_add_event_cb(sound, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_VOLUME);
-    lv_obj_t *light = menu_row(page, 135, 43, LV_SYMBOL_EYE_OPEN, "Brightness", AMBER);
+    lv_obj_t *light = menu_row(page, UI_MENU_START_Y + UI_MENU_STEP_Y, UI_MENU_ROW_H, LV_SYMBOL_EYE_OPEN, "Brightness", AMBER);
     lv_obj_add_event_cb(light, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_BRIGHTNESS);
-    lv_obj_t *sessions = menu_row(page, 182, 43, LV_SYMBOL_EDIT, "Sessions", LILAC);
+    lv_obj_t *sessions = menu_row(page, UI_MENU_START_Y + 2 * UI_MENU_STEP_Y, UI_MENU_ROW_H, LV_SYMBOL_EDIT, "Sessions", LILAC);
     lv_obj_add_event_cb(sessions, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_SESSIONS);
-    lv_obj_t *manual = menu_row(page, 229, 43, LV_SYMBOL_LIST, "Manual control", TEAL);
+    lv_obj_t *manual = menu_row(page, UI_MENU_START_Y + 3 * UI_MENU_STEP_Y, UI_MENU_ROW_H, LV_SYMBOL_LIST, "Manual control", TEAL);
     lv_obj_add_event_cb(manual, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_MANUAL);
-    lv_obj_t *network = menu_row(page, 276, 43, LV_SYMBOL_WIFI, "Network", LILAC);
+    lv_obj_t *network = menu_row(page, UI_MENU_START_Y + 4 * UI_MENU_STEP_Y, UI_MENU_ROW_H, LV_SYMBOL_WIFI, "Network", LILAC);
     lv_obj_add_event_cb(network, navigate, LV_EVENT_CLICKED, (void *)(uintptr_t)PAGE_NETWORK);
 
     build_network(pages[PAGE_NETWORK]);
     build_level_page(pages[PAGE_VOLUME], &volume, 0, "Volume", LV_SYMBOL_VOLUME_MAX, TEAL);
     build_level_page(pages[PAGE_BRIGHTNESS], &brightness, SUGARAT_BRIGHTNESS_MIN,
-                     "Brightness", LV_SYMBOL_EYE_OPEN, AMBER);
+                     "Brightness", LV_SYMBOL_EYE_OPEN, UI_LEVEL_BRIGHTNESS_RGB);
     build_header(pages[PAGE_SESSIONS], "Sessions", PAGE_SETTINGS);
     screen_conversations_build(pages[PAGE_SESSIONS]);
 }
@@ -656,11 +567,7 @@ esp_err_t screen_init(bool touch_ready)
     lv_obj_t *root = lv_screen_active();
     lv_obj_remove_style_all(root);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-#if defined(SUGARAT_NATIVE_AMOLED_UI)
     lv_obj_set_style_bg_color(root, UI_BG, 0);
-#else
-    lv_obj_set_style_bg_color(root, lv_color_hex(BG), 0);
-#endif
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     for (int i = 0; i < PAGE_COUNT; ++i) {
         const int size = i == PAGE_HOME ? SCREEN_SIZE : SECONDARY_PAGE_SIZE;
@@ -669,9 +576,7 @@ esp_err_t screen_init(bool touch_ready)
         screen_set_hidden(pages[i], i != PAGE_HOME);
     }
     build_home(pages[PAGE_HOME]);
-#if defined(SUGARAT_NATIVE_AMOLED_UI)
-    if (!native_home) return ESP_ERR_NO_MEM;
-#endif
+    if (!orbit_home) return ESP_ERR_NO_MEM;
     build_settings();
     build_servos(pages[PAGE_MANUAL]);
 
@@ -724,59 +629,6 @@ static void sync_adjustment(adjustment_t *control, int confirmed, bool enabled, 
     }
 }
 
-#if !defined(SUGARAT_NATIVE_AMOLED_UI)
-static void show_voice(const sugarat_voice_view_t *voice, bool china)
-{
-    const voice_copy_t *copy = &voice_copy[voice->phase];
-    const bool activation = voice->phase == SUGARAT_VOICE_ACTIVATE;
-    if (voice->phase == SUGARAT_VOICE_READY) {
-        lv_obj_add_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
-    } else {
-        lv_obj_remove_flag(voice_ring, LV_OBJ_FLAG_CLICKABLE);
-    }
-    const lv_color_t tint = lv_color_hex(voice->speaking ? LILAC : copy->tint);
-    lv_obj_set_style_bg_color(voice_core, lv_color_mix(tint, lv_color_hex(BG), LV_OPA_20), 0);
-    lv_obj_set_style_arc_color(voice_orbit[0], tint, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(voice_orbit[1], lv_color_mix(tint, lv_color_hex(EDGE), LV_OPA_50), LV_PART_INDICATOR);
-    for (int i = 0; i < WAVE_BARS; ++i) {
-        lv_obj_set_style_bg_color(waveform[i], tint, 0);
-    }
-    lv_obj_set_style_text_font(voice_title, activation ? &lv_font_montserrat_40 : &lv_font_montserrat_24, 0);
-    lv_obj_align(voice_title, LV_ALIGN_TOP_MID, 0, activation ? 232 : 247);
-    lv_label_set_text(voice_title, activation ? voice->activation_code : copy->title);
-    const char *host = sugarat_voice_server_host(china);
-    if (activation) {
-        lv_label_set_text_fmt(voice_detail, "Enter this code at %s", host);
-    } else if (voice->phase == SUGARAT_VOICE_BIND_AGENT) {
-        lv_label_set_text_fmt(voice_detail, "Bind a voice agent at %s", host);
-    } else {
-        lv_label_set_text(voice_detail, voice->phase == SUGARAT_VOICE_IN_CALL && voice->speaking
-                                       ? "Jarvis is speaking" : copy->detail);
-    }
-    screen_set_hidden(voice_end, !voice->can_end);
-}
-
-static void animate_wave(const sugarat_voice_view_t *voice)
-{
-    const uint32_t tick = lv_tick_get();
-    if (tick - wave_updated < 90) return;
-    wave_updated = tick;
-    const unsigned cycle = tick / 90;
-    for (int i = 0; i < WAVE_BARS; ++i) {
-        const int offset = i - WAVE_BARS / 2;
-        const unsigned distance = (unsigned)(offset < 0 ? -offset : offset);
-        const unsigned step = (cycle + i * 3) % 14;
-        const unsigned pulse = step < 7 ? step : 14 - step;
-        unsigned height = 6 + (5 - distance) * pulse / 4;
-        if (voice->phase == SUGARAT_VOICE_IN_CALL) {
-            height += ((unsigned)voice->level * (5 - distance) * (pulse + 3)) / 80;
-        }
-        if (lv_obj_get_height(waveform[i]) != (int32_t)height) lv_obj_set_height(waveform[i], height);
-    }
-}
-
-#endif
-
 static void update_manual(const screen_state_t *state)
 {
     const manual_control_view_t *view = &state->manual;
@@ -794,7 +646,7 @@ static void update_manual(const screen_state_t *state)
         }
     }
     if (!has_state || view->angle_limit_deg != previous->angle_limit_deg) {
-        lv_label_set_text_fmt(angle_caption, "B angle (0-%u°)", (unsigned)view->angle_limit_deg);
+        lv_label_set_text_fmt(angle_caption, "B angle (0-%u" UI_ANGLE_UNIT ")", (unsigned)view->angle_limit_deg);
         lv_slider_set_range(angle.slider, 0, view->angle_limit_deg / SERVO_ANGLE_INCREMENT);
     }
     if (!has_state || view->light != previous->light || view->online != previous->online ||
@@ -802,8 +654,12 @@ static void update_manual(const screen_state_t *state)
         const bool known = view->online && view->light != SERVO_LIGHT_UNKNOWN;
         const bool on = known && view->light == SERVO_LIGHT_ON;
         lv_label_set_text(light_label, known ? (on ? "Light on" : "Light off") : "Light");
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
         lv_obj_set_style_bg_color(light_button, lv_color_hex(on ? AMBER : PANEL), 0);
         lv_obj_set_style_text_color(light_label, lv_color_hex(on ? INK : TEXT), 0);
+#else
+        lv_obj_set_state(light_button, LV_STATE_CHECKED, on);
+#endif
         screen_mark_enabled(light_button, enabled && known);
     }
     sync_adjustment(&angle, view->angle_deg / SERVO_ANGLE_INCREMENT, enabled, view->pending);
@@ -817,17 +673,12 @@ void screen_update(const screen_state_t *state)
     sync_level(&volume, state->settings.volume);
     sync_level(&brightness, state->settings.brightness);
 #if defined(SUGARAT_NATIVE_AMOLED_UI)
-    const home_snapshot_t home = home_presenter_snapshot(state, voice_playback_level());
-    home_screen_update(native_home, &home);
+    const unsigned playback = voice_playback_level();
 #else
-    if (!has_state || state->voice.phase != displayed.voice.phase || state->voice.can_end != displayed.voice.can_end ||
-        state->voice.speaking != displayed.voice.speaking ||
-        state->settings.voice_china != displayed.settings.voice_china ||
-        strcmp(state->voice.activation_code, displayed.voice.activation_code) != 0) {
-        show_voice(&state->voice, state->settings.voice_china);
-    }
-    if (active_page == PAGE_HOME) animate_wave(&state->voice);
+    const unsigned playback = state->voice.speaking;
 #endif
+    const home_snapshot_t home = home_presenter_snapshot(state, playback);
+    home_screen_update(orbit_home, &home);
     if (!has_state || state->wifi_connected != displayed.wifi_connected ||
         state->wifi_setup_active != displayed.wifi_setup_active ||
         state->voice.can_end != displayed.voice.can_end || state->voice.phase != displayed.voice.phase ||

@@ -6,7 +6,12 @@
 
 static uint32_t now_ms;
 enum { FRAME_MS = 33, MOTION_FRAMES = 48 };
-static uint16_t framebuffer[UI_SIZE * UI_SIZE], draw_buffer[UI_SIZE * UI_SIZE], draw_buffer_b[UI_SIZE * UI_SIZE];
+static uint16_t framebuffer[UI_SIZE * UI_SIZE];
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+static uint16_t draw_buffer[UI_SIZE * UI_SIZE], draw_buffer_b[UI_SIZE * UI_SIZE];
+#else
+static uint16_t draw_buffer[UI_SIZE * 12];
+#endif
 static unsigned flushed_pixels, clicks;
 static home_action_t clicked_action;
 static lv_area_t dirty;
@@ -33,6 +38,7 @@ static void reset_stats(void)
 }
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 {
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     (void)area;
     if (lv_display_flush_is_last(display)) {
         /* Like the port: DIRECT preserves the logical frame, and each completed
@@ -41,6 +47,20 @@ static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
         flushed_pixels += UI_SIZE * UI_SIZE;
         dirty = (lv_area_t){0, 0, UI_SIZE - 1, UI_SIZE - 1};
     }
+#else
+    const int width = lv_area_get_width(area);
+    const int height = lv_area_get_height(area);
+    const size_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_RGB565);
+    for (int y = 0; y < height; ++y) {
+        memcpy(framebuffer + (area->y1 + y) * UI_SIZE + area->x1,
+               pixels + y * stride, width * sizeof(*framebuffer));
+    }
+    flushed_pixels += width * height;
+    if (dirty.x1 > area->x1) dirty.x1 = area->x1;
+    if (dirty.y1 > area->y1) dirty.y1 = area->y1;
+    if (dirty.x2 < area->x2) dirty.x2 = area->x2;
+    if (dirty.y2 < area->y2) dirty.y2 = area->y2;
+#endif
     lv_display_flush_ready(display);
 }
 static void advance(unsigned elapsed)
@@ -100,6 +120,95 @@ static void check_action(home_screen_t *screen, screen_state_t state)
     require(clicks == before, "Forced disabled click cannot dispatch");
 }
 
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
+static void align_window(lv_event_t *event)
+{
+    lv_area_t *area = lv_event_get_param(event);
+    area->x1 &= ~1;
+    area->x2 |= 1;
+}
+
+static lv_point_t pointer;
+static bool pressed;
+
+static void read_pointer(lv_indev_t *input, lv_indev_data_t *data)
+{
+    (void)input;
+    data->point = pointer;
+    data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+static void tap(lv_indev_t *input, int x, int y)
+{
+    pointer = (lv_point_t){x, y};
+    pressed = true;
+    lv_indev_read(input);
+    pressed = false;
+    lv_indev_read(input);
+    advance(210);
+}
+
+static bool visible_label(lv_obj_t *obj, const char *text)
+{
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return false;
+    if (lv_obj_check_type(obj, &lv_label_class) && strcmp(lv_label_get_text(obj), text) == 0) return true;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i) {
+        if (visible_label(lv_obj_get_child(obj, i), text)) return true;
+    }
+    return false;
+}
+
+static void render_settings(const char *folder)
+{
+    require(screen_init(true) == ESP_OK, "Create production Sugarat pages");
+    screen_state_t state = mock_state(SUGARAT_VOICE_READY);
+    state.settings = (device_settings_t){.volume = 65, .brightness = 74};
+    state.manual = (manual_control_view_t){.online = true, .speed = 40, .angle_deg = 90,
+        .angle_limit_deg = 145, .receiver_channel = 6};
+    strcpy(state.voice.conversation_id, "main");
+    screen_update(&state);
+    advance(210);
+    lv_indev_t *input = lv_indev_create();
+    lv_indev_set_type(input, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(input, read_pointer);
+
+    tap(input, 180, 40);
+    lv_obj_t *root = lv_screen_active();
+    require(visible_label(root, "Control center"), "Home header opens Control center");
+    tap(input, 180, 166);
+    require(visible_label(root, "Brightness") && visible_label(root, "Manual control"), "Open Settings");
+    save(folder, "device_settings");
+
+    static const char *const pages[] = {"Volume", "Brightness", "Sessions", "Manual control", "Network"};
+    static const char *const names[] = {"device_volume", "device_brightness", "device_sessions", "device_manual", "device_network"};
+    for (int i = 0; i < 5; ++i) {
+        tap(input, 180, UI_MENU_START_Y + i * UI_MENU_STEP_Y + UI_MENU_ROW_H / 2);
+        require(visible_label(root, pages[i]), "Navigate to a Sugarat settings page");
+        require(!visible_label(root, "Settings"), "Hide the settings list on its child pages");
+        screen_update(&state);
+        screen_update(&state);
+        advance(210);
+        save(folder, names[i]);
+        if (i == 3) {
+            require(screen_manual_is_open(), "Manual control remains connected to the manual page");
+            tap(input, 244, 132);
+            screen_action_t action = screen_poll();
+            require(action.kind == SCREEN_SET_TARGET && action.value == 1, "Position B produces the original action");
+        }
+        if (i == 4) {
+            tap(input, 242, 246);
+            require(visible_label(root, "Use China server?"), "Region change requires confirmation");
+            tap(input, 235, 220);
+            screen_action_t action = screen_poll();
+            require(action.kind == SCREEN_SET_VOICE_SERVER && action.value == 1, "Confirm China emits the original action");
+        }
+        tap(input, 90, 66);
+    }
+    lv_indev_delete(input);
+    puts("PASS: Sugarat Settings touch navigation, Position B, and network confirmation");
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc != 2) return 2;
@@ -107,7 +216,12 @@ int main(int argc, char **argv)
     lv_display_t *display = lv_display_create(UI_SIZE, UI_SIZE);
     lv_display_set_theme(display, NULL);
     lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
     lv_display_set_buffers(display, draw_buffer, draw_buffer_b, sizeof(draw_buffer), LV_DISPLAY_RENDER_MODE_DIRECT);
+#else
+    lv_display_set_buffers(display, draw_buffer, NULL, sizeof(draw_buffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_add_event_cb(display, align_window, LV_EVENT_INVALIDATE_AREA, NULL);
+#endif
     lv_display_set_flush_cb(display, flush);
     lv_obj_t *root = lv_screen_active();
     lv_obj_remove_style_all(root);
@@ -161,8 +275,15 @@ int main(int argc, char **argv)
     home_screen_update(screen, &listening); advance(200); save(argv[1], "device_listening");
     reset_stats(); home_screen_update(screen, &speaking); advance(FRAME_MS);
     sample(metrics, "listening_to_speaking", 0);
-    require(dirty.x1 == 0 && dirty.y1 == 0 && dirty.x2 == 465 && dirty.y2 == 465,
+#if defined(SUGARAT_NATIVE_AMOLED_UI)
+    require(dirty.x1 == 0 && dirty.y1 == 0 && dirty.x2 == UI_SIZE - 1 && dirty.y2 == UI_SIZE - 1,
             "Full-frame path submits one complete frame");
+#else
+    /* LVGL refresh includes an edge pixel; the real flush also rounds to even columns. */
+    require(dirty.x1 >= UI_ORBIT_X - 2 && dirty.y1 >= UI_ORBIT_Y - 1 &&
+            dirty.x2 <= UI_ORBIT_X + UI_ORBIT_SIZE + 1 && dirty.y2 <= UI_ORBIT_Y + UI_ORBIT_SIZE,
+            "Playback invalidates only the central orbit");
+#endif
     for (unsigned i = 0; i < MOTION_FRAMES; ++i) {
         reset_stats(); advance(FRAME_MS); sample(metrics, "speaking", i);
         snprintf(name, sizeof(name), "device_speaking_%02u", i); save(argv[1], name);
@@ -182,7 +303,12 @@ int main(int argc, char **argv)
     require(!home_presenter_snapshot(&setup, 0).action_enabled, "Do not restart an active setup hotspot");
     screen_state_t bad = mock_state(999);
     require(!strcmp(home_presenter_snapshot(&bad, 0).title, "Voice error"), "Unknown phase has a safe presentation");
-    fclose(metrics); home_screen_destroy(screen); lv_display_delete(display);
-    puts("PASS: 16 device phases, regional onboarding, action guards, Listening during playback, full-frame submission and hidden-page pause");
+    fclose(metrics);
+    home_screen_destroy(screen);
+#if !defined(SUGARAT_NATIVE_AMOLED_UI)
+    render_settings(argv[1]);
+#endif
+    lv_display_delete(display);
+    puts("PASS: 16 device phases, regional onboarding, action guards, Listening during playback, refresh bounds and hidden-page pause");
     return 0;
 }

@@ -11,7 +11,7 @@ typedef enum {
     HOME_OPEN_SETTINGS, HOME_OPEN_SESSIONS, HOME_NO_ACTION
 } home_action_t;
 
-/* Presentation data only. Preview supplies mocks; the application owns guards. */
+/* Shared Orbit presentation. Preview supplies mocks; the application owns guards. */
 typedef struct {
     home_visual_state_t state;
     bool wifi_connected;

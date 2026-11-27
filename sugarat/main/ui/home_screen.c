@@ -1,4 +1,5 @@
 #include "home_screen.h"
+#include "ui_button.h"
 #include "ui_theme.h"
 #include <stdlib.h>
 #include <string.h>
@@ -12,10 +13,6 @@ struct home_screen {
     int32_t motion;
     bool visible;
 };
-
-static lv_style_t button_base, button_pressed, button_disabled, button_active;
-static lv_style_transition_dsc_t press_transition;
-static bool styles_ready;
 
 static bool active(const home_screen_t *s)
 {
@@ -113,7 +110,13 @@ static void draw_orbit(home_screen_t *s, lv_layer_t *layer, int x, int y)
     const int phase = s->motion * 360 / 1024;
     const home_visual_state_t state = s->snapshot.state;
     if (s->snapshot.activation_code[0]) {
-        arc(layer, x, y, UI_RING_RADIUS, 0, 360, UI_ACCENT, UI_STROKE, LV_OPA_50);
+        if (UI_CODE_ORBIT_GAP_DEG) {
+            const int gap = UI_CODE_ORBIT_GAP_DEG;
+            arc(layer, x, y, UI_RING_RADIUS, gap, 180 - gap, UI_ACCENT, UI_STROKE, LV_OPA_50);
+            arc(layer, x, y, UI_RING_RADIUS, 180 + gap, 360 - gap, UI_ACCENT, UI_STROKE, LV_OPA_50);
+        } else {
+            arc(layer, x, y, UI_RING_RADIUS, 0, 360, UI_ACCENT, UI_STROKE, LV_OPA_50);
+        }
         return;
     }
     if (state == HOME_OFFLINE) {
@@ -143,7 +146,7 @@ static void draw_orbit(home_screen_t *s, lv_layer_t *layer, int x, int y)
     } else {
         for (int i = 0; i < 3; ++i) {
             int t = (s->motion + i * 341) % 1024;
-            arc(layer, x, y, 38 + t * 41 / 1024, 0, 360,
+            arc(layer, x, y, UI_RIPPLE_MIN + t * UI_RIPPLE_SPAN / 1024, 0, 360,
                 UI_ACCENT, UI_STROKE, (lv_opa_t)(230 - t * 190 / 1024));
         }
         mic(layer, x, y - 3, UI_ACCENT, LV_OPA_COVER);
@@ -182,31 +185,6 @@ static void draw_action_icon(lv_event_t *event)
     }
 }
 
-static void button_styles_init(void)
-{
-    if (styles_ready) return;
-    styles_ready = true;
-    static const lv_style_prop_t transition_props[] = {LV_STYLE_BG_COLOR, LV_STYLE_TRANSLATE_Y, 0};
-    lv_style_transition_dsc_init(&press_transition, transition_props, lv_anim_path_ease_out,
-                                 UI_PRESS_MS, 0, NULL);
-    lv_style_init(&button_base);
-    lv_style_set_bg_color(&button_base, UI_SURFACE);
-    lv_style_set_bg_opa(&button_base, LV_OPA_COVER);
-    lv_style_set_radius(&button_base, UI_RADIUS);
-    lv_style_set_border_width(&button_base, 1);
-    lv_style_set_border_color(&button_base, UI_BORDER);
-    lv_style_set_shadow_width(&button_base, 0);
-    lv_style_set_pad_all(&button_base, 0);
-    lv_style_set_transition(&button_base, &press_transition);
-    lv_style_init(&button_pressed);
-    lv_style_set_bg_color(&button_pressed, UI_SURFACE_PRESSED);
-    lv_style_set_translate_y(&button_pressed, 1);
-    lv_style_init(&button_disabled);
-    lv_style_set_opa(&button_disabled, LV_OPA_40);
-    lv_style_init(&button_active);
-    lv_style_set_border_color(&button_active, UI_ACCENT);
-}
-
 static lv_obj_t *plain(lv_obj_t *parent, int x, int y, int w, int h)
 {
     lv_obj_t *o = lv_obj_create(parent);
@@ -237,19 +215,10 @@ static void clicked(lv_event_t *event)
         s->on_action(action_for(s), s->context);
 }
 
-/* Adapted from lvgl-ui/assets/templates/action_button.c; single shared anatomy. */
 static lv_obj_t *make_action_button(home_screen_t *s, int y)
 {
-    button_styles_init();
-    lv_obj_t *b = lv_button_create(s->root);
-    lv_obj_remove_style_all(b);
+    lv_obj_t *b = ui_button_create(s->root, UI_BUTTON_W, UI_BUTTON_H, UI_TOUCH_EXT);
     lv_obj_set_pos(b, UI_CENTER - UI_BUTTON_W / 2, y);
-    lv_obj_set_size(b, UI_BUTTON_W, UI_BUTTON_H);
-    lv_obj_set_ext_click_area(b, UI_TOUCH_EXT);
-    lv_obj_add_style(b, &button_base, 0);
-    lv_obj_add_style(b, &button_pressed, LV_STATE_PRESSED);
-    lv_obj_add_style(b, &button_disabled, LV_STATE_DISABLED);
-    lv_obj_add_style(b, &button_active, LV_STATE_CHECKED);
     lv_obj_add_event_cb(b, clicked, LV_EVENT_CLICKED, s);
     s->button_icon = plain(b, UI_BUTTON_ICON_X, UI_BUTTON_ICON_Y,
                             UI_BUTTON_ICON_SIZE, UI_BUTTON_ICON_SIZE);
@@ -308,7 +277,7 @@ home_screen_t *home_screen_create(lv_obj_t *parent, home_action_cb_t on_action, 
     lv_obj_set_style_text_letter_space(brand, UI_BRAND_TRACKING, 0);
     s->hero = plain(s->root, UI_ORBIT_X, UI_ORBIT_Y, UI_ORBIT_SIZE, UI_ORBIT_SIZE);
     lv_obj_add_event_cb(s->hero, draw_hero, LV_EVENT_DRAW_MAIN, s);
-    s->code = label(s->root, "", UI_FONT_TITLE, UI_TEXT, UI_CODE_Y);
+    s->code = label(s->root, "", UI_FONT_CODE, UI_TEXT, UI_CODE_Y);
     lv_obj_set_width(s->code, UI_CODE_W);
     lv_obj_set_x(s->code, UI_CENTER - UI_CODE_W / 2);
     s->title = label(s->root, "", UI_FONT_TITLE, UI_TEXT, UI_ORBIT_TITLE_Y);

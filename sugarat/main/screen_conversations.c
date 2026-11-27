@@ -8,7 +8,7 @@
 #include "esp_attr.h"
 #include "screen_widgets.h"
 
-enum { LIST_WIDTH = 236, ROW_HEIGHT = 56, DELETE_FILL = 0x47232E };
+enum { LIST_WIDTH = 236, ROW_HEIGHT = 56, DELETE_FILL = UI_DANGER_FILL_RGB };
 
 typedef struct {
     lv_obj_t *choose;
@@ -99,6 +99,7 @@ static void rebuild_rows(void)
         lv_obj_set_style_bg_opa(row->choose, LV_OPA_TRANSP, LV_STATE_DISABLED);
         lv_obj_set_style_text_font(row->title, &title_font, 0);
         lv_obj_set_width(row->title, LIST_WIDTH - 64);
+        lv_obj_set_height(row->title, title_font.line_height);
         lv_label_set_long_mode(row->title, LV_LABEL_LONG_DOT);
         lv_obj_align(row->title, LV_ALIGN_TOP_LEFT, 12, 9);
         row->badge = screen_label(row->choose, "", &lv_font_montserrat_14, MUTED);
@@ -130,7 +131,7 @@ void screen_conversations_build(lv_obj_t *page)
 #if LV_FONT_SIMSUN_16_CJK
     title_font.fallback = &lv_font_simsun_16_cjk;
 #endif
-    create = toolbar_button(page, LV_SYMBOL_PLUS, 93, 39, 42, 0x23529A);
+    create = toolbar_button(page, LV_SYMBOL_PLUS, 93, 39, 42, UI_SESSION_CREATE_RGB);
     list = screen_surface(page, LIST_WIDTH + 8, 174, 0, BG);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 91);
     lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);

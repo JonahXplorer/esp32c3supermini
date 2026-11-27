@@ -18,12 +18,12 @@ home_screen.c：A 方案控件、统一按钮、中央动效，只读快照，�
 原有 main.c：执行发起/结束通话、配网等动作；AMOLED 分支按显示期限等待
 ```
 
-- `home_presenter.h/.c`：全部设备状态映射、播放视觉选择、唯一按钮权限判断。
+- 共用源码位于 `sugarat/main/ui/`。`home_presenter.h/.c` 负责全部设备状态映射、播放视觉选择和主按钮权限。
 - `home_screen.h/.c`：不依赖 ESP-IDF 的 LVGL 组件；不会启动/停止麦克风、切换 AEC 或改变业务状态。
 - `ui_theme.h`：颜色、字体、布局、触摸范围和动画节奏。
 - `../screen_port.c`：PSRAM 全帧缓冲、异步传输、刷新期限及屏幕输入。
 - `../frame_rotate.c`：按小块进行 RGB565 顺时针 90° 旋转和字节序转换，不修改 LVGL 的逻辑帧。
-- 共享 `sugarat/main/screen.c` 只在此板编译时通过 `SUGARAT_NATIVE_AMOLED_UI` 选择 A 方案；其他板仍使用原有主屏。
+- `SUGARAT_NATIVE_AMOLED_UI` 选择 466×466 AMOLED 布局。Sugarat 使用相同组件的 360×360 LCD 布局和局部刷新。
 
 ## 现有业务状态机
 

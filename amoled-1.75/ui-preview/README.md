@@ -1,6 +1,6 @@
 # A / Orbit 原生 UI 渲染
 
-用户已选定 A 方案，固件集成同一份 `../main/ui/home_presenter.c` 和 `home_screen.c`。
+AMOLED 和 Sugarat 固件共用 `../../sugarat/main/ui/` 下的 Orbit 主屏和状态映射。
 状态与模块职责详见 [UI 状态说明](../main/ui/README.md)。
 
 ## 运行
@@ -10,6 +10,8 @@
 ```powershell
 & .\amoled-1.75\ui-preview\render.ps1
 ```
+
+加 `-Board Sugarat` 可渲染 360×360 LCD 版本。Sugarat 的预览额外模拟点击主屏顶部、进入设置、切换到手动控制和网络确认。输出位于 `../../sugarat/build/ui-preview-renders/`。
 
 脚本复用 `../build/ui-preview/`，用现有 MSVC、Windows SDK、ESP-IDF CMake/Ninja，
 以 2 个编译任务直接构建项目下载的 LVGL 9.2.2 源码。Python Pillow 将真实 RGB565 帧

@@ -1,7 +1,15 @@
+param([ValidateSet('AMOLED','Sugarat')][string]$Board = 'AMOLED')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $output = Join-Path $projectRoot 'build\ui-preview'
 $images = Join-Path $PSScriptRoot 'renders\device-states'
+$frames = $output
+$target = 'amoled_ui_preview'
+if ($Board -eq 'Sugarat') {
+    $frames = Join-Path $projectRoot '..\sugarat\build\ui-preview-frames'
+    $images = Join-Path $projectRoot '..\sugarat\build\ui-preview-renders'
+    $target = 'sugarat_ui_preview'
+}
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$visualStudio) { throw 'MSVC C compiler is required for the native preview.' }
@@ -25,16 +33,16 @@ try {
         (Join-Path $kitRoot "Lib\$kitVersion\um\x64")) -join ';')
     $sdkBin = Join-Path $kitRoot "bin\$kitVersion\x64"
     $env:Path = (Join-Path $toolchain 'bin\Hostx64\x64') + ';' + $sdkBin + ';' + $env:Path
-    New-Item -ItemType Directory -Force -Path $output, $images | Out-Null
+    New-Item -ItemType Directory -Force -Path (@($output, $frames, $images) | Select-Object -Unique) | Out-Null
     & $cmake -S $PSScriptRoot -B $output -G Ninja ('-DCMAKE_MAKE_PROGRAM=' + $ninja) `
         ('-DCMAKE_RC_COMPILER=' + (Join-Path $sdkBin 'rc.exe')) `
         ('-DCMAKE_MT=' + (Join-Path $sdkBin 'mt.exe')) -DCMAKE_BUILD_TYPE=Release
     if ($LASTEXITCODE -ne 0) { throw 'Preview configuration failed.' }
-    & $cmake --build $output --parallel 2
+    & $cmake --build $output --parallel 2 --target $target
     if ($LASTEXITCODE -ne 0) { throw 'Preview compilation failed.' }
-    & (Join-Path $output 'amoled_ui_preview.exe') $output
+    & (Join-Path $output "$target.exe") $frames
     if ($LASTEXITCODE -ne 0) { throw 'Preview rendering failed.' }
-    & python (Join-Path $PSScriptRoot 'package-renders.py') $output $images
+    & python (Join-Path $PSScriptRoot 'package-renders.py') $frames $images $Board
     if ($LASTEXITCODE -ne 0) { throw 'Preview packaging failed.' }
 } finally {
     $env:INCLUDE = $previous.INCLUDE
